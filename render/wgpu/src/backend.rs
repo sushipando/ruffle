@@ -631,8 +631,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         .filters
                         .iter()
                         .all(crate::surface::layer_atlas::is_local_filter)
-                    && texture.width() <= 512
-                    && texture.height() <= 512
+                    && texture.width() <= crate::surface::layer_atlas::max_batched_filter_size()
+                    && texture.height() <= crate::surface::layer_atlas::max_batched_filter_size()
                     && !referenced.contains(&entry.handle)
                 {
                     match filter_groups

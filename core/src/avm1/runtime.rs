@@ -87,6 +87,11 @@ pub struct Avm1<'gc> {
     /// The list of all movie clips in execution order.
     clip_exec_list: Option<MovieClip<'gc>>,
 
+    /// Whether objects were queued for removal (see `remove_pending`) since it last
+    /// looked for them. Most movies (and all AVM2 movies) never do, so the display
+    /// list doesn't have to be searched every frame.
+    pending_removals: bool,
+
     /// If getBounds / getRect is called on a MovieClip with invalid bounds and the
     /// target space is identical to the origin space, but the target is not the
     /// MovieClip itself, the call can return either the default invalid rectangle
@@ -124,6 +129,7 @@ impl<'gc> Avm1<'gc> {
             max_recursion_depth: 255,
             has_mouse_listener: false,
             clip_exec_list: None,
+            pending_removals: false,
 
             #[cfg(feature = "avm_debug")]
             debug_output: false,
@@ -470,6 +476,10 @@ impl<'gc> Avm1<'gc> {
     /// Remove all display objects pending removal
     /// See [`find_display_objects_pending_removal`] for details
     fn remove_pending(context: &mut UpdateContext<'gc>) {
+        if !std::mem::take(&mut context.avm1.pending_removals) {
+            return;
+        }
+
         // Storage for objects to remove
         // Have to do this in two passes to avoid borrow-mut while already borrowed
         let mut out = Vec::new();
@@ -498,6 +508,11 @@ impl<'gc> Avm1<'gc> {
                 );
             }
         }
+    }
+
+    /// Notes that objects were queued for removal at the start of the next frame.
+    pub fn queue_pending_removals(&mut self) {
+        self.pending_removals = true;
     }
 
     // Run a single frame.

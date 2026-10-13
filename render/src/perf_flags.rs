@@ -50,9 +50,14 @@ pub enum PerfFlag {
     FetchBlends,
     /// Draw consecutive chunks of draws in the same render pass.
     MergeChunks,
+    /// Let cached bitmaps' textures be larger than needed, so that they aren't recreated
+    /// whenever their size changes a little (see `BitmapCache::update` in core).
+    CacheSlack,
+    /// Batch the filters of larger cached bitmaps, in larger atlases.
+    BatchLargeFilters,
 }
 
-const NAMES: [&str; 18] = [
+const NAMES: [&str; 20] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -71,9 +76,11 @@ const NAMES: [&str; 18] = [
     "complex-as-normal",
     "fetch-blends",
     "merge-chunks",
+    "cache-slack",
+    "batch-large-filters",
 ];
 
-static FLAGS: [AtomicBool; 18] = [
+static FLAGS: [AtomicBool; 20] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -92,6 +99,8 @@ static FLAGS: [AtomicBool; 18] = [
     AtomicBool::new(false), // complex-as-normal
     AtomicBool::new(true),  // fetch-blends
     AtomicBool::new(true),  // merge-chunks
+    AtomicBool::new(true),  // cache-slack
+    AtomicBool::new(true),  // batch-large-filters
 ];
 
 #[inline]

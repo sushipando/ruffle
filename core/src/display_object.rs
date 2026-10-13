@@ -108,7 +108,12 @@ pub struct BitmapCache {
     draw_offset: Point<i32>,
 
     /// The current contents of the cache, if any. Values are post-filters.
+    /// The texture may be larger than `used_width` x `used_height` (see `update`).
     bitmap: Option<BitmapInfo>,
+
+    /// The size of the part of `bitmap` that is used.
+    used_width: u32,
+    used_height: u32,
 
     /// Whether we warned that this bitmap was too large to be cached
     warned_for_oversize: bool,
@@ -133,7 +138,15 @@ impl BitmapCache {
             || self.bitmap.is_none()
     }
 
-    /// Clears any dirtiness and ensure there's an appropriately sized texture allocated
+    /// Clears any dirtiness and ensure there's an appropriately sized texture allocated.
+    ///
+    /// Unless `exact` (with an opaque background, which fills the whole texture, or
+    /// filters whose results depend on the texture's size), the
+    /// texture may be larger than needed: sizes are rounded up, and a texture is kept
+    /// while it's at most `SLACK` pixels too large. Animated objects change size all the
+    /// time, and creating a texture every frame is expensive (as is filtering new sizes,
+    /// for which the renderer has no textures pooled). The unused part is transparent,
+    /// and only the used part is drawn (see `bitmap`).
     #[expect(clippy::too_many_arguments)]
     fn update(
         &mut self,
@@ -145,7 +158,11 @@ impl BitmapCache {
         actual_height: u32,
         draw_offset: Point<i32>,
         swf_version: u8,
+        exact: bool,
     ) {
+        const ROUND_TO: u32 = 32;
+        const SLACK: u32 = 64;
+
         self.matrix_a = matrix.a;
         self.matrix_b = matrix.b;
         self.matrix_c = matrix.c;
@@ -153,28 +170,52 @@ impl BitmapCache {
         self.source_width = source_width;
         self.source_height = source_height;
         self.draw_offset = draw_offset;
+        self.used_width = actual_width;
+        self.used_height = actual_height;
+        let fits = |size: u32, needed: u32| {
+            if exact {
+                size == needed
+            } else {
+                size >= needed && size - needed <= SLACK
+            }
+        };
         if let Some(current) = &mut self.bitmap
-            && current.width == actual_width
-            && current.height == actual_height
+            && fits(current.width, actual_width)
+            && fits(current.height, actual_height)
         {
             return; // No need to resize it
         }
-        let acceptable_size = if swf_version > 9 {
-            let total = actual_width * actual_height;
-            actual_width < 8191 && actual_height < 8191 && total < 16777215
-        } else {
-            actual_width < 2880 && actual_height < 2880
+        let acceptable_size = |width: u32, height: u32| {
+            if swf_version > 9 {
+                let total = width * height;
+                width < 8191 && height < 8191 && total < 16777215
+            } else {
+                width < 2880 && height < 2880
+            }
         };
+        if !acceptable_size(actual_width, actual_height) {
+            self.bitmap = None;
+            return;
+        }
+        let (mut width, mut height) = (actual_width, actual_height);
+        if !exact
+            && acceptable_size(
+                actual_width.next_multiple_of(ROUND_TO),
+                actual_height.next_multiple_of(ROUND_TO),
+            )
+        {
+            width = actual_width.next_multiple_of(ROUND_TO);
+            height = actual_height.next_multiple_of(ROUND_TO);
+        }
 
         if renderer.is_offscreen_supported()
-            && let Some(actual_width) = NonZero::new(actual_width)
-            && let Some(actual_height) = NonZero::new(actual_height)
-            && acceptable_size
+            && let Some(width) = NonZero::new(width)
+            && let Some(height) = NonZero::new(height)
         {
-            let handle = renderer.create_empty_texture(actual_width, actual_height);
+            let handle = renderer.create_empty_texture(width, height);
             self.bitmap = handle.ok().map(|handle| BitmapInfo {
-                width: actual_width.get(),
-                height: actual_height.get(),
+                width: width.get(),
+                height: height.get(),
                 handle,
             });
         } else {
@@ -189,8 +230,13 @@ impl BitmapCache {
         self.bitmap = None;
     }
 
+    /// The cached bitmap, as large as the part of its texture that is used.
     fn bitmap(&self) -> Option<BitmapInfo> {
-        self.bitmap.clone()
+        self.bitmap.as_ref().map(|bitmap| BitmapInfo {
+            handle: bitmap.handle.clone(),
+            width: self.used_width,
+            height: self.used_height,
+        })
     }
 }
 
@@ -1027,6 +1073,20 @@ pub fn render_base<'gc>(
                         filter_rect.height() as u32,
                         draw_offset,
                         swf_version,
+                        // Extra (transparent) space doesn't change what these filters
+                        // produce in the used part, unlike, for example, a displacement map.
+                        !ruffle_render::perf_flags::enabled(
+                            ruffle_render::perf_flags::PerfFlag::CacheSlack,
+                        ) || this.opaque_background().is_some()
+                            || !filters.iter().all(|filter| {
+                                matches!(
+                                    filter,
+                                    Filter::BlurFilter(_)
+                                        | Filter::GlowFilter(_)
+                                        | Filter::DropShadowFilter(_)
+                                        | Filter::ColorMatrixFilter(_)
+                                )
+                            }),
                     );
                     cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
                         bitmap,

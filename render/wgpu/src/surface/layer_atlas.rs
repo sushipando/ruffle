@@ -275,6 +275,24 @@ pub fn is_local_filter(filter: &ruffle_render::filters::Filter) -> bool {
 ///
 /// Returns the indices of textures that were too large to batch, which the caller
 /// must filter itself.
+/// The largest cached bitmaps whose filters are applied in an atlas (in either dimension).
+pub fn max_batched_filter_size() -> u32 {
+    if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BatchLargeFilters) {
+        1024
+    } else {
+        512
+    }
+}
+
+/// The maximum size of a filter atlas (in either dimension).
+fn max_filter_atlas_size() -> u32 {
+    if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BatchLargeFilters) {
+        4096
+    } else {
+        2048
+    }
+}
+
 pub fn apply_filters_batched(
     filters: &[ruffle_render::filters::Filter],
     textures: &[wgpu::Texture],
@@ -301,7 +319,7 @@ pub fn apply_filters_batched(
     let gutter = reach + 2;
 
     // Shelf-pack the textures (with their gutters) into atlases.
-    let max_size = 2048.min(descriptors.limits.max_texture_dimension_2d);
+    let max_size = max_filter_atlas_size().min(descriptors.limits.max_texture_dimension_2d);
     // Each batch: the (texture index, x, y) of its entries, and its atlas size.
     type Batch = (Vec<(usize, u32, u32)>, u32, u32);
     let mut batches: Vec<Batch> = vec![];
