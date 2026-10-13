@@ -93,6 +93,20 @@ impl<'gc, V> PropertyMap<'gc, V> {
         None
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Like `get`, but also returns the namespace the value is stored with.
+    pub fn get_entry(&self, name: QName<'gc>) -> Option<(Namespace<'gc>, &V)> {
+        self.0.get(&name.local_name()).and_then(|bucket| {
+            bucket
+                .iter()
+                .find(|(n, _)| n.matches_ns(name.namespace()))
+                .map(|(n, v)| (*n, v))
+        })
+    }
+
     pub fn contains_key(&self, name: QName<'gc>) -> bool {
         self.0
             .get(&name.local_name())

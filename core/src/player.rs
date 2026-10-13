@@ -2209,6 +2209,11 @@ impl Player {
         }
     }
 
+    /// Diagnostics: runs a whole garbage collection cycle now.
+    pub fn collect_garbage_full(&mut self) {
+        self.gc_arena.borrow_mut().finish_cycle();
+    }
+
     /// Diagnostics (leak debugging): prints the most common types of reachable GC objects.
     fn print_heap_histogram(&self) {
         let Ok(arena) = self.gc_arena.try_borrow() else {
@@ -3274,6 +3279,21 @@ impl PlayerBuilder {
 
         // Finalize configuration and load the movie.
         let mut player_lock = player.lock().unwrap();
+
+        // Diagnostics: GC pacing experiments (see gc-arena's `Pacing::sleep_factor`).
+        if let Some(sleep_factor) = std::env::var("RUFFLE_GC_SLEEP_FACTOR")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            player_lock
+                .gc_arena
+                .borrow()
+                .metrics()
+                .set_pacing(gc_arena::metrics::Pacing {
+                    sleep_factor,
+                    ..Default::default()
+                });
+        }
 
         #[cfg(feature = "default_font")]
         if self.default_font {

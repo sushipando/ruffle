@@ -1505,6 +1505,9 @@ impl<'a> Reader<'a> {
         while let Some(record) = Self::read_shape_record(&mut bits, &mut shape_context)? {
             records.push(record);
         }
+        // Shapes are usually kept for as long as their movie, and pushing leaves up to
+        // half of the capacity unused.
+        records.shrink_to_fit();
 
         Ok(Shape {
             version,

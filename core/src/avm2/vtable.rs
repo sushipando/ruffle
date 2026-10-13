@@ -12,9 +12,12 @@ use crate::avm2::{Class, Multiname, Namespace, QName};
 use crate::context::UpdateContext;
 use crate::string::{AvmString, StringContext};
 use gc_arena::barrier::{field, unlock};
+use gc_arena::collect::Trace;
 use gc_arena::lock::Lock;
 use gc_arena::{Collect, Gc, Mutation};
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Collect, Clone, Copy)]
 #[collect(no_drop)]
@@ -27,7 +30,7 @@ struct VTableData<'gc> {
 
     protected_namespace: Option<Namespace<'gc>>,
 
-    resolved_traits: PropertyMap<'gc, Property>,
+    resolved_traits: VTableTraits<'gc>,
 
     /// Use hashmaps for the metadata tables because metadata will rarely be present on traits
     slot_metadata_table: HashMap<usize, Box<[Metadata<'gc>]>>,
@@ -112,7 +115,7 @@ impl<'gc> VTable<'gc> {
         Ok(VTable(Gc::new(context.gc(), this)))
     }
 
-    pub fn resolved_traits(self) -> &'gc PropertyMap<'gc, Property> {
+    pub fn resolved_traits(self) -> &'gc VTableTraits<'gc> {
         &Gc::as_ref(self.0).resolved_traits
     }
 
@@ -270,7 +273,7 @@ impl<'gc> VTable<'gc> {
         // so long-term it's still something we should verify.
         // (and it's far from the only verification check we lack anyway)
 
-        let mut resolved_traits = PropertyMap::new();
+        let mut resolved_traits = VTableTraits::default();
         let mut slot_metadata_table = HashMap::new();
         let mut disp_metadata_table = HashMap::new();
         let mut slot_table = Vec::new();
@@ -284,7 +287,8 @@ impl<'gc> VTable<'gc> {
         let mut force_auto_assign_slots = false;
 
         if let Some(superclass_vtable) = superclass_vtable {
-            resolved_traits = superclass_vtable.resolved_traits().clone();
+            resolved_traits =
+                VTableTraits::with_base(superclass_vtable.0.resolved_traits.flattened());
             slot_metadata_table = superclass_vtable.0.slot_metadata_table.clone();
             disp_metadata_table = superclass_vtable.0.disp_metadata_table.clone();
             slot_table.extend_from_slice(&superclass_vtable.0.slot_table);
@@ -331,13 +335,13 @@ impl<'gc> VTable<'gc> {
                         scope: Lock::new(scope),
                         method: *method,
                     };
-                    match resolved_traits.get(trait_data.name()) {
+                    match resolved_traits.get(trait_data.name()).copied() {
                         Some(Property::Method { disp_id, .. }) => {
                             if let Some(metadata) = trait_data.metadata() {
-                                disp_metadata_table.insert(*disp_id, metadata);
+                                disp_metadata_table.insert(disp_id, metadata);
                             }
 
-                            method_table[*disp_id] = entry;
+                            method_table[disp_id] = entry;
                         }
                         // note: ideally overwriting other property types
                         // should be a VerifyError
@@ -362,19 +366,23 @@ impl<'gc> VTable<'gc> {
                         scope: Lock::new(scope),
                         method: *method,
                     };
-                    match resolved_traits.get_mut(trait_data.name()) {
+                    match resolved_traits.get(trait_data.name()).copied() {
                         Some(Property::Virtual {
                             get: Some(disp_id), ..
                         }) => {
                             if let Some(metadata) = trait_data.metadata() {
-                                disp_metadata_table.insert(*disp_id, metadata);
+                                disp_metadata_table.insert(disp_id, metadata);
                             }
 
-                            method_table[*disp_id] = entry;
+                            method_table[disp_id] = entry;
                         }
-                        Some(Property::Virtual { get, .. }) => {
+                        Some(Property::Virtual { get: None, .. }) => {
                             let disp_id = method_table.len();
-                            *get = Some(disp_id);
+                            if let Some(Property::Virtual { get, .. }) =
+                                resolved_traits.get_mut(trait_data.name())
+                            {
+                                *get = Some(disp_id);
+                            }
                             method_table.push(entry);
 
                             if let Some(metadata) = trait_data.metadata() {
@@ -402,20 +410,24 @@ impl<'gc> VTable<'gc> {
                         scope: Lock::new(scope),
                         method: *method,
                     };
-                    match resolved_traits.get_mut(trait_data.name()) {
+                    match resolved_traits.get(trait_data.name()).copied() {
                         Some(Property::Virtual {
                             set: Some(disp_id), ..
                         }) => {
                             if let Some(metadata) = trait_data.metadata() {
-                                disp_metadata_table.insert(*disp_id, metadata);
+                                disp_metadata_table.insert(disp_id, metadata);
                             }
 
-                            method_table[*disp_id] = entry;
+                            method_table[disp_id] = entry;
                         }
-                        Some(Property::Virtual { set, .. }) => {
+                        Some(Property::Virtual { set: None, .. }) => {
                             let disp_id = method_table.len();
                             method_table.push(entry);
-                            *set = Some(disp_id);
+                            if let Some(Property::Virtual { set, .. }) =
+                                resolved_traits.get_mut(trait_data.name())
+                            {
+                                *set = Some(disp_id);
+                            }
 
                             if let Some(metadata) = trait_data.metadata() {
                                 disp_metadata_table.insert(disp_id, metadata);
@@ -548,7 +560,10 @@ impl<'gc> VTable<'gc> {
                 let interface_name = interface_trait.name();
                 if !interface_name.namespace().is_public() {
                     let public_name = QName::new(internal_ns, interface_name.local_name());
-                    if let Some(prop) = this.resolved_traits.get(public_name).copied() {
+                    if let Some(prop) = this.resolved_traits.get(public_name).copied()
+                        // Usually already copied for the superclass (see the FIXME above).
+                        && this.resolved_traits.get(interface_name) != Some(&prop)
+                    {
                         this.resolved_traits.insert(interface_name, prop);
                     }
                 }
@@ -624,5 +639,103 @@ fn trait_to_default_value<'gc>(trait_data: &Trait<'gc>) -> Value<'gc> {
         TraitKind::Const { default_value, .. } => *default_value,
         TraitKind::Class { .. } => Value::Null,
         _ => unreachable!(),
+    }
+}
+
+/// The resolved traits of a vtable: the ones its class adds or changes (`own`), over
+/// the flattened traits of its superclass (`base`, which is shared by all of the
+/// superclass's subclasses).
+///
+/// Lookups check `own` first, so they find the same entries as in a single map made by
+/// inserting `own` into a copy of `base` (`PropertyMap::insert` puts new entries first).
+/// Copying the superclass's traits for every class took hundreds of MB in content that
+/// defines thousands of MovieClip subclasses (MovieClip has ~200 traits).
+#[derive(Default)]
+pub struct VTableTraits<'gc> {
+    own: PropertyMap<'gc, Property>,
+    base: Option<Rc<PropertyMap<'gc, Property>>>,
+    /// `own` over `base` in a single map, made once this vtable's class has a subclass.
+    flattened: OnceCell<Rc<PropertyMap<'gc, Property>>>,
+}
+
+unsafe impl<'gc> Collect<'gc> for VTableTraits<'gc> {
+    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
+        cc.trace(&self.own);
+        cc.trace(&self.base);
+        // (Only holds what's in `own` and `base`, so setting it doesn't need a write barrier.)
+        if let Some(flattened) = self.flattened.get() {
+            cc.trace(flattened);
+        }
+    }
+}
+
+impl<'gc> VTableTraits<'gc> {
+    fn with_base(base: Rc<PropertyMap<'gc, Property>>) -> Self {
+        Self {
+            own: PropertyMap::new(),
+            base: Some(base),
+            flattened: OnceCell::new(),
+        }
+    }
+
+    pub fn get(&self, name: QName<'gc>) -> Option<&Property> {
+        self.own
+            .get(name)
+            .or_else(|| self.base.as_ref().and_then(|base| base.get(name)))
+    }
+
+    pub fn get_for_multiname(&self, name: &Multiname<'gc>) -> Option<&Property> {
+        if !self.own.is_empty()
+            && let Some(property) = self.own.get_for_multiname(name)
+        {
+            return Some(property);
+        }
+        self.base
+            .as_ref()
+            .and_then(|base| base.get_for_multiname(name))
+    }
+
+    /// All traits, as `(local name, namespace, property)`.
+    pub fn iter(&self) -> impl Iterator<Item = (AvmString<'gc>, Namespace<'gc>, &Property)> {
+        let own = &self.own;
+        own.iter().chain(
+            self.base
+                .iter()
+                .flat_map(|base| base.iter())
+                .filter(move |(name, ns, _)| !own.contains_key(QName::new(*ns, *name))),
+        )
+    }
+
+    fn insert(&mut self, name: QName<'gc>, property: Property) {
+        self.own.insert(name, property);
+    }
+
+    /// Gets a trait to change it (copying it from `base` into `own` first if needed).
+    fn get_mut(&mut self, name: QName<'gc>) -> Option<&mut Property> {
+        if !self.own.contains_key(name) {
+            let (ns, property) = self.base.as_ref()?.get_entry(name)?;
+            let property = *property;
+            self.own.insert(QName::new(ns, name.local_name()), property);
+        }
+        self.own.get_mut(name)
+    }
+
+    /// All traits in a single map, to be the `base` of subclasses.
+    fn flattened(&self) -> Rc<PropertyMap<'gc, Property>> {
+        if self.own.is_empty() {
+            return self.base.clone().unwrap_or_default();
+        }
+        self.flattened
+            .get_or_init(|| {
+                let mut map = self.base.as_deref().cloned().unwrap_or_default();
+                // Inserting puts entries first in their bucket, so insert each bucket of
+                // `own` back to front to keep its order (and its entries before `base`'s).
+                let own: Vec<_> = self.own.iter().collect();
+                for (name, ns, property) in own.into_iter().rev() {
+                    map.insert(QName::new(ns, name), *property);
+                }
+                Rc::new(map)
+            })
+            .clone()
     }
 }
