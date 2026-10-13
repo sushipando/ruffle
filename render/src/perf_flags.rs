@@ -30,9 +30,24 @@ pub enum PerfFlag {
     /// Off by default, because the result isn't exactly Flash's (it's on in the desktop
     /// player).
     BlurDownscale,
+    /// Submit and present the desktop GUI's frame on the submit thread, after the
+    /// movie's frame, instead of waiting for that on the main thread.
+    AsyncPresent,
+    /// Record the next frame while the previous one is still being submitted on
+    /// another thread (only wait for it when submitting).
+    OverlapRecord,
+    /// Do all passes of a blur in each direction at once, with a combined kernel.
+    /// Off by default, because the result isn't exactly Flash's (it's on in the desktop
+    /// player).
+    BlurMerge,
+    /// For measurements only: don't apply the filters of cached bitmaps.
+    SkipCacheFilters,
+    /// For measurements only: draw complex blends (which need to read the backdrop)
+    /// as normal ones.
+    ComplexAsNormal,
 }
 
-const NAMES: [&str; 11] = [
+const NAMES: [&str; 16] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -44,9 +59,14 @@ const NAMES: [&str; 11] = [
     "filter-batching",
     "share-cmdbufs",
     "blur-downscale",
+    "async-present",
+    "overlap-record",
+    "blur-merge",
+    "skip-cache-filters",
+    "complex-as-normal",
 ];
 
-static FLAGS: [AtomicBool; 11] = [
+static FLAGS: [AtomicBool; 16] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -58,6 +78,11 @@ static FLAGS: [AtomicBool; 11] = [
     AtomicBool::new(true),  // filter-batching
     AtomicBool::new(true),  // share-cmdbufs
     AtomicBool::new(false), // blur-downscale
+    AtomicBool::new(true),  // async-present
+    AtomicBool::new(true),  // overlap-record
+    AtomicBool::new(false), // blur-merge
+    AtomicBool::new(false), // skip-cache-filters
+    AtomicBool::new(false), // complex-as-normal
 ];
 
 #[inline]

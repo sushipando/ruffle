@@ -200,18 +200,25 @@ impl DisplacementMapFilter {
 }
 
 thread_local! {
-    static VIEW_SCALE: Cell<f32> = const { Cell::new(1.0) };
+    static VIEW_SCALE: Cell<Option<f32>> = const { Cell::new(None) };
 }
 
 /// Sets how much the stage is magnified for display while a frame is rendered on this
-/// thread. Filters' sizes have been multiplied by it (see [`Filter::scale`]), so a renderer
-/// may compute expensive filters at up to this many times lower resolution without going
-/// below the movie's own resolution.
-pub fn set_view_scale(scale: f32) {
+/// thread (`None` once it's done). Filters' sizes have been multiplied by it (see
+/// [`Filter::scale`]), so a renderer may compute expensive filters at up to this many
+/// times lower resolution without going below the movie's own resolution.
+pub fn set_view_scale(scale: Option<f32>) {
     VIEW_SCALE.with(|v| v.set(scale));
 }
 
 /// See [`set_view_scale`]. 1.0 unless a frame is being rendered on this thread.
 pub fn view_scale() -> f32 {
-    VIEW_SCALE.with(|v| v.get())
+    VIEW_SCALE.with(|v| v.get()).unwrap_or(1.0)
+}
+
+/// Whether a frame is being rendered for display on this thread (see [`set_view_scale`]).
+/// Filters applied meanwhile only end up on screen, so they may be approximated, unlike
+/// filters applied by scripts (whose results scripts can read).
+pub fn rendering_for_display() -> bool {
+    VIEW_SCALE.with(|v| v.get()).is_some()
 }

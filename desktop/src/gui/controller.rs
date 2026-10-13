@@ -21,7 +21,7 @@ use ruffle_render_wgpu::utils::{format_list, get_backend_names};
 use std::any::Any;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use url::Url;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -48,8 +48,46 @@ pub struct GuiController {
     /// If this is set, we should not render the main menu.
     no_gui: bool,
     theme_controller: ThemeController,
+    /// Presents handed to the renderer's submit thread (see `render`).
+    pending_presents: Arc<PendingPresents>,
     #[cfg(feature = "tracy_images")]
     tracy_frame_captures: crate::tracy::FrameCapturesHolder,
+}
+
+/// Counts the frames that were handed to another thread to be presented, but
+/// haven't been yet. A new surface texture can only be acquired (and the surface
+/// only reconfigured) once the previous one was presented.
+#[derive(Default)]
+struct PendingPresents {
+    count: Mutex<usize>,
+    presented: Condvar,
+}
+
+impl PendingPresents {
+    /// Marks a present as pending, until the returned guard is dropped.
+    fn start(self: &Arc<Self>) -> PendingPresentGuard {
+        *self.count.lock().expect("pending presents lock") += 1;
+        PendingPresentGuard(self.clone())
+    }
+
+    fn wait(&self) {
+        let mut count = self.count.lock().expect("pending presents lock");
+        while *count > 0 {
+            count = self
+                .presented
+                .wait(count)
+                .expect("pending presents lock");
+        }
+    }
+}
+
+struct PendingPresentGuard(Arc<PendingPresents>);
+
+impl Drop for PendingPresentGuard {
+    fn drop(&mut self) {
+        *self.0.count.lock().expect("pending presents lock") -= 1;
+        self.0.presented.notify_all();
+    }
 }
 
 impl GuiController {
@@ -178,6 +216,7 @@ impl GuiController {
             size,
             no_gui,
             theme_controller,
+            pending_presents: Default::default(),
             #[cfg(feature = "tracy_images")]
             tracy_frame_captures,
         })
@@ -207,6 +246,7 @@ impl GuiController {
     }
 
     pub fn reconfigure_surface(&self) {
+        self.pending_presents.wait();
         self.surface.configure(
             &self.descriptors.device,
             &wgpu::SurfaceConfiguration {
@@ -312,6 +352,7 @@ impl GuiController {
     }
 
     pub fn render(&mut self, mut player: Option<MutexGuard<Player>>) {
+        self.pending_presents.wait();
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
@@ -478,21 +519,50 @@ impl GuiController {
         }
 
         command_buffers.push(encoder.finish());
-        self.descriptors.queue.submit(command_buffers);
+        self.window.pre_present_notify();
+        let queue = self.descriptors.queue.clone();
+        let present = move || {
+            queue.submit(command_buffers);
+            queue.present(surface_texture);
+        };
+        // The movie's frame may still be being submitted on the renderer's submit
+        // thread. This frame shows it, so it must be submitted after it: let that
+        // thread do it, instead of waiting here.
+        let renderer = player.as_deref_mut().and_then(|player| {
+            <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(player.renderer_mut())
+        });
+        match renderer {
+            Some(renderer)
+                if ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::AsyncPresent,
+                ) =>
+            {
+                let guard = self.pending_presents.start();
+                renderer.run_after_submissions(Box::new(move || {
+                    present();
+                    drop(guard);
+                }));
+            }
+            _ => present(),
+        }
 
         // Free textures only after submitting the command buffer that may still
         // reference them.  Destroying a texture before its usage is submitted
         // causes a wgpu validation panic.
+        if !full_output.textures_delta.free.is_empty() {
+            self.pending_presents.wait();
+        }
         for id in full_output.textures_delta.free.drain() {
             self.egui_renderer.free_texture(&id);
         }
 
-        self.window.pre_present_notify();
-        self.descriptors.queue.present(surface_texture);
         #[cfg(feature = "tracy")]
         tracing_tracy::client::frame_mark();
         #[cfg(feature = "tracy_images")]
-        self.tracy_frame_captures.finish_frame();
+        {
+            self.pending_presents.wait();
+            self.tracy_frame_captures.finish_frame();
+        }
     }
 
     pub fn show_context_menu(

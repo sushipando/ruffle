@@ -402,6 +402,14 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &self.target
     }
 
+    /// Runs `task` once everything submitted so far is on the queue. If the last
+    /// frame is still being submitted on another thread, `task` runs there after
+    /// it, so the caller doesn't have to wait (for example, to present a frame
+    /// that shows this one).
+    pub fn run_after_submissions(&mut self, task: Box<dyn FnOnce() + Send>) {
+        self.active_frame.run_after_submissions(task);
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.descriptors.device
     }
@@ -579,9 +587,20 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
-        // The previous frame may still be being submitted on another thread;
-        // its staging buffers must be recalled before this frame's are finished.
-        self.active_frame.wait_for_submission();
+        let mut cache_entries = cache_entries;
+        if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipCacheFilters)
+        {
+            for entry in &mut cache_entries {
+                entry.filters.clear();
+            }
+        }
+        // The previous frame may still be being submitted on another thread.
+        // Recording this one meanwhile is fine: it uses another staging belt, and
+        // everything that must come after the previous frame on the queue (the
+        // transforms arena flush, recalling belts, other submissions) waits for it.
+        if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::OverlapRecord) {
+            self.active_frame.wait_for_submission();
+        }
         let Some(frame_output) = self.target.get_next_texture() else {
             // Attempt to recreate the swap chain in this case.
             self.target.resize(
@@ -1497,8 +1516,8 @@ pub struct ActiveFrame {
     draws_since_flush: u32,
     /// Finishes and submits frames on another thread (see `submit_for_target_async`).
     submitter: Option<AsyncSubmitter>,
-    /// Whether a frame is still being submitted by `submitter`.
-    submitting: bool,
+    /// How many jobs sent to `submitter` aren't done yet.
+    jobs_in_flight: usize,
     /// The staging belt used by the commands being submitted by `submitter`.
     /// It's only recalled once they have been submitted; meanwhile, recording
     /// continues with another belt. (Recalling a belt while some of its chunks
@@ -1513,20 +1532,33 @@ pub struct ActiveFrame {
 /// and submitting it is the most expensive part of rendering a complex frame.
 /// Doing it on another thread lets the next frame's scripts run meanwhile.
 struct AsyncSubmitter {
-    jobs: std::sync::mpsc::Sender<(wgpu::CommandEncoder, wgpu::Queue)>,
+    jobs: std::sync::mpsc::Sender<SubmitJob>,
     done: std::sync::mpsc::Receiver<()>,
+}
+
+/// Work for the submit thread, which does it in order.
+enum SubmitJob {
+    /// Finish the encoder and submit it.
+    Frame(wgpu::CommandEncoder, wgpu::Queue),
+    /// Anything that must happen after the frames before it were submitted
+    /// (see `WgpuRenderBackend::run_after_submissions`).
+    Task(Box<dyn FnOnce() + Send>),
 }
 
 impl AsyncSubmitter {
     fn new() -> Self {
-        let (jobs, job_receiver) =
-            std::sync::mpsc::channel::<(wgpu::CommandEncoder, wgpu::Queue)>();
+        let (jobs, job_receiver) = std::sync::mpsc::channel::<SubmitJob>();
         let (done_sender, done) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("ruffle-wgpu-submit".to_string())
             .spawn(move || {
-                for (encoder, queue) in job_receiver {
-                    queue.submit(Some(encoder.finish()));
+                for job in job_receiver {
+                    match job {
+                        SubmitJob::Frame(encoder, queue) => {
+                            queue.submit(Some(encoder.finish()));
+                        }
+                        SubmitJob::Task(task) => task(),
+                    }
                     if done_sender.send(()).is_err() {
                         break;
                     }
@@ -1549,7 +1581,7 @@ impl ActiveFrame {
             dynamic_transforms: DynamicTransforms::new(descriptors),
             draws_since_flush: 0,
             submitter: None,
-            submitting: false,
+            jobs_in_flight: 0,
             in_flight_belt: None,
             spare_belt: None,
         }
@@ -1559,17 +1591,37 @@ impl ActiveFrame {
     /// Anything that must happen after the previous frame on the queue
     /// (such as further submissions or buffer writes) must call this first.
     pub fn wait_for_submission(&mut self) {
-        if self.submitting {
+        if self.jobs_in_flight > 0 {
             let submitter = self
                 .submitter
                 .as_ref()
-                .expect("submitting implies a submitter");
-            let _ = submitter.done.recv();
-            self.submitting = false;
+                .expect("jobs in flight imply a submitter");
+            while self.jobs_in_flight > 0 {
+                if submitter.done.recv().is_err() {
+                    self.jobs_in_flight = 0;
+                    break;
+                }
+                self.jobs_in_flight -= 1;
+            }
             if let Some(mut belt) = self.in_flight_belt.take() {
                 belt.recall();
                 self.spare_belt = Some(belt);
             }
+        }
+    }
+
+    /// Runs `task` once everything submitted so far is on the queue: on the
+    /// submit thread if a frame is still being submitted there, otherwise now.
+    pub fn run_after_submissions(&mut self, task: Box<dyn FnOnce() + Send>) {
+        match &self.submitter {
+            Some(submitter) if self.jobs_in_flight > 0 => {
+                submitter
+                    .jobs
+                    .send(SubmitJob::Task(task))
+                    .expect("Submit thread should be running");
+                self.jobs_in_flight += 1;
+            }
+            _ => task(),
         }
     }
 
@@ -1640,9 +1692,9 @@ impl ActiveFrame {
         let submitter = self.submitter.get_or_insert_with(AsyncSubmitter::new);
         submitter
             .jobs
-            .send((draw_encoder, descriptors.queue.clone()))
+            .send(SubmitJob::Frame(draw_encoder, descriptors.queue.clone()))
             .expect("Submit thread should be running");
-        self.submitting = true;
+        self.jobs_in_flight += 1;
     }
 
     pub fn submit_direct(&mut self, descriptors: &Descriptors) -> SubmissionIndex {

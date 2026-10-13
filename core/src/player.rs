@@ -2170,10 +2170,10 @@ impl Player {
             let view_matrix = gc_root.stage.view_matrix();
             view_matrix.a.abs().min(view_matrix.d.abs())
         });
-        ruffle_render::filters::set_view_scale(view_scale);
+        ruffle_render::filters::set_view_scale(Some(view_scale));
         self.renderer
             .submit_frame(background_color, commands, cache_draws);
-        ruffle_render::filters::set_view_scale(1.0);
+        ruffle_render::filters::set_view_scale(None);
 
         self.needs_render = false;
         if self.perf_stats.is_some() {

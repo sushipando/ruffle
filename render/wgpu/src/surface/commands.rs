@@ -958,6 +958,13 @@ impl WgpuCommandHandler<'_, '_> {
             {
                 BlendType::Trivial(TrivialBlend::MultiplyOpaque)
             }
+            BlendType::Complex(_)
+                if ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::ComplexAsNormal,
+                ) =>
+            {
+                BlendType::Trivial(TrivialBlend::Normal)
+            }
             // A shader may produce any alpha.
             BlendType::Shader(shader) => {
                 self.opaque = false;

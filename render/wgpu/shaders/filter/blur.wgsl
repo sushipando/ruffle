@@ -70,3 +70,36 @@ fn main_fragment(in: filter__VertexOutput) -> @location(0) vec4<f32> {
     // This rounding imitates the fixed-point computations of FP, improving emulation accuracy.
     return floor(result * 255.0) / 255.0;
 }
+
+// All passes of a blur in one direction at once (see `BlurFilter::apply_merged`):
+// the box blurs combined into one kernel, sampled as pairs of neighboring texels.
+struct Kernel {
+    // One of these is always 0.0, the other is the size of a texel.
+    dir_x: f32,
+    dir_y: f32,
+    // The number of taps.
+    count: u32,
+    _padding: u32,
+    // Two taps per element: (offset, weight, offset, weight), offsets in texels.
+    taps: array<vec4<f32>, 128>,
+}
+
+@group(0) @binding(3) var<uniform> kernel: Kernel;
+
+@vertex
+fn kernel_vertex(in: filter__VertexInput) -> filter__VertexOutput {
+    return filter__main_vertex(in);
+}
+
+@fragment
+fn kernel_fragment(in: filter__VertexOutput) -> @location(0) vec4<f32> {
+    let direction = vec2<f32>(kernel.dir_x, kernel.dir_y);
+    var total = vec4<f32>(0.0);
+    for (var i = 0u; i < kernel.count; i += 2u) {
+        let pair = kernel.taps[i / 2u];
+        total += textureSample(texture, texture_sampler, in.uv + direction * pair.x) * pair.y;
+        total += textureSample(texture, texture_sampler, in.uv + direction * pair.z) * pair.w;
+    }
+    // This rounding imitates the fixed-point computations of FP, improving emulation accuracy.
+    return floor(total * 255.0) / 255.0;
+}
