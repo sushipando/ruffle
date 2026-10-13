@@ -261,6 +261,10 @@ impl RenderTarget for MovieView {
     ) -> wgpu::SubmissionIndex {
         queue.submit(command_buffers)
     }
+
+    fn can_submit_asynchronously(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]

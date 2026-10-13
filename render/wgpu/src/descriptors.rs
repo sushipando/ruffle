@@ -24,6 +24,7 @@ pub struct Descriptors {
     pub shaders: Shaders,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
+    pub msaa_region_resolve: crate::msaa_resolve::MsaaRegionResolve,
 }
 
 impl Debug for Descriptors {
@@ -45,6 +46,7 @@ impl Descriptors {
         let shaders = Shaders::new(&device);
         let quad = Quad::new(&device);
         let filters = Filters::new(&device);
+        let msaa_region_resolve = crate::msaa_resolve::MsaaRegionResolve::new(&device);
         let backend = adapter.get_info().backend;
 
         Self {
@@ -61,6 +63,7 @@ impl Descriptors {
             shaders,
             pipelines: Default::default(),
             filters,
+            msaa_region_resolve,
         }
     }
 

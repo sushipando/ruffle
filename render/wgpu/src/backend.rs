@@ -5,6 +5,7 @@ use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::FilterSource;
 use crate::mesh::{CommonGradient, Mesh, PendingDraw};
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
+use crate::surface::target::CommandTarget;
 use crate::surface::{LayerRef, Surface};
 use crate::target::{MaybeOwnedBuffer, TextureTarget};
 use crate::target::{RenderTargetFrame, TextureBufferInfo};
@@ -72,6 +73,10 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) descriptors: Arc<Descriptors>,
     target: T,
     surface: Surface,
+    /// See `RenderBackend::set_visible_region`.
+    visible_region: Option<(i32, i32, u32, u32)>,
+    /// A surface covering just `visible_region`, used instead of `surface` when set.
+    region_surface: Option<((i32, i32, u32, u32), Surface)>,
     meshes: Vec<Mesh>,
     shape_tessellator: ShapeTessellator,
     // This is currently unused - we just store it to report in
@@ -80,7 +85,6 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     texture_pool: TexturePool,
     offscreen_texture_pool: TexturePool,
     pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
-    dynamic_transforms: DynamicTransforms,
     active_frame: ActiveFrame,
     profiler: GpuProfiler,
 }
@@ -249,7 +253,6 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             },
         ));
 
-        let transforms = DynamicTransforms::new(&descriptors);
         let active_frame = ActiveFrame::new(&descriptors);
 
         let profiler_settings = GpuProfilerSettings {
@@ -271,13 +274,14 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             descriptors,
             target,
             surface,
+            visible_region: None,
+            region_surface: None,
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
             offscreen_texture_pool: TexturePool::new(),
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
-            dynamic_transforms: transforms,
             active_frame,
             profiler,
         })
@@ -309,6 +313,15 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 gradient,
                 &mut uniform_buffer,
             ));
+        }
+
+        let mut bounds: Option<(f32, f32, f32, f32)> = None;
+        for vertex in lyon_mesh.draws.iter().flat_map(|draw| &draw.vertices) {
+            let (x, y) = (vertex.x, vertex.y);
+            bounds = Some(match bounds {
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                None => (x, y, x, y),
+            });
         }
 
         for draw in lyon_mesh.draws {
@@ -351,6 +364,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             draws,
             vertex_buffer,
             index_buffer,
+            bounds,
         }
     }
 
@@ -453,6 +467,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.viewport_scale_factor = dimensions.scale_factor;
         self.texture_pool = TexturePool::new();
+        self.region_surface = None;
+    }
+
+    fn set_visible_region(&mut self, region: Option<(i32, i32, u32, u32)>) {
+        let (width, height) = (self.target.width(), self.target.height());
+        self.visible_region = region.filter(|&(x, y, w, h)| {
+            ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::VisibleRegion)
+                && x >= 0
+                && y >= 0
+                && w > 0
+                && h > 0
+                && x as u32 + w <= width
+                && y as u32 + h <= height
+                // Only worth it if it saves a meaningful amount.
+                && (w as u64 * h as u64) * 10 < (width as u64 * height as u64) * 9
+        });
     }
 
     fn create_context3d(
@@ -549,6 +579,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
+        // The previous frame may still be being submitted on another thread;
+        // its staging buffers must be recalled before this frame's are finished.
+        self.active_frame.wait_for_submission();
         let Some(frame_output) = self.target.get_next_texture() else {
             // Attempt to recreate the swap chain in this case.
             self.target.resize(
@@ -559,7 +592,67 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return;
         };
 
-        for entry in cache_entries {
+        // Cache entries whose contents are simple enough are all drawn together in an
+        // atlas, and copied into their textures. They mustn't use other cache entries'
+        // textures, as those may not be drawn yet.
+        let cache_handles: Vec<_> = cache_entries.iter().map(|e| e.handle.clone()).collect();
+        let is_atlased: Vec<bool> = cache_entries
+            .iter()
+            .map(|entry| {
+                let texture = as_texture(&entry.handle);
+                ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LayerAtlas)
+                    && entry.clear.a == 0
+                    && entry.clear.r == 0
+                    && entry.clear.g == 0
+                    && entry.clear.b == 0
+                    && crate::surface::layer_atlas::is_leaf(
+                        &entry.commands,
+                        texture.texture.width(),
+                        texture.texture.height(),
+                    ) && !entry.commands.commands.iter().any(|command| {
+                    matches!(command, ruffle_render::commands::Command::RenderBitmap { bitmap, .. }
+                            if cache_handles.contains(bitmap))
+                })
+            })
+            .collect();
+        let mut cache_entries: Vec<_> = cache_entries.into_iter().map(Some).collect();
+        let atlased: Vec<_> = cache_entries
+            .iter_mut()
+            .zip(&is_atlased)
+            .filter(|(_, atlased)| **atlased)
+            .filter_map(|(entry, _)| {
+                let entry = entry.as_mut()?;
+                let texture = as_texture(&entry.handle);
+                Some(crate::surface::layer_atlas::LeafLayer {
+                    commands: std::mem::take(&mut entry.commands),
+                    origin: (0, 0),
+                    width: texture.texture.width(),
+                    height: texture.texture.height(),
+                    destination: texture.texture.clone(),
+                })
+            })
+            .collect();
+        if !atlased.is_empty() {
+            crate::surface::layer_atlas::render_leaf_layers(
+                atlased,
+                &self.descriptors,
+                &self.meshes,
+                &mut self.active_frame.staging_belt,
+                &self.active_frame.dynamic_transforms,
+                &mut self
+                    .profiler
+                    .scope("Draw to CABs", &mut self.active_frame.command_encoder),
+                &mut self.offscreen_texture_pool,
+                self.surface.quality(),
+            );
+        }
+
+        for (entry, atlased) in cache_entries.into_iter().zip(is_atlased) {
+            let entry = entry.expect("entries are only taken once");
+            crate::perf_counters::count(crate::perf_counters::Counter::CacheEntry);
+            if !entry.filters.is_empty() {
+                crate::perf_counters::count(crate::perf_counters::Counter::CacheEntryFiltered);
+            }
             let texture = as_texture(&entry.handle);
             let surface = Surface::new(
                 &self.descriptors,
@@ -568,28 +661,28 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 texture.texture.height(),
                 wgpu::TextureFormat::Rgba8Unorm,
             );
+            let clear = wgpu::Color {
+                r: f64::from(entry.clear.r) / 255.0,
+                g: f64::from(entry.clear.g) / 255.0,
+                b: f64::from(entry.clear.b) / 255.0,
+                a: f64::from(entry.clear.a) / 255.0,
+            };
             if entry.filters.is_empty() {
-                surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(
-                        texture.texture.clone(),
-                        wgpu::Color {
-                            r: f64::from(entry.clear.r) / 255.0,
-                            g: f64::from(entry.clear.g) / 255.0,
-                            b: f64::from(entry.clear.b) / 255.0,
-                            a: f64::from(entry.clear.a) / 255.0,
-                        },
-                    ),
-                    &self.descriptors,
-                    &self.meshes,
-                    entry.commands,
-                    &mut self.active_frame.staging_belt,
-                    &self.dynamic_transforms,
-                    &mut self
-                        .profiler
-                        .scope("Draw to CAB", &mut self.active_frame.command_encoder),
-                    LayerRef::None,
-                    &mut self.offscreen_texture_pool,
-                );
+                if !atlased {
+                    surface.draw_commands(
+                        RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear),
+                        &self.descriptors,
+                        &self.meshes,
+                        entry.commands,
+                        &mut self.active_frame.staging_belt,
+                        &self.active_frame.dynamic_transforms,
+                        &mut self
+                            .profiler
+                            .scope("Draw to CAB", &mut self.active_frame.command_encoder),
+                        LayerRef::None,
+                        &mut self.offscreen_texture_pool,
+                    );
+                }
             } else {
                 let mut scope = self
                     .profiler
@@ -598,44 +691,71 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 // so that we can safely start by using the actual CAB texture.
                 // It's guaranteed that at least one filter would have used it and moved the target to something else,
                 // letting us safely copy back to it later.
-                let mut target = surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(
-                        texture.texture.clone(),
-                        wgpu::Color {
-                            r: f64::from(entry.clear.r) / 255.0,
-                            g: f64::from(entry.clear.g) / 255.0,
-                            b: f64::from(entry.clear.b) / 255.0,
-                            a: f64::from(entry.clear.a) / 255.0,
-                        },
-                    ),
-                    &self.descriptors,
-                    &self.meshes,
-                    entry.commands,
-                    &mut self.active_frame.staging_belt,
-                    &self.dynamic_transforms,
-                    &mut scope.scope("Draw to CAB"),
-                    LayerRef::None,
-                    &mut self.offscreen_texture_pool,
-                );
+                let mut target: Option<CommandTarget> = if atlased {
+                    // Already drawn into the texture.
+                    None
+                } else {
+                    Some(surface.draw_commands(
+                        RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear),
+                        &self.descriptors,
+                        &self.meshes,
+                        entry.commands,
+                        &mut self.active_frame.staging_belt,
+                        &self.active_frame.dynamic_transforms,
+                        &mut scope.scope("Draw to CAB"),
+                        LayerRef::None,
+                        &mut self.offscreen_texture_pool,
+                    ))
+                };
+                if crate::perf_counters::enabled() {
+                    let (w, h) = (texture.texture.width(), texture.texture.height());
+                    let size = match w * h {
+                        0..=4096 => "tiny",
+                        4097..=65536 => "small",
+                        65537..=262144 => "medium",
+                        _ => "large",
+                    };
+                    let names: Vec<_> = entry.filters.iter().map(|f| f.name()).collect();
+                    crate::perf_counters::count_named(format!("cab/{size}/{}", names.join("+")));
+                }
                 for filter in entry.filters {
-                    target = self.descriptors.filters.apply(
+                    crate::perf_counters::count(crate::perf_counters::Counter::Filter);
+                    let source = match &target {
+                        Some(target) => target.color_texture(),
+                        None => &texture.texture,
+                    };
+                    target = Some(self.descriptors.filters.apply(
                         &self.descriptors,
                         &mut scope.scope(filter.name()),
                         &mut self.offscreen_texture_pool,
                         &mut self.active_frame.staging_belt,
-                        FilterSource::for_entire_texture(target.color_texture()),
+                        FilterSource::for_entire_texture(source),
                         filter,
+                    ));
+                }
+                let target = target.expect("there's at least one filter");
+                let result = target.color_texture();
+                if result.sample_count() == 1
+                    && result.size() == texture.texture.size()
+                    && result.format() == texture.texture.format()
+                {
+                    // Same as the copy pipeline below, but without a render pass.
+                    scope.copy_texture_to_texture(
+                        result.as_image_copy(),
+                        texture.texture.as_image_copy(),
+                        result.size(),
+                    );
+                } else {
+                    run_copy_pipeline(
+                        &self.descriptors,
+                        texture.texture.format(),
+                        &texture.texture.create_view(&Default::default()),
+                        target.color_view(),
+                        target.globals(),
+                        target.color_texture().sample_count(),
+                        &mut scope.scope("Copy filtered to CAB"),
                     );
                 }
-                run_copy_pipeline(
-                    &self.descriptors,
-                    texture.texture.format(),
-                    &texture.texture.create_view(&Default::default()),
-                    target.color_view(),
-                    target.globals(),
-                    target.color_texture().sample_count(),
-                    &mut scope.scope("Copy filtered to CAB"),
-                );
             }
             // Periodically flush GPU work to prevent OOM when many cache entries
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
@@ -643,7 +763,29 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.active_frame.maybe_flush(&self.descriptors);
         }
 
-        self.surface.draw_commands_and_copy_to(
+        let surface = match self.visible_region {
+            Some(region) => {
+                let quality = self.surface.quality();
+                if !matches!(&self.region_surface, Some((r, s)) if *r == region && s.quality() == quality)
+                {
+                    let (x, y, width, height) = region;
+                    self.region_surface = Some((
+                        region,
+                        Surface::new(
+                            &self.descriptors,
+                            quality,
+                            width,
+                            height,
+                            self.target.format(),
+                        )
+                        .with_origin((x, y)),
+                    ));
+                }
+                &self.region_surface.as_ref().expect("just created").1
+            }
+            None => &self.surface,
+        };
+        surface.draw_commands_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithColor(wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
@@ -653,7 +795,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             }),
             &self.descriptors,
             &mut self.active_frame.staging_belt,
-            &self.dynamic_transforms,
+            &self.active_frame.dynamic_transforms,
             &mut self
                 .profiler
                 .scope("Frame commands", &mut self.active_frame.command_encoder),
@@ -661,14 +803,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             commands,
             LayerRef::None,
             &mut self.texture_pool,
+            self.visible_region,
         );
         self.profiler
             .resolve_queries(&mut self.active_frame.command_encoder);
         self.active_frame.staging_belt.finish();
 
         self.active_frame
-            .submit_for_target(&self.descriptors, &self.target, frame_output);
-        self.offscreen_texture_pool = TexturePool::new();
+            .submit_for_target_async(&self.descriptors, &self.target, frame_output);
+        self.offscreen_texture_pool.end_frame();
+        self.texture_pool.end_frame();
+        crate::perf_counters::end_frame();
         self.profiler
             .end_frame()
             .expect("Frame should end successfully");
@@ -826,7 +971,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             RenderTargetMode::FreshWithTexture(target.get_texture()),
             &self.descriptors,
             &mut self.active_frame.staging_belt,
-            &self.dynamic_transforms,
+            &self.active_frame.dynamic_transforms,
             &mut self
                 .profiler
                 .scope("Offscreen commands", &mut self.active_frame.command_encoder),
@@ -834,6 +979,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             commands,
             LayerRef::Current,
             &mut self.offscreen_texture_pool,
+            None,
         );
 
         self.active_frame.maybe_flush(&self.descriptors);
@@ -1275,7 +1421,42 @@ impl RenderTargetMode {
 pub struct ActiveFrame {
     pub staging_belt: wgpu::util::StagingBelt,
     pub command_encoder: wgpu::CommandEncoder,
+    pub dynamic_transforms: DynamicTransforms,
     draws_since_flush: u32,
+    /// Finishes and submits frames on another thread (see `submit_for_target_async`).
+    submitter: Option<AsyncSubmitter>,
+    /// Whether a frame is still being submitted by `submitter`.
+    submitting: bool,
+}
+
+/// A thread that finishes command encoders and submits them.
+///
+/// Finishing an encoder (where wgpu actually encodes the commands for the GPU)
+/// and submitting it is the most expensive part of rendering a complex frame.
+/// Doing it on another thread lets the next frame's scripts run meanwhile.
+struct AsyncSubmitter {
+    jobs: std::sync::mpsc::Sender<(wgpu::CommandEncoder, wgpu::Queue)>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl AsyncSubmitter {
+    fn new() -> Self {
+        let (jobs, job_receiver) =
+            std::sync::mpsc::channel::<(wgpu::CommandEncoder, wgpu::Queue)>();
+        let (done_sender, done) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("ruffle-wgpu-submit".to_string())
+            .spawn(move || {
+                for (encoder, queue) in job_receiver {
+                    queue.submit(Some(encoder.finish()));
+                    if done_sender.send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("Submit thread should be created");
+        Self { jobs, done }
+    }
 }
 
 impl ActiveFrame {
@@ -1287,7 +1468,25 @@ impl ActiveFrame {
                 .device
                 .create_command_encoder(&Default::default()),
             staging_belt: wgpu::util::StagingBelt::new(descriptors.device.clone(), 65536),
+            dynamic_transforms: DynamicTransforms::new(descriptors),
             draws_since_flush: 0,
+            submitter: None,
+            submitting: false,
+        }
+    }
+
+    /// Waits until a frame being submitted on another thread has been submitted.
+    /// Anything that must happen after the previous frame on the queue
+    /// (such as further submissions or buffer writes) must call this first.
+    pub fn wait_for_submission(&mut self) {
+        if self.submitting {
+            let submitter = self
+                .submitter
+                .as_ref()
+                .expect("submitting implies a submitter");
+            let _ = submitter.done.recv();
+            self.submitting = false;
+            self.staging_belt.recall();
         }
     }
 
@@ -1297,8 +1496,10 @@ impl ActiveFrame {
         target: &T,
         frame: T::Frame,
     ) -> SubmissionIndex {
+        self.wait_for_submission();
         self.draws_since_flush = 0;
         self.staging_belt.finish();
+        self.dynamic_transforms.flush(&descriptors.queue);
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder,
             descriptors
@@ -1315,9 +1516,45 @@ impl ActiveFrame {
         index
     }
 
-    pub fn submit_direct(&mut self, descriptors: &Descriptors) -> SubmissionIndex {
+    /// Like `submit_for_target`, but if the target allows it, the frame is finished
+    /// and submitted on another thread, and this returns without waiting for that.
+    pub fn submit_for_target_async<T: RenderTarget>(
+        &mut self,
+        descriptors: &Descriptors,
+        target: &T,
+        frame: T::Frame,
+    ) {
+        if !target.can_submit_asynchronously()
+            || !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::AsyncSubmit)
+        {
+            self.submit_for_target(descriptors, target, frame);
+            return;
+        }
+        self.wait_for_submission();
         self.draws_since_flush = 0;
         self.staging_belt.finish();
+        self.dynamic_transforms.flush(&descriptors.queue);
+        let draw_encoder = std::mem::replace(
+            &mut self.command_encoder,
+            descriptors
+                .device
+                .create_command_encoder(&Default::default()),
+        );
+        drop(frame);
+        let submitter = self.submitter.get_or_insert_with(AsyncSubmitter::new);
+        submitter
+            .jobs
+            .send((draw_encoder, descriptors.queue.clone()))
+            .expect("Submit thread should be running");
+        // The staging belt is recalled once the submission is done.
+        self.submitting = true;
+    }
+
+    pub fn submit_direct(&mut self, descriptors: &Descriptors) -> SubmissionIndex {
+        self.wait_for_submission();
+        self.draws_since_flush = 0;
+        self.staging_belt.finish();
+        self.dynamic_transforms.flush(&descriptors.queue);
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder,
             descriptors
@@ -1337,6 +1574,7 @@ impl ActiveFrame {
         self.draws_since_flush += 1;
 
         if self.draws_since_flush > Self::MAX_DRAWS_PER_FLUSH {
+            crate::perf_counters::count(crate::perf_counters::Counter::Flush);
             self.submit_direct(descriptors);
         }
     }

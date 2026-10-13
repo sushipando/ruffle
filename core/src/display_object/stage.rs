@@ -646,6 +646,30 @@ impl<'gc> Stage<'gc> {
         context.transform_stack.pop();
     }
 
+    /// The region of the viewport (as `(x, y, width, height)`) outside of which
+    /// the letterbox hides everything, if it is drawn.
+    pub fn visible_region(
+        self,
+        viewport_width: u32,
+        viewport_height: u32,
+    ) -> Option<(i32, i32, u32, u32)> {
+        if !self.should_letterbox() {
+            return None;
+        }
+        let letterbox_matrix = self.0.letterbox_matrix.get();
+        let (movie_width, movie_height) = self.0.movie_size.get();
+        let x0 = letterbox_matrix.tx.to_pixels().floor().max(0.0);
+        let y0 = letterbox_matrix.ty.to_pixels().floor().max(0.0);
+        let x1 = (letterbox_matrix.tx.to_pixels() + movie_width as f64 * letterbox_matrix.a as f64)
+            .ceil()
+            .min(viewport_width as f64);
+        let y1 = (letterbox_matrix.ty.to_pixels()
+            + movie_height as f64 * letterbox_matrix.d as f64)
+            .ceil()
+            .min(viewport_height as f64);
+        (x1 > x0 && y1 > y0).then_some((x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32))
+    }
+
     /// Draw the stage's letterbox.
     fn draw_letterbox(self, context: &mut RenderContext<'_, 'gc>) {
         let ViewportDimensions {

@@ -49,6 +49,7 @@ use crate::loader::{LoadBehavior, LoadManager};
 use crate::local_connection::LocalConnections;
 use crate::net_connection::NetConnections;
 use crate::orphan_manager::OrphanManager;
+use crate::perf_stats::PerfStats;
 use crate::prelude::*;
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
@@ -366,6 +367,9 @@ pub struct Player {
     frame_accumulator: FloatDuration,
     recent_run_frame_timings: VecDeque<f64>,
 
+    /// Optional per-second timing log, enabled via `RUFFLE_PERF`.
+    perf_stats: Option<PerfStats>,
+
     /// Faked time passage for fooling hand-written busy-loop FPS limiters.
     time_offset: u32,
 
@@ -561,7 +565,11 @@ impl Player {
         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
-            let elapsed = timer.elapsed().as_millis() as f64;
+            let elapsed_duration = timer.elapsed();
+            if let Some(stats) = &mut self.perf_stats {
+                stats.record_run_frame(elapsed_duration);
+            }
+            let elapsed = elapsed_duration.as_millis() as f64;
 
             self.add_frame_timing(elapsed);
 
@@ -606,6 +614,7 @@ impl Player {
         });
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
+        let other_start = Instant::now();
         self.update_sockets();
         self.update_net_connections();
         self.update_timers(dt);
@@ -613,6 +622,9 @@ impl Player {
             StreamManager::tick(context, dt);
         });
         self.audio.tick();
+        if let Some(stats) = &mut self.perf_stats {
+            stats.record_tick_other(other_start.elapsed());
+        }
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {
@@ -2093,6 +2105,7 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn render(&mut self) {
+        let render_start = Instant::now();
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {
@@ -2144,10 +2157,20 @@ impl Player {
             (cache_draws, commands)
         });
 
+        let viewport = self.renderer.viewport_dimensions();
+        let visible_region = self.enter_arena(|_, gc_root, _| {
+            gc_root
+                .stage
+                .visible_region(viewport.width, viewport.height)
+        });
+        self.renderer.set_visible_region(visible_region);
         self.renderer
             .submit_frame(background_color, commands, cache_draws);
 
         self.needs_render = false;
+        if let Some(stats) = &mut self.perf_stats {
+            stats.record_render(render_start.elapsed());
+        }
     }
 
     /// The current frame of the main timeline, if available.
@@ -3091,6 +3114,7 @@ impl PlayerBuilder {
                 frame_phase: Default::default(),
                 frame_accumulator: FloatDuration::ZERO,
                 recent_run_frame_timings: VecDeque::with_capacity(10),
+                perf_stats: PerfStats::from_env(),
                 start_time: Instant::now(),
                 time_offset: 0,
                 time_til_next_timer: None,
@@ -3257,6 +3281,9 @@ fn run_mouse_pick<'gc>(
     context: &mut UpdateContext<'gc>,
     require_button_mode: bool,
 ) -> Option<InteractiveObject<'gc>> {
+    // Picking doesn't run any scripts, so the display list can't change meanwhile.
+    let _cache = ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::PickCache)
+        .then(crate::display_object::global_matrix_cache::enable);
     context.stage.iter_render_list().rev().find_map(|level| {
         level.as_interactive().and_then(|l| {
             if l.as_displayobject().movie().is_action_script_3() {

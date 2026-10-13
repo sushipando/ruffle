@@ -8,15 +8,32 @@ use std::sync::{Arc, Mutex, Weak};
 type PoolInner<T> = Mutex<Vec<T>>;
 type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
 
+type TexturePoolEntry = BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>;
+
+/// Textures and globals of sizes unused for this many frames are freed.
+const UNUSED_FRAMES_TO_KEEP: u64 = 4;
+
 #[derive(Debug, Default)]
 pub struct TexturePool {
-    pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
-    globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    /// Each pool, with the frame it was last used in.
+    pools: FnvHashMap<TextureKey, (TexturePoolEntry, u64)>,
+    globals_cache: FnvHashMap<GlobalsKey, (Arc<Globals>, u64)>,
+    frame: u64,
 }
 
 impl TexturePool {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Frees textures and globals of sizes that haven't been used recently.
+    /// Without this, a pool used for content of varying sizes would grow forever.
+    pub fn end_frame(&mut self) {
+        self.frame += 1;
+        let oldest = self.frame.saturating_sub(UNUSED_FRAMES_TO_KEEP);
+        self.pools.retain(|_, (_, last_used)| *last_used >= oldest);
+        self.globals_cache
+            .retain(|_, (_, last_used)| *last_used >= oldest);
     }
 
     pub fn get_texture(
@@ -33,7 +50,8 @@ impl TexturePool {
             format,
             sample_count,
         };
-        let pool = self.pools.entry(key).or_insert_with(|| {
+        let frame = self.frame;
+        let (pool, last_used) = self.pools.entry(key).or_insert_with(|| {
             let label = if cfg!(feature = "render_debug_labels") {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static ID_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -42,7 +60,7 @@ impl TexturePool {
             } else {
                 None
             };
-            BufferPool::new(Box::new(move |descriptors, _description| {
+            let pool = BufferPool::new(Box::new(move |descriptors, _description| {
                 let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
                     label: label.as_deref(),
                     size,
@@ -55,8 +73,10 @@ impl TexturePool {
                 });
                 let view = texture.create_view(&Default::default());
                 (texture, view)
-            }))
+            }));
+            (pool, frame)
         });
+        *last_used = frame;
         pool.take(descriptors, AlwaysCompatible)
     }
 
@@ -66,20 +86,26 @@ impl TexturePool {
         viewport_width: u32,
         viewport_height: u32,
     ) -> Arc<Globals> {
-        self.globals_cache
+        let frame = self.frame;
+        let (globals, last_used) = self
+            .globals_cache
             .entry(GlobalsKey {
                 viewport_width,
                 viewport_height,
             })
             .or_insert_with(|| {
-                Arc::new(Globals::new(
-                    &descriptors.device,
-                    &descriptors.bind_layouts.globals,
-                    viewport_width,
-                    viewport_height,
-                ))
-            })
-            .clone()
+                (
+                    Arc::new(Globals::new(
+                        &descriptors.device,
+                        &descriptors.bind_layouts.globals,
+                        viewport_width,
+                        viewport_height,
+                    )),
+                    frame,
+                )
+            });
+        *last_used = frame;
+        globals.clone()
     }
 }
 

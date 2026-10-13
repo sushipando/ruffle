@@ -19,6 +19,8 @@ pub struct Mesh {
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// The bounds of all vertices, as `(x_min, y_min, x_max, y_max)` in local pixels.
+    pub bounds: Option<(f32, f32, f32, f32)>,
 }
 
 impl ShapeHandleImpl for Mesh {}

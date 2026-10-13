@@ -205,6 +205,31 @@ pub fn run_copy_pipeline(
     sample_count: u32,
     encoder: &mut CommandEncoder,
 ) {
+    run_copy_pipeline_into_region(
+        descriptors,
+        format,
+        frame_view,
+        input,
+        globals,
+        sample_count,
+        encoder,
+        None,
+    )
+}
+
+/// Like `run_copy_pipeline`, but if `region` (`(x, y, width, height)`) is given, the
+/// input is copied into just that region, and the rest of the output is made black.
+#[expect(clippy::too_many_arguments)]
+pub fn run_copy_pipeline_into_region(
+    descriptors: &Descriptors,
+    format: wgpu::TextureFormat,
+    frame_view: &wgpu::TextureView,
+    input: &wgpu::TextureView,
+    globals: &Globals,
+    sample_count: u32,
+    encoder: &mut CommandEncoder,
+    region: Option<(i32, i32, u32, u32)>,
+) {
     let copy_bind_group = descriptors
         .device
         .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -227,9 +252,14 @@ pub fn run_copy_pipeline(
     let pipeline = descriptors.copy_pipeline(format, sample_count);
 
     // We overwrite the pixels in the target texture (no blending at all),
-    // so this doesn't matter.
-    let load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+    // so this doesn't matter, except outside of the region we copy into.
+    let load = wgpu::LoadOp::Clear(if region.is_some() {
+        wgpu::Color::BLACK
+    } else {
+        wgpu::Color::TRANSPARENT
+    });
 
+    crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: create_debug_label!("Copy back to render target").as_deref(),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -246,6 +276,9 @@ pub fn run_copy_pipeline(
 
     render_pass.set_pipeline(&pipeline);
     render_pass.set_bind_group(0, globals.bind_group(), &[]);
+    if let Some((x, y, width, height)) = region {
+        render_pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
+    }
 
     render_pass.set_bind_group(2, &copy_bind_group, &[]);
 

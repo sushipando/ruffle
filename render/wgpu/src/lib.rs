@@ -47,6 +47,8 @@ mod dynamic_transforms;
 mod filters;
 mod layouts;
 mod mesh;
+mod msaa_resolve;
+mod perf_counters;
 mod shaders;
 mod surface;
 

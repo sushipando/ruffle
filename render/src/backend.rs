@@ -87,6 +87,14 @@ pub trait RenderBackend: Any {
         cache_entries: Vec<BitmapCacheEntry>,
     );
 
+    /// Sets the region of the viewport, as `(x, y, width, height)` in pixels, outside
+    /// of which everything is black in the following frames (e.g. because of
+    /// letterboxing). Backends may use this to render less. `None` means that the
+    /// whole viewport may be visible.
+    fn set_visible_region(&mut self, region: Option<(i32, i32, u32, u32)>) {
+        let _ = region;
+    }
+
     fn create_empty_texture(
         &mut self,
         width: NonZeroU32,

@@ -206,3 +206,13 @@ lto = "off"
 incremental = true
 # Right between the defaults of 16 and 256, for crate fragment caching.
 codegen-units = 64
+
+# Performance patches to wgpu, kept as tagged branches of
+# forks of their repositories ("Ruffle patch" comments mark the changes). All
+# wgpu crates come from the fork, so that they share one `wgpu-types` and `naga`.
+[patch.crates-io]
+wgpu = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-1" }
+wgpu-core = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-1" }
+wgpu-hal = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-1" }
+wgpu-types = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-1" }
+naga = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-1" }

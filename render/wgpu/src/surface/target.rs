@@ -3,7 +3,7 @@ use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool};
 use crate::descriptors::Descriptors;
 use crate::globals::Globals;
 use crate::utils::run_copy_pipeline;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -200,6 +200,9 @@ pub struct CommandTarget {
     sample_count: u32,
     color_needs_clear: OnceCell<bool>,
     render_target_mode: RenderTargetMode,
+    /// Whether the multisampled frame buffer has been drawn to since it was
+    /// last resolved into the resolve buffer.
+    needs_resolve: Cell<bool>,
 }
 
 impl CommandTarget {
@@ -212,6 +215,7 @@ impl CommandTarget {
         render_target_mode: RenderTargetMode,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Self {
+        crate::perf_counters::count(crate::perf_counters::Counter::CommandTarget);
         let globals = pool.get_globals(descriptors, size.width, size.height);
 
         let mut make_pooled_frame_buffer = || {
@@ -221,7 +225,7 @@ impl CommandTarget {
                 size,
                 format,
                 if sample_count > 1 {
-                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
                 } else {
                     wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::COPY_SRC
@@ -306,6 +310,7 @@ impl CommandTarget {
             sample_count,
             color_needs_clear: OnceCell::new(),
             render_target_mode,
+            needs_resolve: Cell::new(false),
         }
     }
 
@@ -324,6 +329,7 @@ impl CommandTarget {
         // If we aren't clearing with a color (eg a texture instead)
         // the there's no point in creating a new render pass that does nothing.
         if self.render_target_mode.color().is_some() {
+            crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: create_debug_label!("Clearing command target").as_deref(),
                 color_attachments: &[self.color_attachments()],
@@ -332,7 +338,35 @@ impl CommandTarget {
         }
     }
 
+    /// Ensures the target is cleared (if it was never drawn to), and that the
+    /// resolve buffer (if any) contains everything drawn so far.
+    pub fn ensure_resolved(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.ensure_cleared(encoder);
+        if !self.needs_resolve.replace(false) {
+            return;
+        }
+        let Some(resolve_buffer) = &self.resolve_buffer else {
+            return;
+        };
+        // An empty pass, just to resolve.
+        crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: create_debug_label!("Resolving command target").as_deref(),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: self.frame_buffer.view(),
+                resolve_target: Some(resolve_buffer.view()),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            ..Default::default()
+        });
+    }
+
     pub fn take_color_texture(self) -> PoolOrArcTexture {
+        debug_assert!(!self.needs_resolve.get(), "target must be resolved first");
         self.resolve_buffer
             .map(|b| b.take_texture())
             .unwrap_or_else(|| self.frame_buffer.take_texture())
@@ -342,6 +376,23 @@ impl CommandTarget {
         &self.globals
     }
 
+    /// Like `color_attachments`, but if `is_last` is set, the pass also resolves the
+    /// target (so that no separate resolve is needed afterwards).
+    pub fn color_attachments_for_pass(
+        &self,
+        is_last: bool,
+    ) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+        let mut attachment = self.color_attachments();
+        if is_last
+            && let (Some(attachment), Some(resolve_buffer)) =
+                (&mut attachment, &self.resolve_buffer)
+        {
+            attachment.resolve_target = Some(resolve_buffer.view());
+            self.needs_resolve.set(false);
+        }
+        attachment
+    }
+
     pub fn color_attachments(&self) -> Option<wgpu::RenderPassColorAttachment<'_>> {
         let mut load = wgpu::LoadOp::Load;
         if self.color_needs_clear.set(false).is_ok()
@@ -349,9 +400,18 @@ impl CommandTarget {
         {
             load = wgpu::LoadOp::Clear(clear_color);
         }
+        let lazy_resolve = self.resolve_buffer.is_some()
+            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LazyResolve);
+        let resolve_target = if lazy_resolve {
+            // Resolved later, by `ensure_resolved` or `copy_region_for_blend`.
+            self.needs_resolve.set(true);
+            None
+        } else {
+            self.resolve_buffer.as_ref().map(|b| b.view())
+        };
         Some(wgpu::RenderPassColorAttachment {
             view: self.frame_buffer.view(),
-            resolve_target: self.resolve_buffer.as_ref().map(|b| b.view()),
+            resolve_target,
             ops: wgpu::Operations {
                 load,
                 store: wgpu::StoreOp::Store,
@@ -404,7 +464,7 @@ impl CommandTarget {
                 pool,
             )
         });
-        self.ensure_cleared(encoder);
+        self.ensure_resolved(encoder);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: self
@@ -427,7 +487,165 @@ impl CommandTarget {
         blend_buffer
     }
 
+    /// Copies the given region of this target into a new texture of the region's size,
+    /// for use as the background of a bounded complex blend.
+    pub fn copy_region_for_blend(
+        &self,
+        descriptors: &Descriptors,
+        pool: &mut TexturePool,
+        encoder: &mut wgpu::CommandEncoder,
+        region: BlendRegion,
+    ) -> BlendBuffer {
+        let blend_buffer = BlendBuffer::new(
+            descriptors,
+            region.size(),
+            self.format,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            pool,
+        );
+        self.ensure_cleared(encoder);
+        if self.needs_resolve.get() {
+            // Only resolve the part of the frame buffer we need.
+            crate::msaa_resolve::MsaaRegionResolve::resolve(
+                descriptors,
+                encoder,
+                self.frame_buffer.view(),
+                blend_buffer.view(),
+                self.format,
+                (region.x, region.y),
+            );
+            return blend_buffer;
+        }
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.color_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
+                aspect: Default::default(),
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: blend_buffer.texture(),
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            region.size(),
+        );
+        blend_buffer
+    }
+
+    /// Like `copy_region_for_blend`, but for several non-overlapping regions at once.
+    /// If the target needs resolving, this takes a single render pass for all of them.
+    pub fn copy_regions_for_blends(
+        &self,
+        descriptors: &Descriptors,
+        pool: &mut TexturePool,
+        encoder: &mut wgpu::CommandEncoder,
+        regions: &[BlendRegion],
+    ) -> Vec<BlendBuffer> {
+        const USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+            .union(wgpu::TextureUsages::COPY_DST)
+            .union(wgpu::TextureUsages::COPY_SRC)
+            .union(wgpu::TextureUsages::RENDER_ATTACHMENT);
+        self.ensure_cleared(encoder);
+        let buffers: Vec<BlendBuffer> = regions
+            .iter()
+            .map(|region| BlendBuffer::new(descriptors, region.size(), self.format, USAGE, pool))
+            .collect();
+
+        let (source, positions) = if self.needs_resolve.get() {
+            // Resolve all regions into rows of an atlas, then copy them out of it.
+            let max_width = descriptors.limits.max_texture_dimension_2d;
+            let atlas_width = regions
+                .iter()
+                .map(|r| r.width)
+                .max()
+                .unwrap_or(1)
+                .max(4096.min(max_width));
+            let mut positions = Vec::with_capacity(regions.len());
+            let (mut x, mut y, mut row_height) = (0, 0, 0);
+            for region in regions {
+                if x + region.width > atlas_width {
+                    (x, y, row_height) = (0, y + row_height, 0);
+                }
+                positions.push((x, y));
+                x += region.width;
+                row_height = row_height.max(region.height);
+            }
+            // Round sizes up, so that textures can be reused between frames.
+            let atlas_width = atlas_width.next_multiple_of(256).min(max_width);
+            let atlas_height = (y + row_height).next_multiple_of(256).min(max_width);
+            if y + row_height > max_width {
+                // Too much to fit in one texture; do them one by one.
+                drop(buffers);
+                return regions
+                    .iter()
+                    .map(|region| self.copy_region_for_blend(descriptors, pool, encoder, *region))
+                    .collect();
+            }
+            let atlas = BlendBuffer::new(
+                descriptors,
+                wgpu::Extent3d {
+                    width: atlas_width,
+                    height: atlas_height,
+                    depth_or_array_layers: 1,
+                },
+                self.format,
+                USAGE,
+                pool,
+            );
+            let resolve_regions: Vec<_> = regions
+                .iter()
+                .zip(&positions)
+                .map(
+                    |(region, &destination)| crate::msaa_resolve::ResolveRegion {
+                        source: (region.x, region.y),
+                        destination,
+                        size: Some((region.width, region.height)),
+                    },
+                )
+                .collect();
+            crate::msaa_resolve::MsaaRegionResolve::resolve_many(
+                descriptors,
+                encoder,
+                self.frame_buffer.view(),
+                atlas.view(),
+                self.format,
+                &resolve_regions,
+            );
+            (Some(atlas), positions)
+        } else {
+            (None, regions.iter().map(|r| (r.x, r.y)).collect())
+        };
+
+        let source_texture = source
+            .as_ref()
+            .map(|atlas| atlas.texture())
+            .unwrap_or_else(|| self.color_texture());
+        for ((region, buffer), (x, y)) in regions.iter().zip(&buffers).zip(positions) {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: source_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: Default::default(),
+                },
+                buffer.texture().as_image_copy(),
+                region.size(),
+            );
+        }
+        buffers
+    }
+
     pub fn color_view(&self) -> &wgpu::TextureView {
+        debug_assert!(!self.needs_resolve.get(), "target must be resolved first");
         self.resolve_buffer
             .as_ref()
             .map(|b| b.view())
@@ -435,9 +653,36 @@ impl CommandTarget {
     }
 
     pub fn color_texture(&self) -> &wgpu::Texture {
+        debug_assert!(!self.needs_resolve.get(), "target must be resolved first");
         self.resolve_buffer
             .as_ref()
             .map(|b| b.texture())
             .unwrap_or_else(|| self.frame_buffer.texture())
+    }
+}
+
+/// A rectangle of pixels within a `CommandTarget`, in the target's own texture coordinates.
+#[derive(Debug, Clone, Copy)]
+pub struct BlendRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl BlendRegion {
+    pub fn overlaps(&self, other: &BlendRegion) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
+
+    pub fn size(&self) -> wgpu::Extent3d {
+        wgpu::Extent3d {
+            width: self.width,
+            height: self.height,
+            depth_or_array_layers: 1,
+        }
     }
 }

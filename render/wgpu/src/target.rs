@@ -35,6 +35,13 @@ pub trait RenderTarget: Debug + 'static {
         command_buffers: I,
         frame: Self::Frame,
     ) -> wgpu::SubmissionIndex;
+
+    /// Whether `submit` does nothing but submit the command buffers to the queue,
+    /// so that rendered frames may instead be finished and submitted on another
+    /// thread (overlapping with whatever the caller does next).
+    fn can_submit_asynchronously(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]

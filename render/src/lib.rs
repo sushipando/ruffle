@@ -9,6 +9,7 @@ pub mod filters;
 pub mod lines;
 pub mod matrix;
 pub mod matrix3d;
+pub mod perf_flags;
 pub mod perspective_projection;
 pub mod pixel_bender_support;
 // The `renderdoc` crate doesn't compile on apple platforms

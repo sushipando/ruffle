@@ -21,7 +21,8 @@ impl BindLayouts {
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
+                    // Each chunk binds its own region of the transforms arena.
+                    has_dynamic_offset: true,
                     min_binding_size: wgpu::BufferSize::new(
                         transforms_per_draw(&device.limits()) * size_of::<Transforms>() as u64,
                     ),

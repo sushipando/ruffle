@@ -36,6 +36,7 @@ pub mod loader;
 mod local_connection;
 mod net_connection;
 mod orphan_manager;
+mod perf_stats;
 pub mod pixel_bender;
 mod player;
 mod prelude;

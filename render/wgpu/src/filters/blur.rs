@@ -320,6 +320,7 @@ impl BlurFilter {
                 ],
             });
 
+        crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
         let mut render_pass = draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: create_debug_label!("Blur filter").as_deref(),
             color_attachments: &[destination.color_attachments()],

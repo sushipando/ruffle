@@ -1168,13 +1168,62 @@ pub fn render_base<'gc>(
             } else {
                 RenderBlendMode::Builtin(blend_mode.try_into().unwrap())
             };
-            context.commands.blend(sub_commands, render_blend_mode);
+            let bounds = blend_layer_bounds(
+                this,
+                &context.transform_stack.transform().matrix,
+                &context.stage.view_matrix(),
+            );
+            match bounds {
+                Some(bounds) => {
+                    context
+                        .commands
+                        .blend_bounded(sub_commands, render_blend_mode, bounds)
+                }
+                None => context.commands.blend(sub_commands, render_blend_mode),
+            }
         }
     }
 
     if options.apply_transform {
         context.transform_stack.pop();
     }
+}
+
+/// Computes conservative bounds of everything `this` renders (including filters),
+/// for use as the size of its blend layer.
+///
+/// Returns `None` if the bounds can't be trusted to contain the rendered output,
+/// such as with `scrollRect` (whose content is drawn offset from its bounds), or
+/// if the subtree contains blend modes that read pixels outside of their own bounds.
+fn blend_layer_bounds<'gc>(
+    this: DisplayObject<'gc>,
+    matrix: &Matrix,
+    view_matrix: &Matrix,
+) -> Option<Rectangle<Twips>> {
+    if this.scroll_rect().is_some()
+        || matches!(
+            this.blend_mode(),
+            ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase | ExtendedBlendMode::Shader
+        )
+    {
+        return None;
+    }
+
+    let mut bounds = *matrix * this.self_bounds(BoundsMode::Engine);
+
+    if let Some(ctr) = this.as_container() {
+        for child in ctr.iter_render_list() {
+            let matrix = *matrix * child.base().matrix();
+            bounds = bounds.union(&blend_layer_bounds(child, &matrix, view_matrix)?);
+        }
+    }
+
+    for mut filter in this.filters().iter().cloned() {
+        filter.scale(view_matrix.a, view_matrix.d);
+        bounds = filter.calculate_dest_rect(bounds);
+    }
+
+    Some(bounds)
 }
 
 /// This applies the **standard** method of `mask` and `scrollRect`.
@@ -1504,6 +1553,9 @@ pub trait TDisplayObject<'gc>:
     /// Should only be used to implement 'Transform.concatenatedMatrix'
     #[no_dynamic]
     fn local_to_global_matrix_without_own_scroll_rect(self) -> Matrix {
+        if let Some(parent_matrix) = global_matrix_cache::parent_matrix(self.parent()) {
+            return parent_matrix * self.base().matrix();
+        }
         let mut node = self.parent();
         let mut matrix = self.base().matrix();
         while let Some(display_object) = node {
@@ -3287,5 +3339,85 @@ impl<'gc> DisplayObjectWeak<'gc> {
             DisplayObjectWeak::LoaderDisplay(ld) => ld.upgrade(mc).map(|ld| ld.into()),
             DisplayObjectWeak::Bitmap(b) => b.upgrade(mc).map(|ld| ld.into()),
         }
+    }
+}
+
+/// A cache of the matrices from objects' local space (including their own
+/// `scrollRect`) to stage space, used while the display list can't change.
+///
+/// Mouse picking visits almost every object, and computing each of their global
+/// matrices by walking up to the root was a large part of the frame time in
+/// content with deep display lists. With this active, every object's matrix is
+/// computed from its parent's cached one instead.
+pub mod global_matrix_cache {
+    use super::{DisplayObject, TDisplayObject};
+    use crate::prelude::Matrix;
+    use fnv::FnvHashMap;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CACHE: RefCell<Option<FnvHashMap<usize, Matrix>>> = const { RefCell::new(None) };
+    }
+
+    /// Enables the cache until the returned guard is dropped.
+    /// The display list (and matrices) must not change while it's enabled.
+    pub fn enable() -> Guard {
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let was_enabled = cache.is_some();
+            if !was_enabled {
+                *cache = Some(FnvHashMap::default());
+            }
+            Guard { was_enabled }
+        })
+    }
+
+    pub struct Guard {
+        was_enabled: bool,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.was_enabled {
+                CACHE.with(|cache| *cache.borrow_mut() = None);
+            }
+        }
+    }
+
+    /// The matrix from `node`'s local space (after its `scrollRect`) to stage space,
+    /// if the cache is enabled. `None` and the stage map to the identity.
+    pub fn parent_matrix(node: Option<DisplayObject<'_>>) -> Option<Matrix> {
+        let enabled = CACHE.with(|cache| cache.borrow().is_some());
+        if !enabled {
+            return None;
+        }
+        Some(compute(node))
+    }
+
+    fn compute(node: Option<DisplayObject<'_>>) -> Matrix {
+        let Some(node) = node else {
+            return Matrix::IDENTITY;
+        };
+        // We want to transform to Stage-local coordinates,
+        // so do *not* apply the Stage's matrix
+        if node.as_stage().is_some() {
+            return Matrix::IDENTITY;
+        }
+        let key = node.as_ptr() as usize;
+        if let Some(matrix) =
+            CACHE.with(|cache| cache.borrow().as_ref().and_then(|c| c.get(&key).copied()))
+        {
+            return matrix;
+        }
+        let mut matrix = compute(node.parent()) * node.base().matrix();
+        if let Some(rect) = node.scroll_rect() {
+            matrix *= Matrix::translate(-rect.x_min, -rect.y_min);
+        }
+        CACHE.with(|cache| {
+            if let Some(cache) = cache.borrow_mut().as_mut() {
+                cache.insert(key, matrix);
+            }
+        });
+        matrix
     }
 }
