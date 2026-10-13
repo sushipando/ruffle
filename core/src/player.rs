@@ -2086,6 +2086,8 @@ impl Player {
             return;
         }
 
+        self.add_minimum_gc_work();
+
         self.update(|context| {
             // TODO: Is this order correct?
             run_all_phases_avm2(context);
@@ -2207,6 +2209,35 @@ impl Player {
                 stats.record_render(render_start.elapsed());
             }
         }
+    }
+
+    /// Makes sure that garbage collection keeps going (by adding to the GC's debt) even
+    /// when little is allocated, so that a whole cycle takes at most about
+    /// `RUFFLE_GC_MAX_CYCLE_SECS` (default 10) seconds.
+    ///
+    /// gc-arena only collects in proportion to allocations. In a quiet scene, garbage
+    /// could then stay around for minutes: memory, but also CPU time, because orphaned
+    /// movie clips keep running their frames until they're collected (hundreds of them
+    /// after much of the content is replaced, adding several ms to every frame).
+    fn add_minimum_gc_work(&mut self) {
+        static MAX_CYCLE_SECS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+            std::env::var("RUFFLE_GC_MAX_CYCLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10.0)
+        });
+        if *MAX_CYCLE_SECS <= 0.0 {
+            return;
+        }
+        // With gc-arena's default pacing, a cycle costs about 0.55 units of debt per
+        // object (marking and tracing the live ones, sweeping all of them).
+        const DEBT_PER_OBJECT: f64 = 0.55;
+        let frames_per_cycle = *MAX_CYCLE_SECS * self.frame_rate.clamp(1.0, 120.0);
+        let arena = self.gc_arena.borrow();
+        let objects = arena.metrics().total_gc_count() as f64;
+        arena
+            .metrics()
+            .adjust_debt(objects * DEBT_PER_OBJECT / frames_per_cycle);
     }
 
     /// Diagnostics: runs a whole garbage collection cycle now.
