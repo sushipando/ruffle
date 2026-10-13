@@ -40,20 +40,23 @@ const COPY_UNIFORM: BlurUniform = BlurUniform {
 
 /// How many times lower the resolution of a blur may be (see `BlurFilter::apply_downscaled`).
 ///
-/// It's never lower than the movie's own resolution (so it's always 1 when the stage
-/// isn't magnified, as in the tests), and the downscaled blur must still be at least 4
-/// pixels in both directions.
+/// Only when the stage is magnified (never in the tests): 2 if the blur is at least 8
+/// pixels in both directions (so never below the movie's own resolution), and 4 if it's
+/// at least 64 (so still at least 16 pixels at a quarter of the resolution; such large
+/// blurs have no detail to lose).
 fn downscale_factor(filter: &BlurFilterArgs) -> u32 {
     if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BlurDownscale) {
         return 1;
     }
     let view_scale = ruffle_render::filters::view_scale();
     let strength = filter.blur_x.to_f32().min(filter.blur_y.to_f32());
-    let mut factor = 1;
-    while factor < 4 && (factor * 2) as f32 <= view_scale && strength / (factor * 2) as f32 >= 4.0 {
-        factor *= 2;
+    if view_scale < 2.0 || strength < 8.0 {
+        1
+    } else if strength < 64.0 {
+        2
+    } else {
+        4
     }
-    factor
 }
 
 pub struct BlurFilter {
@@ -207,10 +210,10 @@ impl BlurFilter {
         )
     }
 
-    /// Blurs at `factor` times lower resolution: the source is scaled down (bilinear
-    /// sampling at the corners of `factor`x`factor` blocks, which averages 2x2 blocks), blurred
-    /// with `factor` times smaller sizes, and scaled back up (bilinear). The blur work
-    /// is `factor`^3 times smaller.
+    /// Blurs at `factor` (a power of 2) times lower resolution: the source is scaled down
+    /// in steps of 2 (bilinear sampling at the corners of 2x2 blocks averages them),
+    /// blurred with `factor` times smaller sizes, and scaled back up (bilinear). The blur
+    /// work is `factor`^3 times smaller.
     #[expect(clippy::too_many_arguments)]
     fn apply_downscaled(
         &self,
@@ -225,36 +228,49 @@ impl BlurFilter {
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
         let pipeline = self.pipeline(descriptors, sample_count);
-        let small_size = (
-            source.size.0.div_ceil(factor),
-            source.size.1.div_ceil(factor),
-        );
-        let small = CommandTarget::new(
-            descriptors,
-            texture_pool,
-            wgpu::Extent3d {
-                width: small_size.0,
-                height: small_size.1,
-                depth_or_array_layers: 1,
-            },
-            format,
-            sample_count,
-            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
-            draw_encoder,
-        );
         staging_belt
             .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
         let source_view = source.texture.create_view(&Default::default());
-        self.write_uniform(draw_encoder, staging_belt, COPY_UNIFORM);
-        self.render_with_uniform_buffers(
-            descriptors,
-            draw_encoder,
-            pipeline,
-            &small,
-            &source_view,
-            self.vertex_buffer.slice(..),
-        );
+        let mut small: Option<CommandTarget> = None;
+        let mut small_size = source.size;
+        let mut step = 1;
+        while step < factor {
+            small_size = (small_size.0.div_ceil(2), small_size.1.div_ceil(2));
+            let next = CommandTarget::new(
+                descriptors,
+                texture_pool,
+                wgpu::Extent3d {
+                    width: small_size.0,
+                    height: small_size.1,
+                    depth_or_array_layers: 1,
+                },
+                format,
+                sample_count,
+                RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+                draw_encoder,
+            );
+            let (view, vertices) = match &small {
+                // The first step reads the source's region.
+                None => (&source_view, self.vertex_buffer.slice(..)),
+                Some(previous) => (
+                    previous.color_view(),
+                    descriptors.quad.filter_vertices.slice(..),
+                ),
+            };
+            self.write_uniform(draw_encoder, staging_belt, COPY_UNIFORM);
+            self.render_with_uniform_buffers(
+                descriptors,
+                draw_encoder,
+                pipeline,
+                &next,
+                view,
+                vertices,
+            );
+            small = Some(next);
+            step *= 2;
+        }
+        let small = small?;
 
         let small_filter = BlurFilterArgs {
             blur_x: Fixed16::from_f32(filter.blur_x.to_f32() / factor as f32),
