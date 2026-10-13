@@ -231,3 +231,157 @@ pub fn render_leaf_layers(
         }
     }
 }
+
+/// Whether a filter only depends on pixels near each output pixel, so that it can
+/// be applied to many sources at once in an atlas (with enough space around them).
+pub fn is_local_filter(filter: &ruffle_render::filters::Filter) -> bool {
+    use ruffle_render::filters::Filter;
+    matches!(
+        filter,
+        Filter::BlurFilter(_)
+            | Filter::GlowFilter(_)
+            | Filter::DropShadowFilter(_)
+            | Filter::ColorMatrixFilter(_)
+    )
+}
+
+/// Applies the same `filters` to all of the given (already drawn) textures,
+/// in place, by applying them once to an atlas containing all of them.
+///
+/// Each texture is surrounded by transparent space at least as wide as the filters
+/// can spread (see `Filter::calculate_dest_rect`), so the result for each texture
+/// only depends on that texture, as when the filters are applied to it alone.
+///
+/// Returns the indices of textures that were too large to batch, which the caller
+/// must filter itself.
+pub fn apply_filters_batched(
+    filters: &[ruffle_render::filters::Filter],
+    textures: &[wgpu::Texture],
+    descriptors: &Descriptors,
+    draw_encoder: &mut wgpu::CommandEncoder,
+    texture_pool: &mut TexturePool,
+    staging_belt: &mut wgpu::util::StagingBelt,
+) -> Vec<usize> {
+    use swf::{Rectangle, Twips};
+    let growth = filters
+        .iter()
+        .fold(Rectangle::<Twips>::ZERO, |rect, filter| {
+            filter.calculate_dest_rect(rect)
+        });
+    let reach = [
+        -growth.x_min.to_pixels(),
+        -growth.y_min.to_pixels(),
+        growth.x_max.to_pixels(),
+        growth.y_max.to_pixels(),
+    ]
+    .into_iter()
+    .fold(0.0f64, f64::max)
+    .ceil() as u32;
+    let gutter = reach + 2;
+
+    // Shelf-pack the textures (with their gutters) into atlases.
+    let max_size = 2048.min(descriptors.limits.max_texture_dimension_2d);
+    let mut batches: Vec<(Vec<(usize, u32, u32)>, u32, u32)> = vec![];
+    let mut batch = vec![];
+    let mut skipped = vec![];
+    let (mut x, mut y, mut row_height, mut used_width) = (0, 0, 0, 0);
+    for (index, texture) in textures.iter().enumerate() {
+        let (w, h) = (texture.width() + gutter * 2, texture.height() + gutter * 2);
+        if w > max_size || h > max_size {
+            skipped.push(index);
+            continue;
+        }
+        if x + w > max_size {
+            (x, y, row_height) = (0, y + row_height, 0);
+        }
+        if y + h > max_size {
+            batches.push((std::mem::take(&mut batch), used_width, y + row_height));
+            (x, y, row_height, used_width) = (0, 0, 0, 0);
+        }
+        batch.push((index, x + gutter, y + gutter));
+        x += w;
+        used_width = used_width.max(x);
+        row_height = row_height.max(h);
+    }
+    if !batch.is_empty() {
+        batches.push((batch, used_width, y + row_height));
+    }
+
+    for (batch, width, height) in batches {
+        let size = wgpu::Extent3d {
+            width: width.next_multiple_of(256).min(max_size),
+            height: height.next_multiple_of(256).min(max_size),
+            depth_or_array_layers: 1,
+        };
+        let atlas = texture_pool.get_texture(
+            descriptors,
+            size,
+            LAYER_TEXTURE_USAGE,
+            wgpu::TextureFormat::Rgba8Unorm,
+            1,
+        );
+        crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
+        draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: create_debug_label!("Clear filter atlas").as_deref(),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &atlas.1,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            ..Default::default()
+        });
+        for &(index, x, y) in &batch {
+            let texture = &textures[index];
+            draw_encoder.copy_texture_to_texture(
+                texture.as_image_copy(),
+                wgpu::TexelCopyTextureInfo {
+                    texture: &atlas.0,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: Default::default(),
+                },
+                texture.size(),
+            );
+        }
+
+        let mut target: Option<CommandTarget> = None;
+        for filter in filters {
+            crate::perf_counters::count(crate::perf_counters::Counter::Filter);
+            let source = match &target {
+                Some(target) => target.color_texture(),
+                None => &atlas.0,
+            };
+            target = Some(descriptors.filters.apply(
+                descriptors,
+                draw_encoder,
+                texture_pool,
+                staging_belt,
+                crate::filters::FilterSource::for_entire_texture(source),
+                filter.clone(),
+            ));
+        }
+        let Some(target) = target else {
+            continue;
+        };
+        let result = target.color_texture();
+        for &(index, x, y) in &batch {
+            let texture = &textures[index];
+            draw_encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: result,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: Default::default(),
+                },
+                texture.as_image_copy(),
+                texture.size(),
+            );
+        }
+        crate::perf_counters::count_named_n("filter-batched", batch.len() as u64);
+    }
+    skipped
+}

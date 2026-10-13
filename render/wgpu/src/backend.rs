@@ -592,6 +592,48 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return;
         };
 
+        // Cache entries with identical local filters (see `is_local_filter`) are
+        // filtered all at once, after all cache entries are drawn. That's only possible
+        // if no other cache entry draws their texture (expecting it to be filtered).
+        let cache_textures: Vec<wgpu::Texture> = cache_entries
+            .iter()
+            .map(|entry| as_texture(&entry.handle).texture.clone())
+            .collect();
+        let mut referenced = vec![];
+        for entry in &cache_entries {
+            collect_bitmaps(&entry.commands, &mut referenced);
+        }
+        let mut filter_groups: Vec<(Vec<Filter>, Vec<usize>)> = vec![];
+        if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::FilterBatching) {
+            for (index, entry) in cache_entries.iter().enumerate() {
+                let texture = &cache_textures[index];
+                if !entry.filters.is_empty()
+                    && entry
+                        .filters
+                        .iter()
+                        .all(crate::surface::layer_atlas::is_local_filter)
+                    && texture.width() <= 512
+                    && texture.height() <= 512
+                    && !referenced.contains(&entry.handle)
+                {
+                    match filter_groups
+                        .iter_mut()
+                        .find(|(filters, _)| *filters == entry.filters)
+                    {
+                        Some((_, members)) => members.push(index),
+                        None => filter_groups.push((entry.filters.clone(), vec![index])),
+                    }
+                }
+            }
+            filter_groups.retain(|(_, members)| members.len() >= 2);
+        }
+        let mut filter_batched = vec![false; cache_entries.len()];
+        for (_, members) in &filter_groups {
+            for &member in members {
+                filter_batched[member] = true;
+            }
+        }
+
         // Cache entries whose contents are simple enough are all drawn together in an
         // atlas, and copied into their textures. They mustn't use other cache entries'
         // textures, as those may not be drawn yet.
@@ -647,7 +689,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             );
         }
 
-        for (entry, atlased) in cache_entries.into_iter().zip(is_atlased) {
+        for (index, (entry, atlased)) in cache_entries.into_iter().zip(is_atlased).enumerate() {
             let entry = entry.expect("entries are only taken once");
             crate::perf_counters::count(crate::perf_counters::Counter::CacheEntry);
             if !entry.filters.is_empty() {
@@ -667,7 +709,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 b: f64::from(entry.clear.b) / 255.0,
                 a: f64::from(entry.clear.a) / 255.0,
             };
-            if entry.filters.is_empty() {
+            if entry.filters.is_empty() || filter_batched[index] {
                 if !atlased {
                     surface.draw_commands(
                         RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear),
@@ -761,6 +803,28 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
             // but its hundreds of children each have their own bitmap caches).
             self.active_frame.maybe_flush(&self.descriptors);
+        }
+
+        for (filters, members) in filter_groups {
+            let textures: Vec<_> = members.iter().map(|&i| cache_textures[i].clone()).collect();
+            let skipped = crate::surface::layer_atlas::apply_filters_batched(
+                &filters,
+                &textures,
+                &self.descriptors,
+                &mut self.active_frame.command_encoder,
+                &mut self.offscreen_texture_pool,
+                &mut self.active_frame.staging_belt,
+            );
+            for index in skipped {
+                filter_texture_in_place(
+                    &self.descriptors,
+                    &mut self.active_frame.command_encoder,
+                    &mut self.offscreen_texture_pool,
+                    &mut self.active_frame.staging_belt,
+                    &textures[index],
+                    &filters,
+                );
+            }
         }
 
         let surface = match self.visible_region {
@@ -1427,6 +1491,12 @@ pub struct ActiveFrame {
     submitter: Option<AsyncSubmitter>,
     /// Whether a frame is still being submitted by `submitter`.
     submitting: bool,
+    /// The staging belt used by the commands being submitted by `submitter`.
+    /// It's only recalled once they have been submitted; meanwhile, recording
+    /// continues with another belt. (Recalling a belt while some of its chunks
+    /// are used by unsubmitted commands makes the submission fail.)
+    in_flight_belt: Option<wgpu::util::StagingBelt>,
+    spare_belt: Option<wgpu::util::StagingBelt>,
 }
 
 /// A thread that finishes command encoders and submits them.
@@ -1472,6 +1542,8 @@ impl ActiveFrame {
             draws_since_flush: 0,
             submitter: None,
             submitting: false,
+            in_flight_belt: None,
+            spare_belt: None,
         }
     }
 
@@ -1486,7 +1558,10 @@ impl ActiveFrame {
                 .expect("submitting implies a submitter");
             let _ = submitter.done.recv();
             self.submitting = false;
-            self.staging_belt.recall();
+            if let Some(mut belt) = self.in_flight_belt.take() {
+                belt.recall();
+                self.spare_belt = Some(belt);
+            }
         }
     }
 
@@ -1530,6 +1605,12 @@ impl ActiveFrame {
             self.submit_for_target(descriptors, target, frame);
             return;
         }
+        drop(frame);
+        self.submit_async(descriptors);
+    }
+
+    /// Finishes and submits the current commands on the submit thread.
+    fn submit_async(&mut self, descriptors: &Descriptors) {
         self.wait_for_submission();
         self.draws_since_flush = 0;
         self.staging_belt.finish();
@@ -1540,13 +1621,17 @@ impl ActiveFrame {
                 .device
                 .create_command_encoder(&Default::default()),
         );
-        drop(frame);
+        // This belt is recalled once the submission is done; record with another one meanwhile.
+        let next_belt = self
+            .spare_belt
+            .take()
+            .unwrap_or_else(|| wgpu::util::StagingBelt::new(descriptors.device.clone(), 65536));
+        self.in_flight_belt = Some(std::mem::replace(&mut self.staging_belt, next_belt));
         let submitter = self.submitter.get_or_insert_with(AsyncSubmitter::new);
         submitter
             .jobs
             .send((draw_encoder, descriptors.queue.clone()))
             .expect("Submit thread should be running");
-        // The staging belt is recalled once the submission is done.
         self.submitting = true;
     }
 
@@ -1575,7 +1660,73 @@ impl ActiveFrame {
 
         if self.draws_since_flush > Self::MAX_DRAWS_PER_FLUSH {
             crate::perf_counters::count(crate::perf_counters::Counter::Flush);
-            self.submit_direct(descriptors);
+            if self.submitter.is_some()
+                && ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::AsyncSubmit,
+                )
+            {
+                // Nothing waits for this submission, so it can happen in the background.
+                self.submit_async(descriptors);
+            } else {
+                self.submit_direct(descriptors);
+            }
         }
+    }
+}
+
+/// Collects the bitmaps drawn by `commands` (including nested ones).
+fn collect_bitmaps(commands: &CommandList, bitmaps: &mut Vec<BitmapHandle>) {
+    use ruffle_render::commands::Command;
+    for command in &commands.commands {
+        match command {
+            Command::RenderBitmap { bitmap, .. } | Command::RenderStage3D { bitmap, .. } => {
+                bitmaps.push(bitmap.clone())
+            }
+            Command::Blend(commands, _) | Command::BlendBounded(commands, _, _) => {
+                collect_bitmaps(commands, bitmaps)
+            }
+            Command::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            } => {
+                collect_bitmaps(maskee_commands, bitmaps);
+                collect_bitmaps(mask_commands, bitmaps);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Applies `filters` to `texture` (which must not be multisampled), in place.
+fn filter_texture_in_place(
+    descriptors: &Descriptors,
+    encoder: &mut wgpu::CommandEncoder,
+    texture_pool: &mut TexturePool,
+    staging_belt: &mut wgpu::util::StagingBelt,
+    texture: &wgpu::Texture,
+    filters: &[Filter],
+) {
+    let mut target: Option<CommandTarget> = None;
+    for filter in filters {
+        let source = match &target {
+            Some(target) => target.color_texture(),
+            None => texture,
+        };
+        target = Some(descriptors.filters.apply(
+            descriptors,
+            encoder,
+            texture_pool,
+            staging_belt,
+            FilterSource::for_entire_texture(source),
+            filter.clone(),
+        ));
+    }
+    if let Some(target) = target {
+        let result = target.color_texture();
+        encoder.copy_texture_to_texture(
+            result.as_image_copy(),
+            texture.as_image_copy(),
+            result.size(),
+        );
     }
 }

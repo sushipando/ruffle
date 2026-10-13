@@ -129,6 +129,11 @@ impl Surface {
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> CommandTarget {
+        // Everything drawn over an opaque background keeps it opaque
+        // (except shader blends, which the command handler accounts for).
+        let opaque = render_target_mode
+            .color()
+            .is_some_and(|color| color.a >= 1.0);
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -144,7 +149,13 @@ impl Surface {
         let commands = if ruffle_render::perf_flags::enabled(
             ruffle_render::perf_flags::PerfFlag::WaveSchedule,
         ) {
-            wave_schedule::schedule(commands, self.origin, self.size.width, self.size.height)
+            wave_schedule::schedule(
+                commands,
+                self.origin,
+                self.size.width,
+                self.size.height,
+                opaque,
+            )
         } else {
             commands
         };
@@ -159,6 +170,7 @@ impl Surface {
             target.width(),
             target.height(),
             self.origin,
+            opaque,
             match nearest_layer {
                 LayerRef::Current => LayerRef::Parent(&target),
                 layer => layer,

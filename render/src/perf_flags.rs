@@ -20,9 +20,13 @@ pub enum PerfFlag {
     PickCache,
     /// Finish and submit frames on another thread, where supported.
     AsyncSubmit,
+    /// Do multiply blends onto opaque targets as trivial blends.
+    OpaqueMultiply,
+    /// Apply identical filters to many cached bitmaps at once.
+    FilterBatching,
 }
 
-const NAMES: [&str; 7] = [
+const NAMES: [&str; 9] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -30,9 +34,11 @@ const NAMES: [&str; 7] = [
     "wave-schedule",
     "pick-cache",
     "async-submit",
+    "opaque-multiply",
+    "filter-batching",
 ];
 
-static FLAGS: [AtomicBool; 7] = [
+static FLAGS: [AtomicBool; 9] = [
     AtomicBool::new(true), // bounded-blends
     AtomicBool::new(true), // lazy-resolve
     AtomicBool::new(true), // layer-atlas
@@ -40,6 +46,8 @@ static FLAGS: [AtomicBool; 7] = [
     AtomicBool::new(true), // wave-schedule
     AtomicBool::new(true), // pick-cache
     AtomicBool::new(true), // async-submit
+    AtomicBool::new(true), // opaque-multiply
+    AtomicBool::new(true), // filter-batching
 ];
 
 #[inline]

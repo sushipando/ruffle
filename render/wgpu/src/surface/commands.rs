@@ -517,6 +517,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     width: u32,
     height: u32,
     origin: (i32, i32),
+    opaque: bool,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
 ) -> (Vec<Chunk>, Vec<layer_atlas::LeafLayer>) {
@@ -533,6 +534,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         nearest_layer,
         texture_pool,
     );
+    handler.opaque = opaque;
     let chunks = handler.chunk_blends(commands);
     (chunks, mem::take(&mut handler.leaf_layers))
 }
@@ -600,6 +602,9 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     translation: (Twips, Twips),
     /// The current scissor rectangle, to be restored when starting a new chunk.
     scissor: Option<(u32, u32, u32, u32)>,
+    /// Whether the target is known to be fully opaque (and stays so), allowing
+    /// some complex blends to be done as trivial ones.
+    opaque: bool,
     transforms: BufferBuilder,
     vertices: BufferBuilder,
     needs_stencil: bool,
@@ -646,6 +651,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             result: vec![],
             current: vec![],
             leaf_layers: vec![],
+            opaque: false,
             // Draws are in absolute pixel coordinates, but the target starts at `origin`.
             translation: (
                 Twips::from_pixels_i32(-origin.0),
@@ -942,6 +948,22 @@ impl WgpuCommandHandler<'_, '_> {
             BlendType::Trivial(TrivialBlend::Normal)
         } else {
             blend_type
+        };
+        let blend_type = match blend_type {
+            BlendType::Complex(ComplexBlend::Multiply)
+                if self.opaque
+                    && ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::OpaqueMultiply,
+                    ) =>
+            {
+                BlendType::Trivial(TrivialBlend::MultiplyOpaque)
+            }
+            // A shader may produce any alpha.
+            BlendType::Shader(shader) => {
+                self.opaque = false;
+                BlendType::Shader(shader)
+            }
+            blend_type => blend_type,
         };
 
         match blend_type {

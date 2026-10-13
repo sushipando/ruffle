@@ -72,6 +72,10 @@ pub enum TrivialBlend {
     Add,
     Subtract,
     Screen,
+    /// Multiply onto a fully opaque target. There, Flash's multiply formula
+    /// (`src * (1 - dst.a) + dst * (1 - src.a) + src * dst`, premultiplied)
+    /// reduces to `src * dst + dst * (1 - src.a)`, which a blend state can do.
+    MultiplyOpaque,
 }
 
 impl TrivialBlend {
@@ -91,6 +95,14 @@ impl TrivialBlend {
                 color: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::One,
                     dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            },
+            TrivialBlend::MultiplyOpaque => wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                     operation: wgpu::BlendOperation::Add,
                 },
                 alpha: wgpu::BlendComponent::OVER,

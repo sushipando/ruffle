@@ -156,8 +156,17 @@ fn transformed_rect(
     bounds
 }
 
-fn is_complex(blend_mode: &RenderBlendMode) -> bool {
+fn is_complex(blend_mode: &RenderBlendMode, opaque: bool) -> bool {
     match blend_mode {
+        // Done as a trivial blend on opaque targets (see `TrivialBlend::MultiplyOpaque`).
+        RenderBlendMode::Builtin(swf::BlendMode::Multiply)
+            if opaque
+                && ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::OpaqueMultiply,
+                ) =>
+        {
+            false
+        }
         RenderBlendMode::Builtin(mode) => matches!(
             BlendType::from(RenderBlendMode::Builtin(*mode)),
             BlendType::Complex(
@@ -174,7 +183,7 @@ fn is_complex(blend_mode: &RenderBlendMode) -> bool {
     }
 }
 
-fn classify(command: &Command, grid: &Grid) -> Kind {
+fn classify(command: &Command, grid: &Grid, opaque: bool) -> Kind {
     let simple_transform = |transform: &ruffle_render::transform::Transform| {
         transform.tz == 0.0 && transform.perspective_projection.is_none()
     };
@@ -205,7 +214,7 @@ fn classify(command: &Command, grid: &Grid) -> Kind {
                 bounds.x_max.to_pixels() as f32,
                 bounds.y_max.to_pixels() as f32,
             ));
-            if is_complex(blend_mode) {
+            if is_complex(blend_mode, opaque) {
                 Kind::ComplexBlend(bounds)
             } else if matches!(blend_mode, RenderBlendMode::Builtin(_)) {
                 Kind::Draw(bounds)
@@ -225,11 +234,11 @@ struct Unit {
 }
 
 /// Groups commands into units.
-fn units(commands: Vec<Command>, grid: &Grid) -> Vec<Unit> {
+fn units(commands: Vec<Command>, grid: &Grid, opaque: bool) -> Vec<Unit> {
     let mut units = Vec::with_capacity(commands.len());
     let mut group: Option<(Vec<Command>, Kind, u32)> = None;
     for command in commands {
-        let kind = classify(&command, grid);
+        let kind = classify(&command, grid, opaque);
         let is_mask_command = matches!(
             command,
             Command::PushMask | Command::ActivateMask | Command::DeactivateMask | Command::PopMask
@@ -286,11 +295,17 @@ fn units(commands: Vec<Command>, grid: &Grid) -> Vec<Unit> {
 /// anything that depends on a complex blend must be in a later wave. Then the
 /// waves are output in order. Units that overlap thus keep their order, and the
 /// complex blends of a wave never overlap each other.
-pub fn schedule(commands: CommandList, origin: (i32, i32), width: u32, height: u32) -> CommandList {
+pub fn schedule(
+    commands: CommandList,
+    origin: (i32, i32),
+    width: u32,
+    height: u32,
+    opaque: bool,
+) -> CommandList {
     let num_complex = commands
         .commands
         .iter()
-        .filter(|command| matches!(command, Command::BlendBounded(_, mode, _) if is_complex(mode)))
+        .filter(|command| matches!(command, Command::BlendBounded(_, mode, _) if is_complex(mode, opaque)))
         .count();
     if num_complex < 2 {
         return commands;
@@ -298,7 +313,7 @@ pub fn schedule(commands: CommandList, origin: (i32, i32), width: u32, height: u
 
     let start = std::time::Instant::now();
     let mut grid = Grid::new(origin, width, height);
-    let units = units(commands.commands, &grid);
+    let units = units(commands.commands, &grid, opaque);
 
     // The earliest wave anything may be in (raised by barriers),
     // and the earliest wave a barrier may be in (after everything so far).
