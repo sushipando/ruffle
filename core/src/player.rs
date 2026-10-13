@@ -2164,8 +2164,14 @@ impl Player {
                 .visible_region(viewport.width, viewport.height)
         });
         self.renderer.set_visible_region(visible_region);
+        let view_scale = self.enter_arena(|_, gc_root, _| {
+            let view_matrix = gc_root.stage.view_matrix();
+            view_matrix.a.abs().min(view_matrix.d.abs())
+        });
+        ruffle_render::filters::set_view_scale(view_scale);
         self.renderer
             .submit_frame(background_color, commands, cache_draws);
+        ruffle_render::filters::set_view_scale(1.0);
 
         self.needs_render = false;
         if self.perf_stats.is_some() {

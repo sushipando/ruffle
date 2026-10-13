@@ -7,6 +7,7 @@ use crate::utils::SampleCountMap;
 use bytemuck::{Pod, Zeroable};
 use std::sync::OnceLock;
 use swf::BlurFilter as BlurFilterArgs;
+use swf::Fixed16;
 use wgpu::util::StagingBelt;
 use wgpu::{BufferSlice, CommandEncoder, RenderPipeline, TextureView};
 
@@ -24,6 +25,35 @@ struct BlurUniform {
     first_weight: f32,
     last_offset: f32,
     last_weight: f32,
+}
+
+/// A blur "pass" that just copies (with bilinear sampling).
+const COPY_UNIFORM: BlurUniform = BlurUniform {
+    direction: [0.0, 0.0],
+    full_size: 1.0,
+    m: 0.0,
+    m2: 0.0,
+    first_weight: 1.0,
+    last_offset: 0.0,
+    last_weight: 0.0,
+};
+
+/// How many times lower the resolution of a blur may be (see `BlurFilter::apply_downscaled`).
+///
+/// It's never lower than the movie's own resolution (so it's always 1 when the stage
+/// isn't magnified, as in the tests), and the downscaled blur must still be at least 4
+/// pixels in both directions.
+fn downscale_factor(filter: &BlurFilterArgs) -> u32 {
+    if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BlurDownscale) {
+        return 1;
+    }
+    let view_scale = ruffle_render::filters::view_scale();
+    let strength = filter.blur_x.to_f32().min(filter.blur_y.to_f32());
+    let mut factor = 1;
+    while factor < 4 && (factor * 2) as f32 <= view_scale && strength / (factor * 2) as f32 >= 4.0 {
+        factor *= 2;
+    }
+    factor
 }
 
 pub struct BlurFilter {
@@ -155,6 +185,141 @@ impl BlurFilter {
         source: &FilterSource,
         filter: &BlurFilterArgs,
     ) -> Option<CommandTarget> {
+        let factor = downscale_factor(filter);
+        if factor > 1 {
+            return self.apply_downscaled(
+                descriptors,
+                texture_pool,
+                draw_encoder,
+                staging_belt,
+                source,
+                filter,
+                factor,
+            );
+        }
+        self.apply_full(
+            descriptors,
+            texture_pool,
+            draw_encoder,
+            staging_belt,
+            source,
+            filter,
+        )
+    }
+
+    /// Blurs at `factor` times lower resolution: the source is scaled down (bilinear
+    /// sampling at the corners of `factor`x`factor` blocks, which averages 2x2 blocks), blurred
+    /// with `factor` times smaller sizes, and scaled back up (bilinear). The blur work
+    /// is `factor`^3 times smaller.
+    #[expect(clippy::too_many_arguments)]
+    fn apply_downscaled(
+        &self,
+        descriptors: &Descriptors,
+        texture_pool: &mut TexturePool,
+        draw_encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        source: &FilterSource,
+        filter: &BlurFilterArgs,
+        factor: u32,
+    ) -> Option<CommandTarget> {
+        let sample_count = source.texture.sample_count();
+        let format = source.texture.format();
+        let pipeline = self.pipeline(descriptors, sample_count);
+        let small_size = (
+            source.size.0.div_ceil(factor),
+            source.size.1.div_ceil(factor),
+        );
+        let small = CommandTarget::new(
+            descriptors,
+            texture_pool,
+            wgpu::Extent3d {
+                width: small_size.0,
+                height: small_size.1,
+                depth_or_array_layers: 1,
+            },
+            format,
+            sample_count,
+            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+            draw_encoder,
+        );
+        staging_belt
+            .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)
+            .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
+        let source_view = source.texture.create_view(&Default::default());
+        self.write_uniform(draw_encoder, staging_belt, COPY_UNIFORM);
+        self.render_with_uniform_buffers(
+            descriptors,
+            draw_encoder,
+            pipeline,
+            &small,
+            &source_view,
+            self.vertex_buffer.slice(..),
+        );
+
+        let small_filter = BlurFilterArgs {
+            blur_x: Fixed16::from_f32(filter.blur_x.to_f32() / factor as f32),
+            blur_y: Fixed16::from_f32(filter.blur_y.to_f32() / factor as f32),
+            flags: filter.flags,
+        };
+        let small_source = FilterSource {
+            texture: small.color_texture(),
+            point: (0, 0),
+            size: small_size,
+        };
+        let blurred = self.apply_full(
+            descriptors,
+            texture_pool,
+            draw_encoder,
+            staging_belt,
+            &small_source,
+            &small_filter,
+        )?;
+
+        let target = CommandTarget::new(
+            descriptors,
+            texture_pool,
+            wgpu::Extent3d {
+                width: source.size.0,
+                height: source.size.1,
+                depth_or_array_layers: 1,
+            },
+            format,
+            sample_count,
+            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+            draw_encoder,
+        );
+        self.write_uniform(draw_encoder, staging_belt, COPY_UNIFORM);
+        self.render_with_uniform_buffers(
+            descriptors,
+            draw_encoder,
+            pipeline,
+            &target,
+            blurred.color_view(),
+            descriptors.quad.filter_vertices.slice(..),
+        );
+        Some(target)
+    }
+
+    fn write_uniform(
+        &self,
+        draw_encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        uniform: BlurUniform,
+    ) {
+        staging_belt
+            .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)
+            .copy_from_slice(bytemuck::cast_slice(&[uniform]));
+    }
+
+    fn apply_full(
+        &self,
+        descriptors: &Descriptors,
+        texture_pool: &mut TexturePool,
+        draw_encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        source: &FilterSource,
+        filter: &BlurFilterArgs,
+    ) -> Option<CommandTarget> {
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
         let pipeline = self.pipeline(descriptors, sample_count);
@@ -189,6 +354,29 @@ impl BlurFilter {
         staging_belt
             .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
+
+        if crate::perf_counters::enabled() {
+            let strength = filter.blur_x.to_f32().max(filter.blur_y.to_f32());
+            let bucket = match strength {
+                s if s <= 4.0 => "s<=4",
+                s if s <= 8.0 => "s<=8",
+                s if s <= 16.0 => "s<=16",
+                s if s <= 32.0 => "s<=32",
+                _ => "s>32",
+            };
+            let pixels = source.size.0 as u64 * source.size.1 as u64;
+            let taps = |s: f32| ((s.min(255.0) - 1.0) / 2.0).ceil() as u64 + 2;
+            let total_taps = pixels
+                * (taps(filter.blur_x.to_f32()) + taps(filter.blur_y.to_f32()))
+                * filter.num_passes() as u64;
+            crate::perf_counters::count_named(format!("blur/{bucket}/q{}", filter.num_passes()));
+            crate::perf_counters::count_named_n("blur-kpx", pixels / 1000);
+            crate::perf_counters::count_named_n("blur-mtaps", total_taps / 1_000_000);
+            crate::perf_counters::count_named_n(
+                format!("blur-mtaps/{bucket}"),
+                total_taps / 1_000_000,
+            );
+        }
 
         let source_view = source.texture.create_view(&Default::default());
         let mut first = true;

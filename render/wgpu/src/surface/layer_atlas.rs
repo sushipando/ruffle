@@ -281,7 +281,9 @@ pub fn apply_filters_batched(
 
     // Shelf-pack the textures (with their gutters) into atlases.
     let max_size = 2048.min(descriptors.limits.max_texture_dimension_2d);
-    let mut batches: Vec<(Vec<(usize, u32, u32)>, u32, u32)> = vec![];
+    // Each batch: the (texture index, x, y) of its entries, and its atlas size.
+    type Batch = (Vec<(usize, u32, u32)>, u32, u32);
+    let mut batches: Vec<Batch> = vec![];
     let mut batch = vec![];
     let mut skipped = vec![];
     let (mut x, mut y, mut row_height, mut used_width) = (0, 0, 0, 0);

@@ -1173,6 +1173,11 @@ pub fn render_base<'gc>(
                 &context.transform_stack.transform().matrix,
                 &context.stage.view_matrix(),
             );
+            static BLEND_DEBUG: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("RUFFLE_BLEND_DEBUG").is_some());
+            if *BLEND_DEBUG {
+                debug_report_blend(this, blend_mode, bounds);
+            }
             match bounds {
                 Some(bounds) => {
                     context
@@ -1195,14 +1200,95 @@ pub fn render_base<'gc>(
 /// Returns `None` if the bounds can't be trusted to contain the rendered output,
 /// such as with `scrollRect` (whose content is drawn offset from its bounds), or
 /// if the subtree contains blend modes that read pixels outside of their own bounds.
+/// Diagnostics: prints each display object with a Layer or Alpha blend mode once.
+fn debug_report_blend(
+    this: DisplayObject<'_>,
+    blend_mode: ExtendedBlendMode,
+    bounds: Option<Rectangle<Twips>>,
+) {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static SEEN: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    }
+    if !matches!(
+        blend_mode,
+        ExtendedBlendMode::Layer | ExtendedBlendMode::Alpha
+    ) {
+        return;
+    }
+    let new = SEEN.with(|seen| seen.borrow_mut().insert(this.as_ptr() as usize));
+    if !new {
+        return;
+    }
+    let class = this
+        .object2()
+        .map(|o| o.instance_class().name().local_name().to_string())
+        .unwrap_or_default();
+    let bounds = bounds.map(|b| {
+        format!(
+            "{}x{} at {},{}",
+            b.width().to_pixels(),
+            b.height().to_pixels(),
+            b.x_min.to_pixels(),
+            b.y_min.to_pixels()
+        )
+    });
+    let children: Vec<String> = this
+        .as_container()
+        .map(|c| {
+            c.iter_render_list()
+                .map(|child| {
+                    format!(
+                        "{}:{:?}",
+                        child.name().map(|n| n.to_string()).unwrap_or_default(),
+                        child.blend_mode()
+                    )
+                })
+                .take(8)
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "[blend] {blend_mode:?} {} ({class}) bounds {bounds:?} children {children:?}",
+        this.path()
+    );
+}
+
 fn blend_layer_bounds<'gc>(
     this: DisplayObject<'gc>,
     matrix: &Matrix,
     view_matrix: &Matrix,
 ) -> Option<Rectangle<Twips>> {
+    let in_layer = this.blend_mode() == ExtendedBlendMode::Layer;
+    blend_layer_bounds_impl(this, matrix, view_matrix, in_layer)
+}
+
+/// `in_layer`: whether the bounds are for a `Layer` blend (of an ancestor of `this`, or of
+/// `this` itself).
+fn blend_layer_bounds_impl<'gc>(
+    this: DisplayObject<'gc>,
+    matrix: &Matrix,
+    view_matrix: &Matrix,
+    in_layer: bool,
+) -> Option<Rectangle<Twips>> {
+    let blend_mode = this.blend_mode();
+    // `Alpha` and `Erase` only reduce the alpha of the layer they're drawn onto (where they
+    // are opaque), so they don't make a layer cover more pixels. Leaving them out keeps
+    // the common "`Layer` parent with an `Alpha` mask child" pattern from always covering
+    // the whole target.
+    if in_layer
+        && matches!(
+            blend_mode,
+            ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase
+        )
+        && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BoundedBlends)
+    {
+        return Some(Rectangle::INVALID);
+    }
     if this.scroll_rect().is_some()
         || matches!(
-            this.blend_mode(),
+            blend_mode,
             ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase | ExtendedBlendMode::Shader
         )
     {
@@ -1214,7 +1300,12 @@ fn blend_layer_bounds<'gc>(
     if let Some(ctr) = this.as_container() {
         for child in ctr.iter_render_list() {
             let matrix = *matrix * child.base().matrix();
-            bounds = bounds.union(&blend_layer_bounds(child, &matrix, view_matrix)?);
+            bounds = bounds.union(&blend_layer_bounds_impl(
+                child,
+                &matrix,
+                view_matrix,
+                in_layer,
+            )?);
         }
     }
 

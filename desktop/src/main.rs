@@ -153,6 +153,11 @@ fn main() -> Result<(), Error> {
 
     let opt = Opt::parse();
 
+    // Large blurs are computed at a lower resolution when the stage is magnified (but never
+    // below the movie's own resolution). It's visually indistinguishable, but not exact,
+    // so it's off by default in the library (and in the tests).
+    ruffle_render::perf_flags::set_by_name("blur-downscale", true);
+
     #[cfg(feature = "shell-completions")]
     if let Some(shell) = opt.completions {
         let mut cmd = Opt::command();

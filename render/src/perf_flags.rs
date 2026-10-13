@@ -24,9 +24,15 @@ pub enum PerfFlag {
     OpaqueMultiply,
     /// Apply identical filters to many cached bitmaps at once.
     FilterBatching,
+    /// Let render passes share Metal command buffers (vendored wgpu-core patch).
+    ShareCommandBuffers,
+    /// Compute large blurs at a lower resolution when the stage is magnified.
+    /// Off by default, because the result isn't exactly Flash's (it's on in the desktop
+    /// player).
+    BlurDownscale,
 }
 
-const NAMES: [&str; 9] = [
+const NAMES: [&str; 11] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -36,18 +42,22 @@ const NAMES: [&str; 9] = [
     "async-submit",
     "opaque-multiply",
     "filter-batching",
+    "share-cmdbufs",
+    "blur-downscale",
 ];
 
-static FLAGS: [AtomicBool; 9] = [
-    AtomicBool::new(true), // bounded-blends
-    AtomicBool::new(true), // lazy-resolve
-    AtomicBool::new(true), // layer-atlas
-    AtomicBool::new(true), // visible-region
-    AtomicBool::new(true), // wave-schedule
-    AtomicBool::new(true), // pick-cache
-    AtomicBool::new(true), // async-submit
-    AtomicBool::new(true), // opaque-multiply
-    AtomicBool::new(true), // filter-batching
+static FLAGS: [AtomicBool; 11] = [
+    AtomicBool::new(true),  // bounded-blends
+    AtomicBool::new(true),  // lazy-resolve
+    AtomicBool::new(true),  // layer-atlas
+    AtomicBool::new(true),  // visible-region
+    AtomicBool::new(true),  // wave-schedule
+    AtomicBool::new(true),  // pick-cache
+    AtomicBool::new(true),  // async-submit
+    AtomicBool::new(true),  // opaque-multiply
+    AtomicBool::new(true),  // filter-batching
+    AtomicBool::new(true),  // share-cmdbufs
+    AtomicBool::new(false), // blur-downscale
 ];
 
 #[inline]

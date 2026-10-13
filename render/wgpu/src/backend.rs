@@ -1482,6 +1482,14 @@ impl RenderTargetMode {
     }
 }
 
+/// Passes Ruffle's perf flags on to the switches of the vendored wgpu-core's patches.
+fn apply_wgpu_core_switches() {
+    #[cfg(not(target_family = "wasm"))]
+    wgpu_core::ruffle_patch::set_share_command_buffers(ruffle_render::perf_flags::enabled(
+        ruffle_render::perf_flags::PerfFlag::ShareCommandBuffers,
+    ));
+}
+
 pub struct ActiveFrame {
     pub staging_belt: wgpu::util::StagingBelt,
     pub command_encoder: wgpu::CommandEncoder,
@@ -1573,6 +1581,7 @@ impl ActiveFrame {
     ) -> SubmissionIndex {
         self.wait_for_submission();
         self.draws_since_flush = 0;
+        apply_wgpu_core_switches();
         self.staging_belt.finish();
         self.dynamic_transforms.flush(&descriptors.queue);
         let draw_encoder = std::mem::replace(
@@ -1612,6 +1621,7 @@ impl ActiveFrame {
     /// Finishes and submits the current commands on the submit thread.
     fn submit_async(&mut self, descriptors: &Descriptors) {
         self.wait_for_submission();
+        apply_wgpu_core_switches();
         self.draws_since_flush = 0;
         self.staging_belt.finish();
         self.dynamic_transforms.flush(&descriptors.queue);
@@ -1637,6 +1647,7 @@ impl ActiveFrame {
 
     pub fn submit_direct(&mut self, descriptors: &Descriptors) -> SubmissionIndex {
         self.wait_for_submission();
+        apply_wgpu_core_switches();
         self.draws_since_flush = 0;
         self.staging_belt.finish();
         self.dynamic_transforms.flush(&descriptors.queue);

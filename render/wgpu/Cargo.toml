@@ -33,6 +33,11 @@ wgpu-profiler = { workspace = true }
 [target.'cfg(not(target_family = "wasm"))'.dependencies.futures]
 workspace = true
 
+# Only for the runtime switches of the patched wgpu-core (its `ruffle_patch` module).
+[target.'cfg(not(target_family = "wasm"))'.dependencies.wgpu-core]
+version = "30.0.1"
+default-features = false
+
 # wasm
 [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 workspace = true

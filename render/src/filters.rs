@@ -1,6 +1,7 @@
 use crate::bitmap::BitmapHandle;
 use crate::pixel_bender::PixelBenderShaderHandle;
 use crate::pixel_bender_support::PixelBenderShaderArgument;
+use std::cell::Cell;
 use std::{any::Any, fmt::Debug};
 use swf::{Color, Rectangle, Twips};
 
@@ -196,4 +197,21 @@ impl DisplacementMapFilter {
         //     source_rect
         // }
     }
+}
+
+thread_local! {
+    static VIEW_SCALE: Cell<f32> = const { Cell::new(1.0) };
+}
+
+/// Sets how much the stage is magnified for display while a frame is rendered on this
+/// thread. Filters' sizes have been multiplied by it (see [`Filter::scale`]), so a renderer
+/// may compute expensive filters at up to this many times lower resolution without going
+/// below the movie's own resolution.
+pub fn set_view_scale(scale: f32) {
+    VIEW_SCALE.with(|v| v.set(scale));
+}
+
+/// See [`set_view_scale`]. 1.0 unless a frame is being rendered on this thread.
+pub fn view_scale() -> f32 {
+    VIEW_SCALE.with(|v| v.get())
 }
