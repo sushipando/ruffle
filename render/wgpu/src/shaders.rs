@@ -21,6 +21,9 @@ pub struct Shaders {
     /// attachment (framebuffer fetch), if the device supports them (see
     /// `supports_fetch_blends`).
     pub fetch_blend_shaders: Option<EnumMap<ComplexBlend, wgpu::ShaderModule>>,
+    /// Like `fetch_blend_shaders`, for solid fills drawn directly with a complex blend
+    /// (with `color.wgsl` as the vertex stage).
+    pub fetch_color_shaders: Option<EnumMap<ComplexBlend, wgpu::ShaderModule>>,
     pub color_matrix_filter: wgpu::ShaderModule,
     pub blur_filter: wgpu::ShaderModule,
     pub glow_filter: wgpu::ShaderModule,
@@ -102,7 +105,11 @@ impl Shaders {
         let fetch_blend_shaders = device
             .features()
             .contains(wgpu::Features::PASSTHROUGH_SHADERS)
-            .then(|| fetch_blend_shaders(device));
+            .then(|| make_fetch_blend_shaders(device, ""));
+        let fetch_color_shaders = device
+            .features()
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+            .then(|| make_fetch_blend_shaders(device, "#define VERTEX_COLOR"));
 
         Self {
             color_shader,
@@ -112,6 +119,7 @@ impl Shaders {
             alpha_mask_shader,
             blend_shaders,
             fetch_blend_shaders,
+            fetch_color_shaders,
             color_matrix_filter,
             blur_filter,
             glow_filter,
@@ -133,10 +141,13 @@ pub fn supports_fetch_blends(adapter: &wgpu::Adapter) -> bool {
             .contains(wgpu::Features::PASSTHROUGH_SHADERS)
 }
 
-fn fetch_blend_shaders(device: &wgpu::Device) -> EnumMap<ComplexBlend, wgpu::ShaderModule> {
+fn make_fetch_blend_shaders(
+    device: &wgpu::Device,
+    variant: &str,
+) -> EnumMap<ComplexBlend, wgpu::ShaderModule> {
     let source = include_str!("../shaders/blend/fetch.metal");
     let make = |name: &str, definitions: &str| {
-        let msl = format!("{definitions}\n{source}");
+        let msl = format!("{variant}\n{definitions}\n{source}");
         // SAFETY: The source is ours, and matches the bitmap pipelines (see `fetch.metal`).
         unsafe {
             device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {

@@ -309,8 +309,12 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut wgpu::RenderPass<'encoder>,
         shape: &'encoder ShapeHandle,
         instance_index: u32,
-        blend_mode: TrivialBlend,
+        blend_mode: ShapeBlend,
     ) {
+        let (blend_mode, fetch) = match blend_mode {
+            ShapeBlend::Trivial(mode) => (mode, None),
+            ShapeBlend::Fetch(mode) => (TrivialBlend::Normal, Some(mode)),
+        };
         let blended = (!matches!(blend_mode, TrivialBlend::Normal)).then(|| {
             self.pipelines.blended_fills(
                 &self.descriptors.device,
@@ -334,6 +338,19 @@ impl<'encoder> CommandRenderer<'encoder> {
             }
 
             match (&draw.draw_type, blended) {
+                (DrawType::Color, None) if fetch.is_some() => {
+                    let pipeline = self.pipelines.fetch_color_blend(
+                        &self.descriptors.device,
+                        &self.descriptors.shaders,
+                        &self.descriptors.bind_layouts,
+                        fetch.expect("checked above"),
+                    );
+                    render_pass.set_pipeline(if self.needs_stencil {
+                        pipeline.pipeline_for(self.mask_state)
+                    } else {
+                        pipeline.stencilless_pipeline()
+                    });
+                }
                 (DrawType::Color, None) => {
                     self.prep_color(render_pass);
                 }
@@ -525,7 +542,7 @@ pub enum DrawCommand {
         shape: ShapeHandle,
         instance_index: u32,
         /// `Normal`, unless drawn directly with a blend mode (see `direct_blend`).
-        blend_mode: TrivialBlend,
+        blend_mode: ShapeBlend,
     },
     DrawRect {
         instance_index: u32,
@@ -647,6 +664,15 @@ pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
     chunks
 }
 
+/// How a shape is drawn onto its target (see `WgpuCommandHandler::direct_blend_mode`).
+#[derive(Clone, Copy, Debug)]
+pub enum ShapeBlend {
+    Trivial(TrivialBlend),
+    /// A complex blend done by reading the backdrop from the color attachment (only for
+    /// solid fills).
+    Fetch(ComplexBlend),
+}
+
 struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     descriptors: &'encoder Descriptors,
     quality: StageQuality,
@@ -678,7 +704,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     needs_stencil: bool,
     num_masks: i32,
     /// While drawing the content of a blend directly (instead of in a layer), its mode.
-    direct_blend: Option<TrivialBlend>,
+    direct_blend: Option<ShapeBlend>,
 }
 
 impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
@@ -967,7 +993,7 @@ impl WgpuCommandHandler<'_, '_> {
         &self,
         commands: &CommandList,
         blend_mode: &RenderBlendMode,
-    ) -> Option<TrivialBlend> {
+    ) -> Option<ShapeBlend> {
         if self.direct_blend.is_some()
             || !ruffle_render::perf_flags::enabled(
                 ruffle_render::perf_flags::PerfFlag::DirectBlends,
@@ -975,30 +1001,42 @@ impl WgpuCommandHandler<'_, '_> {
         {
             return None;
         }
-        let mode = match BlendType::from(blend_mode.clone()) {
-            BlendType::Trivial(mode) => mode,
+        let [command] = commands.commands.as_slice() else {
+            return None;
+        };
+        let single_fill = |color_only: bool| match command {
+            Command::RenderShape { shape, .. } => {
+                let mesh = as_mesh(shape);
+                mesh.draws.len() == 1
+                    && mesh.draws[0].single_fill
+                    && (!color_only || matches!(mesh.draws[0].draw_type, DrawType::Color))
+            }
+            Command::RenderBitmap { .. } => !color_only,
+            _ => false,
+        };
+        match BlendType::from(blend_mode.clone()) {
+            BlendType::Trivial(mode) => single_fill(false).then_some(ShapeBlend::Trivial(mode)),
             BlendType::Complex(ComplexBlend::Multiply)
                 if self.opaque
                     && ruffle_render::perf_flags::enabled(
                         ruffle_render::perf_flags::PerfFlag::OpaqueMultiply,
                     ) =>
             {
-                TrivialBlend::MultiplyOpaque
+                single_fill(false).then_some(ShapeBlend::Trivial(TrivialBlend::MultiplyOpaque))
             }
-            _ => return None,
-        };
-        let [command] = commands.commands.as_slice() else {
-            return None;
-        };
-        let single = match command {
-            Command::RenderShape { shape, .. } => {
-                let mesh = as_mesh(shape);
-                mesh.draws.len() == 1 && mesh.draws[0].single_fill
+            // Solid fills can read the backdrop themselves (see `fetch.metal`). Alpha and
+            // Erase blend with their layer, which may be another target.
+            BlendType::Complex(mode)
+                if !matches!(mode, ComplexBlend::Alpha | ComplexBlend::Erase)
+                    && self.descriptors.shaders.fetch_color_shaders.is_some()
+                    && ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::FetchBlends,
+                    ) =>
+            {
+                single_fill(true).then_some(ShapeBlend::Fetch(mode))
             }
-            Command::RenderBitmap { .. } => true,
-            _ => false,
-        };
-        single.then_some(mode)
+            _ => None,
+        }
     }
 
     fn blend_impl(
@@ -1246,7 +1284,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         pixel_snapping: PixelSnapping,
         region: PixelRegion,
     ) {
-        let direct_blend = self.direct_blend.unwrap_or(TrivialBlend::Normal);
+        let direct_blend = match self.direct_blend {
+            Some(ShapeBlend::Trivial(mode)) => mode,
+            // Only solid fills are drawn directly with fetch blends.
+            Some(ShapeBlend::Fetch(_)) | None => TrivialBlend::Normal,
+        };
         let texture = as_texture(&bitmap);
 
         let mut matrix = transform.matrix;
@@ -1309,7 +1351,9 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
-        let blend_mode = self.direct_blend.unwrap_or(TrivialBlend::Normal);
+        let blend_mode = self
+            .direct_blend
+            .unwrap_or(ShapeBlend::Trivial(TrivialBlend::Normal));
         self.add_to_current(
             transform.matrix,
             transform.tz,

@@ -62,6 +62,8 @@ pub struct Pipelines {
     pub alpha_mask: ShapePipeline,
     /// Color and gradient fills drawn with a trivial blend mode (see `blended_fills`).
     blended_fills: EnumMap<TrivialBlend, std::sync::OnceLock<BlendedFills>>,
+    /// Solid fills drawn with a complex blend mode (see `fetch_color_blend`).
+    fetch_color_blends: EnumMap<ComplexBlend, std::sync::OnceLock<ShapePipeline>>,
     format: wgpu::TextureFormat,
     msaa_sample_count: u32,
 }
@@ -137,6 +139,37 @@ impl Pipelines {
                 0,
                 PrimitiveTopology::TriangleList,
             ),
+        })
+    }
+
+    /// The pipeline for solid fills drawn directly with a complex blend mode, reading the
+    /// backdrop from the color attachment (see `Shaders::fetch_color_shaders`), created
+    /// on first use. Only for fills that don't overlap themselves.
+    pub fn fetch_color_blend(
+        &self,
+        device: &wgpu::Device,
+        shaders: &Shaders,
+        bind_layouts: &BindLayouts,
+        blend: ComplexBlend,
+    ) -> &ShapePipeline {
+        self.fetch_color_blends[blend].get_or_init(|| {
+            let fetch_shaders = shaders
+                .fetch_color_shaders
+                .as_ref()
+                .expect("fetch blends are only used where supported");
+            create_shape_pipeline_with_fragment(
+                &format!("Fetch color ({blend:?})"),
+                device,
+                self.format,
+                &shaders.color_shader,
+                &fetch_shaders[blend],
+                self.msaa_sample_count,
+                &VERTEX_BUFFERS_DESCRIPTION_COLOR,
+                &[Some(&bind_layouts.globals), Some(&bind_layouts.transforms)],
+                BlendState::REPLACE,
+                0,
+                PrimitiveTopology::TriangleList,
+            )
         })
     }
 
@@ -330,6 +363,7 @@ impl Pipelines {
             bitmap: bitmap_pipelines,
             fetch_blends: fetch_blend_pipelines,
             blended_fills: Default::default(),
+            fetch_color_blends: Default::default(),
             format,
             msaa_sample_count,
             bitmap_opaque,
