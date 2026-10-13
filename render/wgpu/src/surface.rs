@@ -146,9 +146,13 @@ impl Surface {
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
+        // With fetch blends, the blends that waves batch don't split passes anymore.
+        let fetch_blends = descriptors.shaders.fetch_blend_shaders.is_some()
+            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::FetchBlends);
         let commands = if ruffle_render::perf_flags::enabled(
             ruffle_render::perf_flags::PerfFlag::WaveSchedule,
-        ) {
+        ) && !fetch_blends
+        {
             wave_schedule::schedule(
                 commands,
                 self.origin,
@@ -209,6 +213,36 @@ impl Surface {
                 } => {
                     let offsets =
                         dynamic_transforms.upload(transforms, vertices, staging_belt, draw_encoder);
+                    // Chunks only end because their transforms or vertices are full, so
+                    // following ones are drawn in the same pass, each with its own offsets.
+                    // (Only one may be in the arena's fallback region at a time.)
+                    let mut group = vec![(chunk, offsets)];
+                    while ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::MergeChunks,
+                    ) && !group.last().is_some_and(|(_, offsets)| offsets.fallback)
+                        && matches!(
+                            chunks.front(),
+                            Some(Chunk::Draw { needs_stencil: next, .. }) if *next == needs_stencil
+                        )
+                    {
+                        let Some(Chunk::Draw {
+                            chunk,
+                            transforms,
+                            vertices,
+                            ..
+                        }) = chunks.pop_front()
+                        else {
+                            unreachable!();
+                        };
+                        let offsets = dynamic_transforms.upload(
+                            transforms,
+                            vertices,
+                            staging_belt,
+                            draw_encoder,
+                        );
+                        group.push((chunk, offsets));
+                    }
+                    let is_last = chunks.is_empty();
                     if pending_blends
                         .iter()
                         .any(|blend| blend.needs_stencil != needs_stencil)
@@ -246,27 +280,29 @@ impl Surface {
                         self.draw_pending_blend(&mut render_pass, &blend, &target, descriptors);
                     }
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
-                    render_pass.set_bind_group(
-                        1,
-                        &dynamic_transforms.bind_group,
-                        &[offsets.transforms],
-                    );
-                    let mut renderer = CommandRenderer::new(
-                        &self.pipelines,
-                        descriptors,
-                        &dynamic_transforms.vertex_buffer,
-                        offsets.vertices,
-                        num_masks,
-                        mask_state,
-                        needs_stencil,
-                    );
+                    for (chunk, offsets) in &group {
+                        render_pass.set_bind_group(
+                            1,
+                            &dynamic_transforms.bind_group,
+                            &[offsets.transforms],
+                        );
+                        let mut renderer = CommandRenderer::new(
+                            &self.pipelines,
+                            descriptors,
+                            &dynamic_transforms.vertex_buffer,
+                            offsets.vertices,
+                            num_masks,
+                            mask_state,
+                            needs_stencil,
+                        );
 
-                    for command in &chunk {
-                        renderer.execute(&mut render_pass.scope(command.name()), command);
+                        for command in chunk {
+                            renderer.execute(&mut render_pass.scope(command.name()), command);
+                        }
+
+                        num_masks = renderer.num_masks();
+                        mask_state = renderer.mask_state();
                     }
-
-                    num_masks = renderer.num_masks();
-                    mask_state = renderer.mask_state();
                 }
                 Chunk::Blend {
                     texture,

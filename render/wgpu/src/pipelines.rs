@@ -56,6 +56,9 @@ pub struct Pipelines {
     pub bitmap: EnumMap<TrivialBlend, ShapePipeline>,
     pub gradients: ShapePipeline,
     pub complex_blends: EnumMap<ComplexBlend, ShapePipeline>,
+    /// Complex blends drawn like bitmaps, reading the backdrop from the color attachment
+    /// (see `Shaders::fetch_blend_shaders`).
+    pub fetch_blends: Option<EnumMap<ComplexBlend, ShapePipeline>>,
     pub alpha_mask: ShapePipeline,
 }
 
@@ -176,6 +179,24 @@ impl Pipelines {
             )
         });
 
+        let fetch_blend_pipelines = shaders.fetch_blend_shaders.as_ref().map(|fetch_shaders| {
+            EnumMap::from_fn(|blend: ComplexBlend| {
+                create_shape_pipeline_with_fragment(
+                    &format!("Fetch blend ({blend:?})"),
+                    device,
+                    format,
+                    &shaders.bitmap_shader,
+                    &fetch_shaders[blend],
+                    msaa_sample_count,
+                    &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
+                    &bitmap_blend_bindings,
+                    BlendState::REPLACE,
+                    0,
+                    PrimitiveTopology::TriangleList,
+                )
+            })
+        });
+
         let bitmap_opaque_pipeline_layout_label =
             create_debug_label!("Opaque bitmap pipeline layout");
         let bitmap_opaque_pipeline_layout =
@@ -253,6 +274,7 @@ impl Pipelines {
             color: color_pipelines,
             lines: lines_pipelines,
             bitmap: bitmap_pipelines,
+            fetch_blends: fetch_blend_pipelines,
             bitmap_opaque,
             bitmap_opaque_dummy_stencil: bitmap_opaque_dummy_depth,
             gradients: gradient_pipeline,
@@ -332,6 +354,36 @@ fn create_shape_pipeline(
     immediate_size: u32,
     primitive_topology: PrimitiveTopology,
 ) -> ShapePipeline {
+    create_shape_pipeline_with_fragment(
+        name,
+        device,
+        format,
+        shader,
+        shader,
+        msaa_sample_count,
+        vertex_buffers_layout,
+        bind_group_layouts,
+        blend,
+        immediate_size,
+        primitive_topology,
+    )
+}
+
+/// Like `create_shape_pipeline`, with the fragment stage from another module.
+#[expect(clippy::too_many_arguments)]
+fn create_shape_pipeline_with_fragment(
+    name: &str,
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    shader: &wgpu::ShaderModule,
+    fragment_shader: &wgpu::ShaderModule,
+    msaa_sample_count: u32,
+    vertex_buffers_layout: &[Option<wgpu::VertexBufferLayout<'_>>],
+    bind_group_layouts: &[Option<&wgpu::BindGroupLayout>],
+    blend: BlendState,
+    immediate_size: u32,
+    primitive_topology: PrimitiveTopology,
+) -> ShapePipeline {
     let pipeline_layout_label = create_debug_label!("{} shape pipeline layout", name);
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: pipeline_layout_label.as_deref(),
@@ -343,7 +395,7 @@ fn create_shape_pipeline(
         device.create_render_pipeline(&create_pipeline_descriptor(
             create_debug_label!("{} pipeline {}", name, mask_name).as_deref(),
             shader,
-            shader,
+            fragment_shader,
             &pipeline_layout,
             Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Stencil8,
@@ -373,7 +425,7 @@ fn create_shape_pipeline(
         device.create_render_pipeline(&create_pipeline_descriptor(
             create_debug_label!("{} stencilless pipeline", name).as_deref(),
             shader,
-            shader,
+            fragment_shader,
             &pipeline_layout,
             None,
             &[Some(wgpu::ColorTargetState {

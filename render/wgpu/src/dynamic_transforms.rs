@@ -47,6 +47,9 @@ pub struct ChunkOffsets {
     pub transforms: u32,
     /// The offset of the chunk's vertices in `vertex_buffer`.
     pub vertices: wgpu::BufferAddress,
+    /// Whether the data is in the region reserved for chunks that don't fit in the
+    /// arenas, which only one chunk can use at a time.
+    pub fallback: bool,
 }
 
 pub fn transforms_per_draw(limits: &wgpu::Limits) -> u64 {
@@ -115,6 +118,7 @@ impl DynamicTransforms {
         ChunkOffsets {
             transforms: transforms as u32,
             vertices,
+            fallback: true,
         }
     }
 
@@ -141,6 +145,7 @@ impl DynamicTransforms {
             return ChunkOffsets {
                 transforms: transforms_offset as u32,
                 vertices: vertices_offset,
+                fallback: false,
             };
         }
 

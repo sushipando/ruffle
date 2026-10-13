@@ -1461,6 +1461,9 @@ async fn request_device(
         | GpuProfiler::ALL_WGPU_TIMER_FEATURES;
 
     features |= optional_features & adapter.features();
+    if crate::shaders::supports_fetch_blends(adapter) {
+        features |= wgpu::Features::PASSTHROUGH_SHADERS;
+    }
 
     adapter
         .request_device(&wgpu::DeviceDescriptor {

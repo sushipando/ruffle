@@ -45,9 +45,14 @@ pub enum PerfFlag {
     /// For measurements only: draw complex blends (which need to read the backdrop)
     /// as normal ones.
     ComplexAsNormal,
+    /// Draw complex blends (except Alpha and Erase) in the current pass, reading the
+    /// backdrop from the color attachment, where supported (Metal on Apple GPUs).
+    FetchBlends,
+    /// Draw consecutive chunks of draws in the same render pass.
+    MergeChunks,
 }
 
-const NAMES: [&str; 16] = [
+const NAMES: [&str; 18] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -64,9 +69,11 @@ const NAMES: [&str; 16] = [
     "blur-merge",
     "skip-cache-filters",
     "complex-as-normal",
+    "fetch-blends",
+    "merge-chunks",
 ];
 
-static FLAGS: [AtomicBool; 16] = [
+static FLAGS: [AtomicBool; 18] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -83,6 +90,8 @@ static FLAGS: [AtomicBool; 16] = [
     AtomicBool::new(false), // blur-merge
     AtomicBool::new(false), // skip-cache-filters
     AtomicBool::new(false), // complex-as-normal
+    AtomicBool::new(true),  // fetch-blends
+    AtomicBool::new(true),  // merge-chunks
 ];
 
 #[inline]

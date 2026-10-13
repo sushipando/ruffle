@@ -161,43 +161,64 @@ pub fn render_leaf_layers(
             texture_pool,
         );
 
-        let num_chunks = chunks.len();
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            let Chunk::Draw {
-                chunk,
-                needs_stencil: _,
-                transforms,
-                vertices,
-            } = chunk
-            else {
-                unreachable!("Leaf layers only contain draws");
-            };
-            let offsets =
-                dynamic_transforms.upload(transforms, vertices, staging_belt, draw_encoder);
+        let mut chunks: std::collections::VecDeque<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let Chunk::Draw {
+                    chunk,
+                    needs_stencil: _,
+                    transforms,
+                    vertices,
+                } = chunk
+                else {
+                    unreachable!("Leaf layers only contain draws");
+                };
+                (chunk, transforms, vertices)
+            })
+            .collect();
+        while !chunks.is_empty() {
+            // As many chunks per pass as possible (see `Surface::draw_commands`).
+            let mut group = vec![];
+            while let Some((chunk, transforms, vertices)) = chunks.pop_front() {
+                let offsets =
+                    dynamic_transforms.upload(transforms, vertices, staging_belt, draw_encoder);
+                group.push((chunk, offsets));
+                if offsets.fallback
+                    || !ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::MergeChunks,
+                    )
+                {
+                    break;
+                }
+            }
             crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
             let mut render_pass =
                 draw_encoder.scoped_render_pass(
                     "Layer atlas",
                     wgpu::RenderPassDescriptor {
-                        color_attachments: &[
-                            target.color_attachments_for_pass(index + 1 == num_chunks)
-                        ],
+                        color_attachments: &[target.color_attachments_for_pass(chunks.is_empty())],
                         ..Default::default()
                     },
                 );
             render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
-            render_pass.set_bind_group(1, &dynamic_transforms.bind_group, &[offsets.transforms]);
-            let mut renderer = CommandRenderer::new(
-                &pipelines,
-                descriptors,
-                &dynamic_transforms.vertex_buffer,
-                offsets.vertices,
-                0,
-                MaskState::NoMask,
-                false,
-            );
-            for command in &chunk {
-                renderer.execute(&mut render_pass.scope(command.name()), command);
+            for (chunk, offsets) in &group {
+                render_pass.set_bind_group(
+                    1,
+                    &dynamic_transforms.bind_group,
+                    &[offsets.transforms],
+                );
+                let mut renderer = CommandRenderer::new(
+                    &pipelines,
+                    descriptors,
+                    &dynamic_transforms.vertex_buffer,
+                    offsets.vertices,
+                    0,
+                    MaskState::NoMask,
+                    false,
+                );
+                for command in chunk {
+                    renderer.execute(&mut render_pass.scope(command.name()), command);
+                }
             }
         }
         target.ensure_resolved(draw_encoder);

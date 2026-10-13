@@ -17,6 +17,10 @@ pub struct Shaders {
     pub copy_shader: wgpu::ShaderModule,
     pub alpha_mask_shader: wgpu::ShaderModule,
     pub blend_shaders: EnumMap<ComplexBlend, wgpu::ShaderModule>,
+    /// Fragment shaders for complex blends that read the backdrop from the color
+    /// attachment (framebuffer fetch), if the device supports them (see
+    /// `supports_fetch_blends`).
+    pub fetch_blend_shaders: Option<EnumMap<ComplexBlend, wgpu::ShaderModule>>,
     pub color_matrix_filter: wgpu::ShaderModule,
     pub blur_filter: wgpu::ShaderModule,
     pub glow_filter: wgpu::ShaderModule,
@@ -95,6 +99,11 @@ impl Shaders {
             ComplexBlend::HardLight => make_shader(device, "blend/hardlight.wgsl", include_str!("../shaders/blend/hardlight.wgsl"), max_transforms),
         };
 
+        let fetch_blend_shaders = device
+            .features()
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+            .then(|| fetch_blend_shaders(device));
+
         Self {
             color_shader,
             bitmap_shader,
@@ -102,12 +111,66 @@ impl Shaders {
             copy_shader,
             alpha_mask_shader,
             blend_shaders,
+            fetch_blend_shaders,
             color_matrix_filter,
             blur_filter,
             glow_filter,
             bevel_filter,
             displacement_map_filter,
         }
+    }
+}
+
+/// Whether complex blends can read their backdrop from the color attachment
+/// (framebuffer fetch), which Metal supports on Apple GPUs. Requesting
+/// `PASSTHROUGH_SHADERS` (see `request_device`) enables them.
+pub fn supports_fetch_blends(adapter: &wgpu::Adapter) -> bool {
+    let info = adapter.get_info();
+    info.backend == wgpu::Backend::Metal
+        && info.name.starts_with("Apple")
+        && adapter
+            .features()
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+}
+
+fn fetch_blend_shaders(device: &wgpu::Device) -> EnumMap<ComplexBlend, wgpu::ShaderModule> {
+    let source = include_str!("../shaders/blend/fetch.metal");
+    let make = |name: &str, definitions: &str| {
+        let msl = format!("{definitions}\n{source}");
+        // SAFETY: The source is ours, and matches the bitmap pipelines (see `fetch.metal`).
+        unsafe {
+            device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                label: create_debug_label!("Fetch blend shader {name}").as_deref(),
+                entry_points: std::borrow::Cow::Borrowed(&[wgpu::PassthroughShaderEntryPoint {
+                    name: std::borrow::Cow::Borrowed("main_fragment"),
+                    workgroup_size: (0, 0, 0),
+                }]),
+                msl: Some(msl.into()),
+                ..Default::default()
+            })
+        }
+    };
+    // `x <= 0.5 ? a : b` for each channel of `x`.
+    let hard_light = "select(1.0 - 2.0 * (1.0 - d) * (1.0 - s), 2.0 * s * d, X <= 0.5)";
+    enum_map! {
+        ComplexBlend::Multiply => make("Multiply", "#define BLEND_FUNC(s, d) ((s) * (d))"),
+        ComplexBlend::Lighten => make("Lighten", "#define BLEND_FUNC(s, d) max(s, d)"),
+        ComplexBlend::Darken => make("Darken", "#define BLEND_FUNC(s, d) min(s, d)"),
+        ComplexBlend::Difference => make("Difference", "#define BLEND_FUNC(s, d) abs((d) - (s))"),
+        ComplexBlend::Invert => make("Invert", "#define BLEND_FUNC(s, d) (1.0 - (d))"),
+        ComplexBlend::Alpha => make("Alpha", "#define COMPOSITE float4(dst.rgb * src.a, src.a * dst.a)"),
+        ComplexBlend::Erase => make(
+            "Erase",
+            "#define COMPOSITE float4(dst.rgb * (1.0 - src.a), (1.0 - src.a) * dst.a)",
+        ),
+        ComplexBlend::Overlay => make(
+            "Overlay",
+            &format!("#define BLEND_FUNC(s, d) {}", hard_light.replace('X', "d")),
+        ),
+        ComplexBlend::HardLight => make(
+            "HardLight",
+            &format!("#define BLEND_FUNC(s, d) {}", hard_light.replace('X', "s")),
+        ),
     }
 }
 

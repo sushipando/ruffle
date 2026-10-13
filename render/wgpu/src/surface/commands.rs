@@ -99,6 +99,12 @@ impl<'encoder> CommandRenderer<'encoder> {
                 instance_index,
                 blend_mode,
             } => self.render_texture(render_pass, *instance_index, binds, *blend_mode),
+            DrawCommand::FetchBlend {
+                _texture,
+                binds,
+                instance_index,
+                blend_mode,
+            } => self.render_fetch_blend(render_pass, *instance_index, binds, *blend_mode),
             DrawCommand::RenderShape {
                 shape,
                 instance_index,
@@ -261,6 +267,33 @@ impl<'encoder> CommandRenderer<'encoder> {
     ) {
         self.prep_bitmap(render_pass, bind_group, blend_mode, false);
 
+        self.draw(
+            render_pass,
+            self.descriptors.quad.vertices_pos_uv.slice(..),
+            self.descriptors.quad.indices.slice(..),
+            6,
+            instance_index,
+        );
+    }
+
+    pub fn render_fetch_blend(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        instance_index: u32,
+        bind_group: &'encoder wgpu::BindGroup,
+        blend_mode: ComplexBlend,
+    ) {
+        let pipelines = &self
+            .pipelines
+            .fetch_blends
+            .as_ref()
+            .expect("fetch blends are only used where supported")[blend_mode];
+        if self.needs_stencil {
+            render_pass.set_pipeline(pipelines.pipeline_for(self.mask_state));
+        } else {
+            render_pass.set_pipeline(pipelines.stencilless_pipeline());
+        }
+        render_pass.set_bind_group(2, bind_group, &[]);
         self.draw(
             render_pass,
             self.descriptors.quad.vertices_pos_uv.slice(..),
@@ -450,6 +483,13 @@ pub enum DrawCommand {
         instance_index: u32,
         blend_mode: TrivialBlend,
     },
+    /// A complex blend that reads the backdrop from the color attachment.
+    FetchBlend {
+        _texture: PoolOrArcTexture,
+        binds: wgpu::BindGroup,
+        instance_index: u32,
+        blend_mode: ComplexBlend,
+    },
     RenderAlphaMask {
         maskee: PoolOrArcTexture,
         mask: PoolOrArcTexture,
@@ -483,6 +523,7 @@ impl DrawCommand {
             DrawCommand::RenderBitmap { .. } => "render bitmap",
             DrawCommand::RenderShape { .. } => "render shape",
             DrawCommand::RenderTexture { .. } => "render texture",
+            DrawCommand::FetchBlend { .. } => "fetch blend",
             DrawCommand::DrawRect { .. } => "draw rect",
             DrawCommand::DrawLine { .. } => "draw line",
             DrawCommand::DrawLineRect { .. } => "draw line rect",
@@ -854,6 +895,28 @@ impl WgpuCommandHandler<'_, '_> {
         Some(Some((x0, y0, width, height)))
     }
 
+    /// A bind group for drawing a blend layer's texture with the bitmap pipelines.
+    fn texture_bind_group(&self, texture: &PoolOrArcTexture) -> wgpu::BindGroup {
+        self.descriptors
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.descriptors.bind_layouts.bitmap,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(texture.view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(
+                            self.descriptors.bitmap_samplers.get_sampler(false, false),
+                        ),
+                    },
+                ],
+                label: None,
+            })
+    }
+
     fn blend_impl(
         &mut self,
         commands: CommandList,
@@ -974,6 +1037,34 @@ impl WgpuCommandHandler<'_, '_> {
         };
 
         match blend_type {
+            BlendType::Complex(blend_mode)
+                if !matches!(blend_mode, ComplexBlend::Alpha | ComplexBlend::Erase)
+                    && self.descriptors.shaders.fetch_blend_shaders.is_some()
+                    && ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::FetchBlends,
+                    ) =>
+            {
+                // Drawn like a trivial blend, but its shader blends with the pixel
+                // underneath (framebuffer fetch), so there's no need to split the pass
+                // and copy the backdrop. (Alpha and Erase blend with their layer,
+                // which may be another target.)
+                crate::perf_counters::count_named("fetch-blend");
+                let bind_group = self.texture_bind_group(&texture);
+                self.add_to_current(
+                    Matrix::translate(
+                        Twips::from_pixels_i32(origin.0),
+                        Twips::from_pixels_i32(origin.1),
+                    ) * Matrix::scale(width as f32, height as f32),
+                    0.0,
+                    Default::default(),
+                    |instance_index| DrawCommand::FetchBlend {
+                        _texture: texture,
+                        binds: bind_group,
+                        instance_index,
+                        blend_mode,
+                    },
+                );
+            }
             BlendType::Trivial(blend_mode) => {
                 crate::perf_counters::count(crate::perf_counters::Counter::BlendTrivial);
                 let transform = Transform {
@@ -985,25 +1076,7 @@ impl WgpuCommandHandler<'_, '_> {
                     color_transform: Default::default(),
                     perspective_projection: None,
                 };
-                let bind_group =
-                    self.descriptors
-                        .device
-                        .create_bind_group(&wgpu::BindGroupDescriptor {
-                            layout: &self.descriptors.bind_layouts.bitmap,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(texture.view()),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(
-                                        self.descriptors.bitmap_samplers.get_sampler(false, false),
-                                    ),
-                                },
-                            ],
-                            label: None,
-                        });
+                let bind_group = self.texture_bind_group(&texture);
                 self.add_to_current(
                     transform.matrix,
                     transform.tz,
