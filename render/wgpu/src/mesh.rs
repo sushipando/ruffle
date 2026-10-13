@@ -36,6 +36,7 @@ pub struct PendingDraw {
     pub indices: Range<wgpu::BufferAddress>,
     pub num_indices: u32,
     pub num_mask_indices: u32,
+    pub single_fill: bool,
 }
 
 impl PendingDraw {
@@ -53,6 +54,7 @@ impl PendingDraw {
             indices: self.indices,
             num_indices: self.num_indices,
             num_mask_indices: self.num_mask_indices,
+            single_fill: self.single_fill,
         }
     }
 }
@@ -64,6 +66,8 @@ pub struct Draw {
     pub indices: Range<wgpu::BufferAddress>,
     pub num_indices: u32,
     pub num_mask_indices: u32,
+    /// See `ruffle_render::tessellator::Draw::single_fill`.
+    pub single_fill: bool,
 }
 
 impl PendingDraw {
@@ -128,6 +132,7 @@ impl PendingDraw {
             indices,
             num_indices: index_count,
             num_mask_indices: draw.mask_index_count,
+            single_fill: draw.single_fill,
         })
     }
 }

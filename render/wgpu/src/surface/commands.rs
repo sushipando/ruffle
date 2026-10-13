@@ -12,7 +12,7 @@ use crate::surface::target::{BlendRegion, CommandTarget};
 use crate::{Descriptors, MaskState, Pipelines, PosUvVertex, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
@@ -108,7 +108,8 @@ impl<'encoder> CommandRenderer<'encoder> {
             DrawCommand::RenderShape {
                 shape,
                 instance_index,
-            } => self.render_shape(render_pass, shape, *instance_index),
+                blend_mode,
+            } => self.render_shape(render_pass, shape, *instance_index, *blend_mode),
             DrawCommand::DrawRect { instance_index } => {
                 self.draw_rect(render_pass, *instance_index)
             }
@@ -308,7 +309,16 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut wgpu::RenderPass<'encoder>,
         shape: &'encoder ShapeHandle,
         instance_index: u32,
+        blend_mode: TrivialBlend,
     ) {
+        let blended = (!matches!(blend_mode, TrivialBlend::Normal)).then(|| {
+            self.pipelines.blended_fills(
+                &self.descriptors.device,
+                &self.descriptors.shaders,
+                &self.descriptors.bind_layouts,
+                blend_mode,
+            )
+        });
         let mesh = as_mesh(shape);
         for draw in &mesh.draws {
             let num_indices = if self.mask_state != MaskState::DrawMaskStencil
@@ -323,15 +333,30 @@ impl<'encoder> CommandRenderer<'encoder> {
                 continue;
             }
 
-            match &draw.draw_type {
-                DrawType::Color => {
+            match (&draw.draw_type, blended) {
+                (DrawType::Color, None) => {
                     self.prep_color(render_pass);
                 }
-                DrawType::Gradient { bind_group, .. } => {
+                (DrawType::Color, Some(blended)) => {
+                    render_pass.set_pipeline(if self.needs_stencil {
+                        blended.color.pipeline_for(self.mask_state)
+                    } else {
+                        blended.color.stencilless_pipeline()
+                    });
+                }
+                (DrawType::Gradient { bind_group, .. }, None) => {
                     self.prep_gradient(render_pass, bind_group);
                 }
-                DrawType::Bitmap { binds, .. } => {
-                    self.prep_bitmap(render_pass, &binds.bind_group, TrivialBlend::Normal, false);
+                (DrawType::Gradient { bind_group, .. }, Some(blended)) => {
+                    render_pass.set_pipeline(if self.needs_stencil {
+                        blended.gradient.pipeline_for(self.mask_state)
+                    } else {
+                        blended.gradient.stencilless_pipeline()
+                    });
+                    render_pass.set_bind_group(2, bind_group, &[]);
+                }
+                (DrawType::Bitmap { binds, .. }, _) => {
+                    self.prep_bitmap(render_pass, &binds.bind_group, blend_mode, false);
                 }
             }
 
@@ -499,6 +524,8 @@ pub enum DrawCommand {
     RenderShape {
         shape: ShapeHandle,
         instance_index: u32,
+        /// `Normal`, unless drawn directly with a blend mode (see `direct_blend`).
+        blend_mode: TrivialBlend,
     },
     DrawRect {
         instance_index: u32,
@@ -650,6 +677,8 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     vertices: BufferBuilder,
     needs_stencil: bool,
     num_masks: i32,
+    /// While drawing the content of a blend directly (instead of in a layer), its mode.
+    direct_blend: Option<TrivialBlend>,
 }
 
 impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
@@ -703,6 +732,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             vertices,
             needs_stencil: false,
             num_masks: 0,
+            direct_blend: None,
         }
     }
 
@@ -930,12 +960,60 @@ impl WgpuCommandHandler<'_, '_> {
         }
     }
 
+    /// The trivial blend mode to draw `commands` with directly, without a layer, if that
+    /// gives the same result: when they're a single bitmap, or a single shape with a
+    /// single fill, which affect each pixel at most once.
+    fn direct_blend_mode(
+        &self,
+        commands: &CommandList,
+        blend_mode: &RenderBlendMode,
+    ) -> Option<TrivialBlend> {
+        if self.direct_blend.is_some()
+            || !ruffle_render::perf_flags::enabled(
+                ruffle_render::perf_flags::PerfFlag::DirectBlends,
+            )
+        {
+            return None;
+        }
+        let mode = match BlendType::from(blend_mode.clone()) {
+            BlendType::Trivial(mode) => mode,
+            BlendType::Complex(ComplexBlend::Multiply)
+                if self.opaque
+                    && ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::OpaqueMultiply,
+                    ) =>
+            {
+                TrivialBlend::MultiplyOpaque
+            }
+            _ => return None,
+        };
+        let [command] = commands.commands.as_slice() else {
+            return None;
+        };
+        let single = match command {
+            Command::RenderShape { shape, .. } => {
+                let mesh = as_mesh(shape);
+                mesh.draws.len() == 1 && mesh.draws[0].single_fill
+            }
+            Command::RenderBitmap { .. } => true,
+            _ => false,
+        };
+        single.then_some(mode)
+    }
+
     fn blend_impl(
         &mut self,
         commands: CommandList,
         blend_mode: RenderBlendMode,
         rect: Option<(i32, i32, u32, u32)>,
     ) {
+        if let Some(mode) = self.direct_blend_mode(&commands, &blend_mode) {
+            crate::perf_counters::count_named("direct-blend");
+            self.direct_blend = Some(mode);
+            commands.execute(self);
+            self.direct_blend = None;
+            return;
+        }
         if crate::perf_counters::enabled() {
             let mode = match &blend_mode {
                 RenderBlendMode::Builtin(mode) => format!("{mode:?}"),
@@ -1168,6 +1246,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         pixel_snapping: PixelSnapping,
         region: PixelRegion,
     ) {
+        let direct_blend = self.direct_blend.unwrap_or(TrivialBlend::Normal);
         let texture = as_texture(&bitmap);
 
         let mut matrix = transform.matrix;
@@ -1199,7 +1278,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 instance_index,
                 vertex_offset,
                 smoothing,
-                blend_mode: TrivialBlend::Normal,
+                blend_mode: direct_blend,
                 render_stage3d: false,
             },
         );
@@ -1230,6 +1309,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
+        let blend_mode = self.direct_blend.unwrap_or(TrivialBlend::Normal);
         self.add_to_current(
             transform.matrix,
             transform.tz,
@@ -1237,6 +1317,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             |instance_index| DrawCommand::RenderShape {
                 shape,
                 instance_index,
+                blend_mode,
             },
         );
     }

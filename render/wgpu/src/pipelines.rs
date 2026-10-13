@@ -60,6 +60,19 @@ pub struct Pipelines {
     /// (see `Shaders::fetch_blend_shaders`).
     pub fetch_blends: Option<EnumMap<ComplexBlend, ShapePipeline>>,
     pub alpha_mask: ShapePipeline,
+    /// Color and gradient fills drawn with a trivial blend mode (see `blended_fills`).
+    blended_fills: EnumMap<TrivialBlend, std::sync::OnceLock<BlendedFills>>,
+    format: wgpu::TextureFormat,
+    msaa_sample_count: u32,
+}
+
+/// Pipelines for drawing fills with a blend mode, directly onto a target (instead of
+/// drawing them into a layer that is blended). Only for fills that don't overlap
+/// themselves, see `ruffle_render::tessellator::Draw::single_fill`.
+#[derive(Debug)]
+pub struct BlendedFills {
+    pub color: ShapePipeline,
+    pub gradient: ShapePipeline,
 }
 
 impl ShapePipeline {
@@ -86,6 +99,47 @@ impl ShapePipeline {
 }
 
 impl Pipelines {
+    /// The pipelines for color and gradient fills with the given blend mode, created on
+    /// first use (most blend modes are never used this way).
+    pub fn blended_fills(
+        &self,
+        device: &wgpu::Device,
+        shaders: &Shaders,
+        bind_layouts: &BindLayouts,
+        blend: TrivialBlend,
+    ) -> &BlendedFills {
+        self.blended_fills[blend].get_or_init(|| BlendedFills {
+            color: create_shape_pipeline(
+                &format!("Color ({blend:?})"),
+                device,
+                self.format,
+                &shaders.color_shader,
+                self.msaa_sample_count,
+                &VERTEX_BUFFERS_DESCRIPTION_COLOR,
+                &[Some(&bind_layouts.globals), Some(&bind_layouts.transforms)],
+                blend.blend_state(),
+                0,
+                PrimitiveTopology::TriangleList,
+            ),
+            gradient: create_shape_pipeline(
+                &format!("Gradient ({blend:?})"),
+                device,
+                self.format,
+                &shaders.gradient_shader,
+                self.msaa_sample_count,
+                &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
+                &[
+                    Some(&bind_layouts.globals),
+                    Some(&bind_layouts.transforms),
+                    Some(&bind_layouts.gradient),
+                ],
+                blend.blend_state(),
+                0,
+                PrimitiveTopology::TriangleList,
+            ),
+        })
+    }
+
     pub fn new(
         device: &wgpu::Device,
         shaders: &Shaders,
@@ -275,6 +329,9 @@ impl Pipelines {
             lines: lines_pipelines,
             bitmap: bitmap_pipelines,
             fetch_blends: fetch_blend_pipelines,
+            blended_fills: Default::default(),
+            format,
+            msaa_sample_count,
             bitmap_opaque,
             bitmap_opaque_dummy_stencil: bitmap_opaque_dummy_depth,
             gradients: gradient_pipeline,

@@ -18,6 +18,8 @@ pub struct ShapeTessellator {
     lyon_mesh: VertexBuffers<Vertex, u32>,
     mask_index_count: Option<u32>,
     is_stroke: bool,
+    /// How many paths are in the pending draw.
+    paths: u32,
 }
 
 const TESSELLATION_EPSILON: f32 = 0.0000001;
@@ -32,6 +34,7 @@ impl ShapeTessellator {
             lyon_mesh: VertexBuffers::new(),
             mask_index_count: None,
             is_stroke: false,
+            paths: 0,
         }
     }
 
@@ -159,6 +162,7 @@ impl ShapeTessellator {
                 self.mask_index_count = Some(self.lyon_mesh.indices.len() as u32);
             }
             self.is_stroke = next_is_stroke;
+            self.paths += 1;
 
             let mut buffers_builder =
                 BuffersBuilder::new(&mut self.lyon_mesh, RuffleVertexCtor { color });
@@ -248,6 +252,7 @@ impl ShapeTessellator {
     }
 
     fn flush_draw(&mut self, draw: DrawType) {
+        let paths = std::mem::take(&mut self.paths);
         if self.lyon_mesh.vertices.is_empty() || self.lyon_mesh.indices.len() < 3 {
             // Ignore degenerate fills
             self.lyon_mesh = VertexBuffers::new();
@@ -260,6 +265,9 @@ impl ShapeTessellator {
             mask_index_count: self
                 .mask_index_count
                 .unwrap_or(draw_mesh.indices.len() as u32),
+            // A fill path is tessellated into triangles that don't overlap; strokes and
+            // several paths (such as fills from different style layers) may overlap.
+            single_fill: paths == 1 && !self.is_stroke && self.mask_index_count.is_none(),
             vertices: draw_mesh.vertices,
             indices: draw_mesh.indices,
         });
@@ -283,6 +291,9 @@ pub struct Draw {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub mask_index_count: u32,
+    /// Whether this is a single fill (no strokes), whose triangles don't overlap.
+    /// Drawing it with any blend state then affects each pixel once.
+    pub single_fill: bool,
 }
 
 pub enum DrawType {

@@ -60,9 +60,12 @@ pub enum PerfFlag {
     /// Apply the filters of many cached bitmaps together, whatever their parameters
     /// (only with `BlurMerge`, see `filters::batch` in the wgpu backend).
     FilterTogether,
+    /// Draw a blend's content directly with the blend mode, instead of in a layer, when
+    /// that's the same (a single bitmap, or a single shape with a single fill).
+    DirectBlends,
 }
 
-const NAMES: [&str; 22] = [
+const NAMES: [&str; 23] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -85,9 +88,10 @@ const NAMES: [&str; 22] = [
     "batch-large-filters",
     "cache-bind-groups",
     "filter-together",
+    "direct-blends",
 ];
 
-static FLAGS: [AtomicBool; 22] = [
+static FLAGS: [AtomicBool; 23] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -110,6 +114,7 @@ static FLAGS: [AtomicBool; 22] = [
     AtomicBool::new(true),  // batch-large-filters
     AtomicBool::new(true),  // cache-bind-groups
     AtomicBool::new(true),  // filter-together
+    AtomicBool::new(true),  // direct-blends
 ];
 
 #[inline]
