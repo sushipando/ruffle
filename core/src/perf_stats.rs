@@ -44,6 +44,10 @@ pub struct PerfStats {
     run_frame: Bucket,
     render: Bucket,
     tick_other: Bucket,
+    /// The number of live GC objects, and of orphan display objects.
+    gc_objects: usize,
+    orphans: usize,
+    loaders: usize,
 }
 
 impl PerfStats {
@@ -54,11 +58,20 @@ impl PerfStats {
             run_frame: Bucket::default(),
             render: Bucket::default(),
             tick_other: Bucket::default(),
+            gc_objects: 0,
+            orphans: 0,
+            loaders: 0,
         })
     }
 
     pub fn record_run_frame(&mut self, d: Duration) {
         self.run_frame.add(d);
+    }
+
+    pub fn set_heap_stats(&mut self, gc_objects: usize, orphans: usize, loaders: usize) {
+        self.gc_objects = gc_objects;
+        self.orphans = orphans;
+        self.loaders = loaders;
     }
 
     pub fn record_render(&mut self, d: Duration) {
@@ -80,7 +93,7 @@ impl PerfStats {
         let busy_ms =
             self.run_frame.total_ms() + self.render.total_ms() + self.tick_other.total_ms();
         eprintln!(
-            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}%",
+            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}% | gc objects {} orphans {} loaders {}",
             self.run_frame.count as f64 / secs,
             self.run_frame.avg_ms(),
             self.run_frame.max_ms(),
@@ -90,6 +103,9 @@ impl PerfStats {
             self.tick_other.avg_ms(),
             self.tick_other.max_ms(),
             busy_ms / (secs * 10.0),
+            self.gc_objects,
+            self.orphans,
+            self.loaders,
         );
         self.window_start = Instant::now();
         self.run_frame = Bucket::default();

@@ -110,8 +110,7 @@ pub fn serialize_value<'gc>(
             } else if let Some(bytearray) = o.as_bytearray() {
                 AmfValue::ByteArray(bytearray.bytes().to_vec())
             } else if let Some(dictionary) = o.as_dictionary_object() {
-                // FIXME change this once weak keys are implemented
-                let has_weak_keys = false;
+                let has_weak_keys = dictionary.has_weak_keys();
 
                 let mut dictionary_body = Vec::new();
 

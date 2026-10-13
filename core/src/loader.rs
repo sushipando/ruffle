@@ -494,6 +494,46 @@ impl<'gc> LoadManager<'gc> {
     }
 }
 
+impl LoadManager<'_> {
+    /// The number of loaders in progress (or not yet cleaned up).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Diagnostics: a description of each loader.
+    pub fn describe(&self) -> Vec<String> {
+        self.0
+            .values()
+            .map(|loader| {
+                let target = if let Some(mc) = loader.target_clip.as_movie_clip() {
+                    format!(
+                        "movieclip(bytes={}/{}, frames_loaded={}, on_stage={})",
+                        mc.loaded_bytes(),
+                        mc.total_bytes(),
+                        mc.frames_loaded(),
+                        loader.target_clip.parent().is_some()
+                    )
+                } else {
+                    format!("{:?}", loader.target_clip)
+                        .chars()
+                        .take(40)
+                        .collect()
+                };
+                let url = loader
+                    .movie
+                    .as_ref()
+                    .map(|m| m.url().to_string())
+                    .unwrap_or_default();
+                format!("{:?} {target} {url}", loader.loader_status)
+            })
+            .collect()
+    }
+}
+
 impl Default for LoadManager<'_> {
     fn default() -> Self {
         Self::new()
@@ -2220,13 +2260,23 @@ impl<'gc> MovieLoader<'gc> {
                 if let Some(dobj) = dobj
                     && dobj.as_movie_clip().is_none()
                 {
-                    loader_info.fire_init_and_complete_events(uc, status, redirected);
+                    // Images don't run frames, so nothing else will fire these events,
+                    // or remove the loader once they have been fired (as
+                    // `LoadManager::run_exit_frame` does for movies). Without this, every
+                    // loaded image stays in the load manager forever, along with everything
+                    // reachable from its `Loader`.
+                    if loader_info.fire_init_and_complete_events(uc, status, redirected) {
+                        uc.load_manager.remove_loader(handle);
+                        return Ok(());
+                    }
                 }
             }
         }
 
-        let loader = uc.load_manager.get_loader_mut(handle).unwrap();
-        loader.loader_status = LoaderStatus::Succeeded;
+        // An event handler may have closed the loader already.
+        if let Some(loader) = uc.load_manager.get_loader_mut(handle) {
+            loader.loader_status = LoaderStatus::Succeeded;
+        }
 
         Ok(())
     }

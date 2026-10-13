@@ -148,7 +148,7 @@ pub use crate::avm2::object::responder_object::{
 };
 pub use crate::avm2::object::script_object::{
     ScriptObject, ScriptObjectData, ScriptObjectHandle, ScriptObjectWeak, ScriptObjectWrapper,
-    get_dynamic_property, scriptobject_allocator,
+    debug_describe_object, get_dynamic_property, scriptobject_allocator,
 };
 pub use crate::avm2::object::security_domain_object::{
     SecurityDomainObject, SecurityDomainObjectWeak,
@@ -961,6 +961,19 @@ macro_rules! define_weak_enum {
             $vis fn upgrade(self, mc: &Mutation<'gc>) -> Option<$strong_enum<'gc>> {
                 match self {
                     $( Self::$variant(o) => $strong_enum::$variant($variant(o.0.upgrade(mc)?)).into(), )*
+                }
+            }
+
+            /// Whether the object has been garbage collected.
+            $vis fn is_dropped(self) -> bool {
+                match self {
+                    $( Self::$variant(o) => o.0.is_dropped(), )*
+                }
+            }
+
+            $vis fn erase(self) -> GcWeak<'gc, ()> {
+                match self {
+                    $( Self::$variant(o) => GcWeak::erase(o.0), )*
                 }
             }
         }

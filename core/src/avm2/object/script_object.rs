@@ -490,3 +490,64 @@ pub fn get_dynamic_property<'gc>(
 
     Ok(None)
 }
+
+/// Diagnostics (leak debugging): describes an object given a pointer to its data, and, if
+/// `child` is a pointer to an object it references, the property holding it.
+///
+/// # Safety
+/// `ptr` must point to a live `ScriptObjectData`, or to a `repr(C)` object data struct
+/// starting with one.
+pub unsafe fn debug_describe_object(ptr: *const (), child: Option<*const ()>) -> String {
+    use crate::avm2::dynamic_map::DynamicKey;
+    use crate::avm2::property::Property;
+
+    let data = unsafe { &*(ptr as *const ScriptObjectData<'_>) };
+    let class = data.instance_class.name().local_name().to_string();
+    let Some(child) = child else {
+        return class;
+    };
+    let is_child = |o: &Object<'_>| std::ptr::eq(o.as_ptr() as *const (), child);
+    let is_child_value = |v: &Value<'_>| matches!(v, Value::Object(o) if is_child(o));
+    if let Ok(values) = data.values.try_borrow() {
+        for (key, prop) in values.iter() {
+            let key_is_child = matches!(key, DynamicKey::Object(o) if is_child(o));
+            if key_is_child || is_child_value(&prop.value) {
+                let key = match key {
+                    DynamicKey::String(s) => s.to_string(),
+                    DynamicKey::Uint(i) => i.to_string(),
+                    DynamicKey::Object(_) if key_is_child => "<key>".to_string(),
+                    DynamicKey::Object(o) => format!("<object key {:?}>", o.as_ptr()),
+                };
+                return format!("{class}[{key}]");
+            }
+        }
+    }
+    for (slot_id, slot) in data.slots.iter().enumerate() {
+        if is_child_value(&slot.get()) {
+            let name = data
+                .vtable
+                .get()
+                .resolved_traits()
+                .iter()
+                .find_map(|(name, _, prop)| match prop {
+                    Property::Slot { slot_id: id } | Property::ConstSlot { slot_id: id }
+                        if *id == slot_id =>
+                    {
+                        Some(name.to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("slot{slot_id}"));
+            return format!("{class}.{name}");
+        }
+    }
+    if data.proto.get().is_some_and(|o| is_child(&o)) {
+        return format!("{class}.<proto>");
+    }
+    if let Ok(methods) = data.bound_methods.try_borrow()
+        && methods.iter().flatten().any(|m| is_child(&(*m).into()))
+    {
+        return format!("{class}.<bound method>");
+    }
+    class
+}

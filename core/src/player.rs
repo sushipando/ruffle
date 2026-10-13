@@ -2168,8 +2168,106 @@ impl Player {
             .submit_frame(background_color, commands, cache_draws);
 
         self.needs_render = false;
-        if let Some(stats) = &mut self.perf_stats {
-            stats.record_render(render_start.elapsed());
+        if self.perf_stats.is_some() {
+            let gc_objects = self.gc_arena.borrow().metrics().total_gc_count();
+            let orphans = self.enter_arena(|_, gc_root, _| gc_root.orphan_manager.len());
+            let loaders = self.enter_arena(|_, gc_root, _| gc_root.load_manager.len());
+            if std::env::var_os("RUFFLE_ORPHAN_DEBUG").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static RENDERS: AtomicU32 = AtomicU32::new(0);
+                if RENDERS.fetch_add(1, Ordering::Relaxed).is_multiple_of(240) {
+                    let histogram = self
+                        .enter_arena(|mc, gc_root, _| gc_root.orphan_manager.class_histogram(mc));
+                    let top: Vec<String> = histogram
+                        .iter()
+                        .take(15)
+                        .map(|(class, count)| format!("{class}={count}"))
+                        .collect();
+                    eprintln!("[orphans] {}", top.join(" "));
+                    let loaders = self.enter_arena(|_, gc_root, _| gc_root.load_manager.describe());
+                    for loader in loaders.iter().take(40) {
+                        eprintln!("[loader] {loader}");
+                    }
+                    if let Some(class) = std::env::var_os("RUFFLE_LEAK_PATHS") {
+                        self.print_retention_paths(&class.to_string_lossy());
+                    }
+                    if std::env::var_os("RUFFLE_HEAP_HISTOGRAM").is_some() {
+                        self.print_heap_histogram();
+                    }
+                }
+            }
+            if let Some(stats) = &mut self.perf_stats {
+                stats.set_heap_stats(gc_objects, orphans, loaders);
+                stats.record_render(render_start.elapsed());
+            }
+        }
+    }
+
+    /// Diagnostics (leak debugging): prints the most common types of reachable GC objects.
+    fn print_heap_histogram(&self) {
+        let Ok(arena) = self.gc_arena.try_borrow() else {
+            return;
+        };
+        if arena.collection_phase() == gc_arena::arena::CollectionPhase::Sweeping {
+            // See `debug_paths`: not safe while sweeping.
+            return;
+        }
+        let start = Instant::now();
+        let histogram = arena.mutate(|_, root| gc_arena::debug_paths::type_histogram(root));
+        let reachable: usize = histogram.iter().map(|(_, count, _)| count).sum();
+        let top: Vec<String> = histogram
+            .iter()
+            .take(25)
+            .map(|(name, count, bytes)| {
+                let name = short_type_name(name).replace("<'_>", "");
+                format!("{name}={count}({}KB)", bytes / 1024)
+            })
+            .collect();
+        eprintln!(
+            "[heap] reachable {reachable} of {} ({:?}): {}",
+            arena.metrics().total_gc_count(),
+            start.elapsed(),
+            top.join(" ")
+        );
+    }
+
+    /// Diagnostics (leak debugging): prints what keeps orphans of an AVM2 class alive.
+    fn print_retention_paths(&self, class: &str) {
+        let Ok(arena) = self.gc_arena.try_borrow() else {
+            return;
+        };
+        if arena.collection_phase() == gc_arena::arena::CollectionPhase::Sweeping {
+            // See `debug_paths`: not safe while sweeping.
+            return;
+        }
+        let start = Instant::now();
+        let (count, paths) = arena.mutate(|mc, root| {
+            let targets = match root.data.try_borrow() {
+                Ok(data) => data.orphan_manager.debug_orphans_of_class(mc, class, 8),
+                Err(_) => return (0, vec![]),
+            };
+            let paths = gc_arena::debug_paths::find_paths(root, &targets);
+            let paths: Vec<Vec<String>> = paths
+                .iter()
+                .map(|path| {
+                    path.iter()
+                        .enumerate()
+                        .map(|(i, (ptr, type_name))| {
+                            let child = path.get(i + 1).map(|(child, _)| *child);
+                            describe_gc_node(*ptr, type_name, child)
+                        })
+                        .collect()
+                })
+                .collect();
+            (targets.len(), paths)
+        });
+        eprintln!(
+            "[paths] {class}: {} of {count} orphans reachable ({:?})",
+            paths.len(),
+            start.elapsed()
+        );
+        for path in paths {
+            eprintln!("[path] {}", path.join(" -> "));
         }
     }
 
@@ -3351,4 +3449,58 @@ pub enum PlayerMode {
 
     /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
     Debug,
+}
+
+/// Diagnostics (leak debugging): describes a GC allocation found by `gc_arena::debug_paths`.
+fn describe_gc_node(ptr: *const (), type_name: &str, child: Option<*const ()>) -> String {
+    const DISPLAY_OBJECT_DATA: &[&str] = &[
+        "MovieClipData",
+        "LoaderDisplayData",
+        "BitmapGraphicData",
+        "GraphicData",
+        "MorphShapeData",
+        "TextData",
+        "VideoData",
+        "EditTextData",
+        "StageData",
+        "TextLineData",
+        "Avm1ButtonData",
+        "Avm2ButtonData",
+    ];
+    let short = short_type_name(type_name);
+    let base_name = short.split('<').next().unwrap_or_default();
+    if type_name.starts_with("ruffle_core::avm2::object::") && base_name.ends_with("ObjectData") {
+        // SAFETY: all of these types start with a `ScriptObjectData`.
+        let object = unsafe { crate::avm2::object::debug_describe_object(ptr, child) };
+        return format!("{base_name}:{object}");
+    }
+    if type_name.starts_with("ruffle_core::display_object::")
+        && DISPLAY_OBJECT_DATA.contains(&base_name)
+    {
+        // SAFETY: all of these types start with a `DisplayObjectBase`.
+        let dobj = unsafe { crate::display_object::debug_describe_display_object(ptr) };
+        return format!("{base_name}{dobj}");
+    }
+    short
+}
+
+/// `a::b::C<d::E>` -> `C<E>`
+fn short_type_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut ident = String::new();
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            ident.clear();
+        } else if c.is_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else {
+            out.push_str(&ident);
+            ident.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(&ident);
+    out
 }

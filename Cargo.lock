@@ -2076,8 +2076,7 @@ dependencies = [
 [[package]]
 name = "gc-arena"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "160a11f93020eea95cb4c59e2eda2e4c6353f75aa4fbb01f2bf8729b2e4d6dd2"
+source = "git+https://github.com/sushipando/gc-arena?tag=perf-0.7.0-1#444a4742e2045d709d6bdb8458efbdd652f919f2"
 dependencies = [
  "enum-map",
  "gc-arena-derive",
@@ -2090,8 +2089,7 @@ dependencies = [
 [[package]]
 name = "gc-arena-derive"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd3d24b051bd5a5f44e66bac510393d3d484ef776bb560f6504668239f35959a"
+source = "git+https://github.com/sushipando/gc-arena?tag=perf-0.7.0-1#444a4742e2045d709d6bdb8458efbdd652f919f2"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -3421,3 +3421,19 @@ pub mod global_matrix_cache {
         matrix
     }
 }
+
+/// Diagnostics (leak debugging): describes a display object given a pointer to its data.
+///
+/// # Safety
+/// `ptr` must point to the data of a live display object, which starts with a
+/// `DisplayObjectBase`.
+pub unsafe fn debug_describe_display_object(ptr: *const ()) -> String {
+    let base = unsafe { &*(ptr as *const DisplayObjectBase<'_>) };
+    let name = base.name.get().map(|n| n.to_string()).unwrap_or_default();
+    let parent = if base.parent.get().is_some() {
+        "has parent"
+    } else {
+        "no parent"
+    };
+    format!("'{name}' ({parent})")
+}

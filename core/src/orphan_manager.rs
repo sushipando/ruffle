@@ -42,6 +42,53 @@ impl<'gc> OrphanManager<'gc> {
         }
     }
 
+    /// The number of objects on the orphan list.
+    pub fn len(&self) -> usize {
+        self.orphans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.orphans.is_empty()
+    }
+
+    /// Diagnostics: counts live orphans by their AVM2 class name, most common first.
+    pub fn class_histogram(&self, mc: &Mutation<'gc>) -> Vec<(String, usize)> {
+        use crate::avm2::object::TObject as _;
+        let mut counts: std::collections::HashMap<String, usize> = Default::default();
+        for orphan in self.orphans.iter() {
+            if let Some(dobj) = valid_orphan(*orphan, mc) {
+                let class = dobj
+                    .object2()
+                    .map(|o| o.instance_class().name().local_name().to_string())
+                    .unwrap_or_else(|| "<no object>".to_string());
+                *counts.entry(class).or_default() += 1;
+            }
+        }
+        let mut counts: Vec<_> = counts.into_iter().collect();
+        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        counts
+    }
+
+    /// Diagnostics: pointers to (up to `limit` of) the live orphans of an AVM2 class.
+    pub fn debug_orphans_of_class(
+        &self,
+        mc: &Mutation<'gc>,
+        class: &str,
+        limit: usize,
+    ) -> Vec<*const ()> {
+        use crate::avm2::object::TObject as _;
+        self.orphans
+            .iter()
+            .filter_map(|orphan| valid_orphan(*orphan, mc))
+            .filter(|dobj| {
+                dobj.object2()
+                    .is_some_and(|o| o.instance_class().name().local_name().to_string() == class)
+            })
+            .take(limit)
+            .map(|dobj| dobj.as_ptr() as *const ())
+            .collect()
+    }
+
     pub fn each_orphan_obj(
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
