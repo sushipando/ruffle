@@ -55,9 +55,14 @@ pub enum PerfFlag {
     CacheSlack,
     /// Batch the filters of larger cached bitmaps, in larger atlases.
     BatchLargeFilters,
+    /// Keep the bind groups of pooled blend layer textures (see `texture_bind_group`).
+    CacheBindGroups,
+    /// Apply the filters of many cached bitmaps together, whatever their parameters
+    /// (only with `BlurMerge`, see `filters::batch` in the wgpu backend).
+    FilterTogether,
 }
 
-const NAMES: [&str; 20] = [
+const NAMES: [&str; 22] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -78,9 +83,11 @@ const NAMES: [&str; 20] = [
     "merge-chunks",
     "cache-slack",
     "batch-large-filters",
+    "cache-bind-groups",
+    "filter-together",
 ];
 
-static FLAGS: [AtomicBool; 20] = [
+static FLAGS: [AtomicBool; 22] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -101,6 +108,8 @@ static FLAGS: [AtomicBool; 20] = [
     AtomicBool::new(true),  // merge-chunks
     AtomicBool::new(true),  // cache-slack
     AtomicBool::new(true),  // batch-large-filters
+    AtomicBool::new(true),  // cache-bind-groups
+    AtomicBool::new(true),  // filter-together
 ];
 
 #[inline]

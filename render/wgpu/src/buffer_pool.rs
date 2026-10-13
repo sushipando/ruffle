@@ -8,7 +8,15 @@ use std::sync::{Arc, Mutex, Weak};
 type PoolInner<T> = Mutex<Vec<T>>;
 type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
 
-type TexturePoolEntry = BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>;
+/// A pooled texture, its view, and a bind group for drawing it with the bitmap
+/// pipelines (created on first use, see `PooledTexture::bitmap_bind_group`).
+pub type PooledTexture = (
+    wgpu::Texture,
+    wgpu::TextureView,
+    std::sync::OnceLock<wgpu::BindGroup>,
+);
+
+type TexturePoolEntry = BufferPool<PooledTexture, AlwaysCompatible>;
 
 /// Textures and globals of sizes unused for this many frames are freed.
 const UNUSED_FRAMES_TO_KEEP: u64 = 4;
@@ -43,7 +51,7 @@ impl TexturePool {
         usage: wgpu::TextureUsages,
         format: wgpu::TextureFormat,
         sample_count: u32,
-    ) -> PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible> {
+    ) -> PoolEntry<PooledTexture, AlwaysCompatible> {
         let key = TextureKey {
             size,
             usage,
@@ -72,7 +80,7 @@ impl TexturePool {
                     usage,
                 });
                 let view = texture.create_view(&Default::default());
-                (texture, view)
+                (texture, view, Default::default())
             }));
             (pool, frame)
         });

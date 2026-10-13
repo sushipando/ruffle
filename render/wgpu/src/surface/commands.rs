@@ -896,25 +896,38 @@ impl WgpuCommandHandler<'_, '_> {
     }
 
     /// A bind group for drawing a blend layer's texture with the bitmap pipelines.
+    /// Pooled textures keep theirs, since they're reused every frame.
     fn texture_bind_group(&self, texture: &PoolOrArcTexture) -> wgpu::BindGroup {
-        self.descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.descriptors.bind_layouts.bitmap,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(texture.view()),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(
-                            self.descriptors.bitmap_samplers.get_sampler(false, false),
-                        ),
-                    },
-                ],
-                label: None,
-            })
+        let create = || {
+            self.descriptors
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &self.descriptors.bind_layouts.bitmap,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(texture.view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(
+                                self.descriptors.bitmap_samplers.get_sampler(false, false),
+                            ),
+                        },
+                    ],
+                    label: None,
+                })
+        };
+        match texture {
+            PoolOrArcTexture::Pool(entry)
+                if ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::CacheBindGroups,
+                ) =>
+            {
+                entry.2.get_or_init(create).clone()
+            }
+            _ => create(),
+        }
     }
 
     fn blend_impl(

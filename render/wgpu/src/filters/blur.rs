@@ -42,12 +42,12 @@ const COPY_UNIFORM: BlurUniform = BlurUniform {
 const MAX_KERNEL_TAPS: usize = 256;
 
 /// The size of `struct Kernel` in `blur.wgsl`.
-const KERNEL_UNIFORM_SIZE: u64 = 16 + 16 * (MAX_KERNEL_TAPS as u64 / 2);
+pub(super) const KERNEL_UNIFORM_SIZE: u64 = 16 + 16 * (MAX_KERNEL_TAPS as u64 / 2);
 
 /// Combines `passes` box blurs of `strength` (as `BlurFilter::apply_full` does them, one
 /// after the other) into one kernel. Returns its taps as `(offset, weight)`, each sampling
 /// between two neighboring texels with bilinear filtering, or `None` if there are too many.
-fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> {
+pub(super) fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> {
     // See `apply_full` for what these mean.
     let full_size = strength.min(255.0);
     let radius = (full_size - 1.0) / 2.0;
@@ -98,7 +98,7 @@ fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> {
 /// movie's own resolution), 4 if it's at least 64 and 8 if it's at least 128 (so still at
 /// least 16 pixels at the lower resolution; such large blurs have no detail to lose).
 /// A direction without any blur (such as `blurX = 0`) keeps its resolution.
-fn downscale_factors(filter: &BlurFilterArgs) -> (u32, u32) {
+pub(super) fn downscale_factors(filter: &BlurFilterArgs) -> (u32, u32) {
     if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BlurDownscale)
         || ruffle_render::filters::view_scale() < 2.0
     {
@@ -125,6 +125,11 @@ pub struct BlurFilter {
     kernel_pipeline_layout: wgpu::PipelineLayout,
     kernel_uniform_buffer: wgpu::Buffer,
     kernel_pipelines: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
+    /// Like `kernel_bind_group_layout`, with a dynamic offset into the kernels (see
+    /// `filters::batch`).
+    pub(super) dynamic_kernel_bind_group_layout: wgpu::BindGroupLayout,
+    dynamic_kernel_pipeline_layout: wgpu::PipelineLayout,
+    dynamic_kernel_pipeline: OnceLock<wgpu::RenderPipeline>,
 }
 
 impl BlurFilter {
@@ -209,6 +214,30 @@ impl BlurFilter {
                 bind_group_layouts: &[Some(&kernel_bind_group_layout)],
                 immediate_size: 0,
             });
+        let dynamic_kernel_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    texture,
+                    sampling,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: wgpu::BufferSize::new(KERNEL_UNIFORM_SIZE),
+                        },
+                        count: None,
+                    },
+                ],
+                label: create_debug_label!("Blur filter binds (dynamic kernel)").as_deref(),
+            });
+        let dynamic_kernel_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&dynamic_kernel_bind_group_layout)],
+                immediate_size: 0,
+            });
         let kernel_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: KERNEL_UNIFORM_SIZE,
@@ -221,6 +250,9 @@ impl BlurFilter {
             kernel_pipeline_layout,
             kernel_uniform_buffer,
             kernel_pipelines: Default::default(),
+            dynamic_kernel_bind_group_layout,
+            dynamic_kernel_pipeline_layout,
+            dynamic_kernel_pipeline: Default::default(),
             pipelines: Default::default(),
             pipeline_layout,
             vertex_buffer,
@@ -234,6 +266,38 @@ impl BlurFilter {
     fn pipeline(&self, descriptors: &Descriptors, msaa_sample_count: u32) -> &wgpu::RenderPipeline {
         self.pipelines.get_or_init(msaa_sample_count, || {
             self.create_pipeline(descriptors, msaa_sample_count, false)
+        })
+    }
+
+    /// The kernel pipeline with `dynamic_kernel_bind_group_layout` (single-sampled).
+    pub(super) fn dynamic_kernel_pipeline(
+        &self,
+        descriptors: &Descriptors,
+    ) -> &wgpu::RenderPipeline {
+        self.dynamic_kernel_pipeline.get_or_init(|| {
+            descriptors
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: create_debug_label!("Blur Filter (dynamic kernel)").as_deref(),
+                    layout: Some(&self.dynamic_kernel_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &descriptors.shaders.blur_filter,
+                        entry_point: Some("kernel_vertex"),
+                        buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS,
+                        compilation_options: Default::default(),
+                    },
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &descriptors.shaders.blur_filter,
+                        entry_point: Some("kernel_fragment"),
+                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        compilation_options: Default::default(),
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
         })
     }
 

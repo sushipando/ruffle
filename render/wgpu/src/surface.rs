@@ -297,7 +297,11 @@ impl Surface {
                         );
 
                         for command in chunk {
-                            renderer.execute(&mut render_pass.scope(command.name()), command);
+                            if crate::utils::PROFILE_COMMANDS {
+                                renderer.execute(&mut render_pass.scope(command.name()), command);
+                            } else {
+                                renderer.execute(&mut render_pass, command);
+                            }
                         }
 
                         num_masks = renderer.num_masks();

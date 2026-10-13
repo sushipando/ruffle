@@ -1,3 +1,4 @@
+mod batch;
 mod bevel;
 mod blur;
 mod color_matrix;
@@ -11,6 +12,7 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
+pub use crate::filters::batch::{apply_together, can_apply_together};
 use crate::filters::bevel::BevelFilter;
 use crate::filters::blur::BlurFilter;
 use crate::filters::color_matrix::ColorMatrixFilter;

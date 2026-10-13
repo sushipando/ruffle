@@ -14,16 +14,21 @@ use wgpu::util::StagingBelt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq)]
-struct GlowUniform {
-    color: [f32; 4],
-    strength: f32,
-    inner: u32,            // a wasteful bool, but we need to be aligned anyway
-    knockout: u32,         // a wasteful bool, but we need to be aligned anyway
-    composite_source: u32, // undocumented flash feature, another bool
+pub(super) struct GlowUniform {
+    pub(super) color: [f32; 4],
+    pub(super) strength: f32,
+    pub(super) inner: u32, // a wasteful bool, but we need to be aligned anyway
+    pub(super) knockout: u32, // a wasteful bool, but we need to be aligned anyway
+    pub(super) composite_source: u32, // undocumented flash feature, another bool
 }
 
 pub struct GlowFilter {
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Like `bind_group_layout`, with a filtering sampler (single-sampled, see
+    /// `linear_pipeline`).
+    pub(super) linear_bind_group_layout: wgpu::BindGroupLayout,
+    linear_pipeline_layout: wgpu::PipelineLayout,
+    linear_pipeline: OnceLock<wgpu::RenderPipeline>,
     pipeline_layout: wgpu::PipelineLayout,
     vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
@@ -35,47 +40,56 @@ pub struct GlowFilter {
 impl GlowFilter {
     pub fn new(device: &wgpu::Device) -> Self {
         let uniform_size = std::mem::size_of::<GlowUniform>() as u64;
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+        // The batched path (`filters::batch`) samples scaled-down blurs bilinearly.
+        let make_layout = |filterable: bool| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(uniform_size),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(if filterable {
+                            wgpu::SamplerBindingType::Filtering
+                        } else {
+                            wgpu::SamplerBindingType::NonFiltering
+                        }),
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(uniform_size),
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-            label: create_debug_label!("Blur filter binds").as_deref(),
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+                label: create_debug_label!("Blur filter binds").as_deref(),
+            })
+        };
+        let bind_group_layout = make_layout(false);
+        let linear_bind_group_layout = make_layout(true);
 
         let vertices_size = std::mem::size_of::<[FilterVertexWithBlur; 4]>() as u64;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -97,8 +111,17 @@ impl GlowFilter {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
+        let linear_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&linear_bind_group_layout)],
+                immediate_size: 0,
+            });
 
         Self {
+            linear_bind_group_layout,
+            linear_pipeline_layout,
+            linear_pipeline: Default::default(),
             pipeline: Default::default(),
             pipeline_layout,
             vertex_buffer,
@@ -111,12 +134,29 @@ impl GlowFilter {
 
     fn pipeline(&self, descriptors: &Descriptors, msaa_sample_count: u32) -> &wgpu::RenderPipeline {
         self.pipeline.get_or_init(msaa_sample_count, || {
+            self.create_pipeline(descriptors, msaa_sample_count, &self.pipeline_layout)
+        })
+    }
+
+    /// The pipeline for `linear_bind_group_layout`.
+    pub(super) fn linear_pipeline(&self, descriptors: &Descriptors) -> &wgpu::RenderPipeline {
+        self.linear_pipeline
+            .get_or_init(|| self.create_pipeline(descriptors, 1, &self.linear_pipeline_layout))
+    }
+
+    fn create_pipeline(
+        &self,
+        descriptors: &Descriptors,
+        msaa_sample_count: u32,
+        layout: &wgpu::PipelineLayout,
+    ) -> wgpu::RenderPipeline {
+        {
             let label = create_debug_label!("Glow Filter ({} msaa)", msaa_sample_count);
             descriptors
                 .device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: label.as_deref(),
-                    layout: Some(&self.pipeline_layout),
+                    layout: Some(layout),
                     vertex: wgpu::VertexState {
                         module: &descriptors.shaders.glow_filter,
                         entry_point: Some("main_vertex"),
@@ -147,7 +187,7 @@ impl GlowFilter {
                     multiview_mask: None,
                     cache: None,
                 })
-        })
+        }
     }
 
     #[expect(clippy::too_many_arguments)]

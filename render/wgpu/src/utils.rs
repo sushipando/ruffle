@@ -5,6 +5,13 @@ use std::borrow::Cow;
 use wgpu::util::DeviceExt;
 use wgpu::{CommandEncoder, TextureFormat};
 
+/// Whether each draw command gets its own profiler scope (a debug group, or a timer
+/// query with tracy). Scopes cost an allocation and a channel message each, and there are
+/// thousands of draw commands per frame in complex content, so they're only used in
+/// builds that make use of them.
+pub const PROFILE_COMMANDS: bool =
+    cfg!(feature = "render_debug_labels") || cfg!(feature = "profile-with-tracy");
+
 macro_rules! create_debug_label {
     ($($arg:tt)*) => (
         if cfg!(feature = "render_debug_labels") {

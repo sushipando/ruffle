@@ -623,18 +623,33 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             collect_bitmaps(&entry.commands, &mut referenced);
         }
         let mut filter_groups: Vec<(Vec<Filter>, Vec<usize>)> = vec![];
+        // Cache entries whose filters are applied together, whatever they are (see
+        // `filters::batch`).
+        let mut filtered_together: Vec<usize> = vec![];
         if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::FilterBatching) {
+            let together = ruffle_render::perf_flags::enabled(
+                ruffle_render::perf_flags::PerfFlag::FilterTogether,
+            ) && ruffle_render::perf_flags::enabled(
+                ruffle_render::perf_flags::PerfFlag::BlurMerge,
+            ) && ruffle_render::filters::rendering_for_display();
             for (index, entry) in cache_entries.iter().enumerate() {
                 let texture = &cache_textures[index];
                 if !entry.filters.is_empty()
-                    && entry
-                        .filters
-                        .iter()
-                        .all(crate::surface::layer_atlas::is_local_filter)
                     && texture.width() <= crate::surface::layer_atlas::max_batched_filter_size()
                     && texture.height() <= crate::surface::layer_atlas::max_batched_filter_size()
                     && !referenced.contains(&entry.handle)
                 {
+                    if together && entry.filters.iter().all(crate::filters::can_apply_together) {
+                        filtered_together.push(index);
+                        continue;
+                    }
+                    if !entry
+                        .filters
+                        .iter()
+                        .all(crate::surface::layer_atlas::is_local_filter)
+                    {
+                        continue;
+                    }
                     match filter_groups
                         .iter_mut()
                         .find(|(filters, _)| *filters == entry.filters)
@@ -646,12 +661,90 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             }
             filter_groups.retain(|(_, members)| members.len() >= 2);
         }
+        if std::env::var_os("RUFFLE_FILTER_DEBUG").is_some() {
+            static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if FRAME
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(120)
+            {
+                let describe = |filters: &[Filter]| {
+                    filters
+                        .iter()
+                        .map(|f| match f {
+                            Filter::BlurFilter(b) => format!(
+                                "Blur({:.1}x{:.1} q{})",
+                                b.blur_x.to_f32(),
+                                b.blur_y.to_f32(),
+                                b.num_passes()
+                            ),
+                            Filter::GlowFilter(g) => format!(
+                                "Glow({:.1}x{:.1} q{} #{:02x}{:02x}{:02x}{:02x} s{:.2}{}{})",
+                                g.blur_x.to_f32(),
+                                g.blur_y.to_f32(),
+                                g.num_passes(),
+                                g.color.r,
+                                g.color.g,
+                                g.color.b,
+                                g.color.a,
+                                g.strength.to_f32(),
+                                if g.is_inner() { " inner" } else { "" },
+                                if g.is_knockout() { " knockout" } else { "" }
+                            ),
+                            other => other.name().to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("+")
+                };
+                for (filters, members) in &filter_groups {
+                    let sizes: Vec<_> = members
+                        .iter()
+                        .map(|&i| {
+                            format!(
+                                "{}x{}",
+                                cache_textures[i].width(),
+                                cache_textures[i].height()
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "[filters] group of {}: {} on {}",
+                        members.len(),
+                        describe(filters),
+                        sizes.join(" ")
+                    );
+                }
+                for (index, entry) in cache_entries.iter().enumerate() {
+                    if !entry.filters.is_empty()
+                        && !filter_groups.iter().any(|(_, m)| m.contains(&index))
+                    {
+                        eprintln!(
+                            "[filters] single: {} on {}x{}",
+                            describe(&entry.filters),
+                            cache_textures[index].width(),
+                            cache_textures[index].height()
+                        );
+                    }
+                }
+            }
+        }
         let mut filter_batched = vec![false; cache_entries.len()];
         for (_, members) in &filter_groups {
             for &member in members {
                 filter_batched[member] = true;
             }
         }
+        for &index in &filtered_together {
+            filter_batched[index] = true;
+        }
+        let filtered_together: Vec<(wgpu::Texture, Vec<Filter>)> = filtered_together
+            .into_iter()
+            .map(|index| {
+                (
+                    cache_textures[index].clone(),
+                    cache_entries[index].filters.clone(),
+                )
+            })
+            .collect();
 
         // Cache entries whose contents are simple enough are all drawn together in an
         // atlas, and copied into their textures. They mustn't use other cache entries'
@@ -824,6 +917,27 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.active_frame.maybe_flush(&self.descriptors);
         }
 
+        if !filtered_together.is_empty() {
+            let skipped = crate::filters::apply_together(
+                &filtered_together,
+                &self.descriptors,
+                &mut self.active_frame.command_encoder,
+                &mut self.offscreen_texture_pool,
+                crate::surface::layer_atlas::max_filter_atlas_size()
+                    .min(self.descriptors.limits.max_texture_dimension_2d),
+            );
+            for index in skipped {
+                let (texture, filters) = &filtered_together[index];
+                filter_texture_in_place(
+                    &self.descriptors,
+                    &mut self.active_frame.command_encoder,
+                    &mut self.offscreen_texture_pool,
+                    &mut self.active_frame.staging_belt,
+                    texture,
+                    filters,
+                );
+            }
+        }
         for (filters, members) in filter_groups {
             let textures: Vec<_> = members.iter().map(|&i| cache_textures[i].clone()).collect();
             let skipped = crate::surface::layer_atlas::apply_filters_batched(

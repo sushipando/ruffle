@@ -9,7 +9,7 @@ use swf::ColorMatrixFilter as ColorMatrixFilterArgs;
 use wgpu::util::StagingBelt;
 
 pub struct ColorMatrixFilter {
-    bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
@@ -86,7 +86,11 @@ impl ColorMatrixFilter {
         }
     }
 
-    fn pipeline(&self, descriptors: &Descriptors, msaa_sample_count: u32) -> &wgpu::RenderPipeline {
+    pub(super) fn pipeline(
+        &self,
+        descriptors: &Descriptors,
+        msaa_sample_count: u32,
+    ) -> &wgpu::RenderPipeline {
         self.pipelines.get_or_init(msaa_sample_count, || {
             let label = create_debug_label!("Color Matrix Filter ({} msaa)", msaa_sample_count);
             descriptors

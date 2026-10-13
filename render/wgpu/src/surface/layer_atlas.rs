@@ -192,14 +192,13 @@ pub fn render_leaf_layers(
                 }
             }
             crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
-            let mut render_pass =
-                draw_encoder.scoped_render_pass(
-                    "Layer atlas",
-                    wgpu::RenderPassDescriptor {
-                        color_attachments: &[target.color_attachments_for_pass(chunks.is_empty())],
-                        ..Default::default()
-                    },
-                );
+            let mut render_pass = draw_encoder.scoped_render_pass(
+                "Layer atlas",
+                wgpu::RenderPassDescriptor {
+                    color_attachments: &[target.color_attachments_for_pass(chunks.is_empty())],
+                    ..Default::default()
+                },
+            );
             render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
             for (chunk, offsets) in &group {
                 render_pass.set_bind_group(
@@ -217,7 +216,11 @@ pub fn render_leaf_layers(
                     false,
                 );
                 for command in chunk {
-                    renderer.execute(&mut render_pass.scope(command.name()), command);
+                    if crate::utils::PROFILE_COMMANDS {
+                        renderer.execute(&mut render_pass.scope(command.name()), command);
+                    } else {
+                        renderer.execute(&mut render_pass, command);
+                    }
                 }
             }
         }
@@ -285,7 +288,7 @@ pub fn max_batched_filter_size() -> u32 {
 }
 
 /// The maximum size of a filter atlas (in either dimension).
-fn max_filter_atlas_size() -> u32 {
+pub fn max_filter_atlas_size() -> u32 {
     if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BatchLargeFilters) {
         4096
     } else {
