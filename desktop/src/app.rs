@@ -75,6 +75,10 @@ struct InterpolationAdaptation {
     raised: bool,
     /// Whether frames were skipped in the last second (it's lowered after two such).
     behind: bool,
+    /// Time the main thread spent ticking and drawing in the current second.
+    busy: Duration,
+    /// Never changes the number of frames (`RUFFLE_FIXED_INTERPOLATION`, for measuring).
+    fixed: bool,
 }
 
 impl InterpolationAdaptation {
@@ -87,6 +91,8 @@ impl InterpolationAdaptation {
             retry_after: 4,
             raised: false,
             behind: false,
+            busy: Duration::ZERO,
+            fixed: std::env::var_os("RUFFLE_FIXED_INTERPOLATION").is_some(),
         }
     }
 }
@@ -98,6 +104,7 @@ impl MainWindow {
             // surface also keeps the size it had before, as `GuiController::resize`
             // refuses to reconfigure it to a zero size.
             if !self.minimized && !self.occluded {
+                let start = Instant::now();
                 let mut player = self.player.get();
                 if let Some(ref mut player) = player {
                     let fraction = self.render_fraction(player.frame_duration_seconds());
@@ -108,6 +115,7 @@ impl MainWindow {
                 }
 
                 self.gui.render(player);
+                self.adaptation.busy += start.elapsed();
             }
 
             // Important that we return here, or we'll get a feedback loop with egui
@@ -447,6 +455,7 @@ impl MainWindow {
                 self.time = new_time;
                 let interpolate = self.interpolate;
                 let mut new_frame_start = None;
+                let tick_start = Instant::now();
                 self.next_frame_time = self.player.get().map(|mut player| {
                     player.set_frame_interpolation(interpolate > 1);
                     let frames_before = player.frames_run();
@@ -460,6 +469,7 @@ impl MainWindow {
                     }
                     next
                 });
+                self.adaptation.busy += tick_start.elapsed();
                 self.next_tick_time = self.next_frame_time;
                 if let Some(start) = new_frame_start {
                     let missed = self.interpolate.saturating_sub(self.next_subframe);
@@ -518,17 +528,22 @@ impl MainWindow {
     /// Lowers the number of frames drawn per movie frame while more than a tenth of them
     /// are skipped (they couldn't be drawn in time), to the next divisor of
     /// `max_interpolate`: evenly spaced frames look smoother than more frames at uneven
-    /// times. Tries a higher number again after a while without skipped frames (waiting
-    /// longer each time that fails).
+    /// times. Tries a higher number again after a while without skipped frames, if the
+    /// GPU and the main thread look like they have time for it (assuming their work grows
+    /// with the number of frames drawn), and waits longer each time that fails.
     fn adapt_interpolation(&mut self, now: Instant) {
         let adaptation = &mut self.adaptation;
-        if now.duration_since(adaptation.window_start) < Duration::from_secs(1) {
+        let window = now.duration_since(adaptation.window_start);
+        if window < Duration::from_secs(1) || adaptation.fixed {
             return;
         }
         let (drawn, skipped) = (adaptation.drawn, adaptation.skipped);
+        let cpu = adaptation.busy.as_secs_f64() / window.as_secs_f64();
+        let load = ruffle_render_wgpu::backend::gpu_busy_fraction().map_or(cpu, |gpu| gpu.max(cpu));
         adaptation.window_start = now;
         adaptation.drawn = 0;
         adaptation.skipped = 0;
+        adaptation.busy = Duration::ZERO;
         let divisors: Vec<u32> = (1..=self.max_interpolate)
             .filter(|n| self.max_interpolate.is_multiple_of(*n))
             .collect();
@@ -551,13 +566,18 @@ impl MainWindow {
             adaptation.clean_windows += 1;
             if adaptation.clean_windows >= adaptation.retry_after
                 && let Some(&higher) = divisors.iter().find(|&&n| n > self.interpolate)
+                && load * higher as f64 / self.interpolate as f64 <= 0.8
             {
                 adaptation.raised = true;
                 adaptation.clean_windows = 0;
-                self.interpolate = higher;
                 if std::env::var_os("RUFFLE_PERF").is_some() {
-                    eprintln!("[interpolate] {higher} frames per movie frame");
+                    eprintln!(
+                        "[interpolate] {higher} frames per movie frame (load {:.0}% at {})",
+                        load * 100.0,
+                        self.interpolate
+                    );
                 }
+                self.interpolate = higher;
             } else if adaptation.raised && adaptation.clean_windows >= 3 {
                 // The last raise worked.
                 adaptation.raised = false;
@@ -751,6 +771,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 loaded = LoadingState::Loaded;
             }
 
+            ruffle_render_wgpu::backend::set_gpu_timing(self.preferences.cli.interpolate > 1);
             self.main_window = Some(MainWindow {
                 preferences,
                 gui,

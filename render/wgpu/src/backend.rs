@@ -1622,6 +1622,24 @@ pub fn set_present_min_duration(seconds: Option<f64>) {
     let _ = seconds;
 }
 
+/// Measures how busy the GPU is, for `gpu_busy_fraction` (on Metal; it adds a completion
+/// handler to each command buffer).
+pub fn set_gpu_timing(enabled: bool) {
+    #[cfg(not(target_family = "wasm"))]
+    wgpu_core::ruffle_patch::set_gpu_timing(enabled);
+    #[cfg(target_family = "wasm")]
+    let _ = enabled;
+}
+
+/// The fraction of the last measured second that the GPU spent on Ruffle's work, while
+/// `set_gpu_timing` is enabled (`None` where it can't be measured).
+pub fn gpu_busy_fraction() -> Option<f64> {
+    #[cfg(not(target_family = "wasm"))]
+    return wgpu_core::ruffle_patch::gpu_busy_fraction();
+    #[cfg(target_family = "wasm")]
+    None
+}
+
 fn apply_wgpu_core_switches() {
     #[cfg(not(target_family = "wasm"))]
     wgpu_core::ruffle_patch::set_share_command_buffers(ruffle_render::perf_flags::enabled(
