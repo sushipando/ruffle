@@ -194,6 +194,8 @@ pub struct Filters {
     pub glow: GlowFilter,
     pub bevel: BevelFilter,
     pub displacement_map: DisplacementMapFilter,
+    /// Reused buffers for `batch::apply_together`.
+    pub(crate) scratch_buffers: batch::ScratchBuffers,
 }
 
 impl Filters {
@@ -205,6 +207,7 @@ impl Filters {
             glow: GlowFilter::new(device),
             bevel: BevelFilter::new(device),
             displacement_map: DisplacementMapFilter::new(device),
+            scratch_buffers: batch::ScratchBuffers::new(),
         }
     }
 

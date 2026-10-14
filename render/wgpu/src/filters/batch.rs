@@ -23,7 +23,7 @@ use crate::surface::layer_atlas::LAYER_TEXTURE_USAGE;
 use ruffle_render::filters::Filter;
 use std::collections::BTreeMap;
 use swf::{BlurFilter as BlurFilterArgs, Rectangle, Twips};
-use wgpu::util::DeviceExt;
+use wgpu::util::StagingBelt;
 
 /// Region positions and sizes are multiples of this, so that they scale down exactly
 /// (blurs are scaled down by at most 8 in each direction).
@@ -130,14 +130,13 @@ impl Uniforms {
         offset as u32
     }
 
-    fn buffer(&self, descriptors: &Descriptors) -> wgpu::Buffer {
-        descriptors
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: create_debug_label!("Filter batch uniforms").as_deref(),
-                contents: &self.bytes,
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
+    fn buffer(
+        &self,
+        scratch: &mut Scratch<'_>,
+        encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+    ) -> wgpu::Buffer {
+        scratch.upload(encoder, staging_belt, &self.bytes)
     }
 }
 
@@ -153,14 +152,99 @@ fn kernel_uniform(direction: [f32; 2], taps: &[[f32; 2]]) -> Vec<u8> {
     bytemuck::cast_slice(&uniform).to_vec()
 }
 
-fn vertex_buffer<T: bytemuck::Pod>(descriptors: &Descriptors, vertices: &[T]) -> wgpu::Buffer {
-    descriptors
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: create_debug_label!("Filter batch vertices").as_deref(),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        })
+/// Uploads uniforms and vertices into buffers reused across passes and frames (creating
+/// buffers for every pass was ~13% of render time when drawing 144 frames per second).
+/// The uploads are copies recorded in the command encoder, so a buffer can be reused as
+/// soon as the passes that use it are recorded.
+pub struct ScratchBuffers {
+    free: std::sync::Mutex<Vec<wgpu::Buffer>>,
+}
+
+impl ScratchBuffers {
+    pub fn new() -> Self {
+        Self {
+            free: Default::default(),
+        }
+    }
+}
+
+/// The scratch buffers used by one `apply_together`, returned to the pool when dropped.
+struct Scratch<'a> {
+    descriptors: &'a Descriptors,
+    taken: Vec<wgpu::Buffer>,
+}
+
+impl Scratch<'_> {
+    fn upload(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        bytes: &[u8],
+    ) -> wgpu::Buffer {
+        let size = (bytes.len().max(16) as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+        let buffer = {
+            let mut free = self
+                .descriptors
+                .filters
+                .scratch_buffers
+                .free
+                .lock()
+                .expect("scratch buffers lock");
+            let best = free
+                .iter()
+                .enumerate()
+                .filter(|(_, buffer)| buffer.size() >= size)
+                .min_by_key(|(_, buffer)| buffer.size())
+                .map(|(index, _)| index);
+            match best {
+                Some(index) => free.swap_remove(index),
+                None => self
+                    .descriptors
+                    .device
+                    .create_buffer(&wgpu::BufferDescriptor {
+                        label: create_debug_label!("Filter batch scratch").as_deref(),
+                        size: size.next_power_of_two().max(4096),
+                        usage: wgpu::BufferUsages::UNIFORM
+                            | wgpu::BufferUsages::VERTEX
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+            }
+        };
+        let mut padded = bytes.to_vec();
+        padded.resize(size as usize, 0);
+        staging_belt
+            .write_buffer(
+                encoder,
+                &buffer,
+                0,
+                wgpu::BufferSize::new(size).expect("not zero"),
+            )
+            .copy_from_slice(&padded);
+        self.taken.push(buffer.clone());
+        buffer
+    }
+
+    fn vertices<T: bytemuck::Pod>(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        vertices: &[T],
+    ) -> wgpu::Buffer {
+        self.upload(encoder, staging_belt, bytemuck::cast_slice(vertices))
+    }
+}
+
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        self.descriptors
+            .filters
+            .scratch_buffers
+            .free
+            .lock()
+            .expect("scratch buffers lock")
+            .append(&mut self.taken);
+    }
 }
 
 fn clear_pass<'a>(
@@ -268,9 +352,14 @@ pub fn apply_together(
     entries: &[(wgpu::Texture, Vec<Filter>)],
     descriptors: &Descriptors,
     encoder: &mut wgpu::CommandEncoder,
+    staging_belt: &mut StagingBelt,
     texture_pool: &mut TexturePool,
     max_size: u32,
 ) -> Vec<usize> {
+    let mut scratch = Scratch {
+        descriptors,
+        taken: vec![],
+    };
     // Shelf-pack the textures, each with transparent space around it as wide as its
     // filters can spread (like `apply_filters_batched`).
     let mut order: Vec<usize> = (0..entries.len()).collect();
@@ -412,8 +501,8 @@ pub fn apply_together(
                             )
                         })
                         .collect();
-                    let uniforms = uniforms.buffer(descriptors);
-                    let vertices = vertex_buffer(descriptors, &vertices);
+                    let uniforms = uniforms.buffer(&mut scratch, encoder, staging_belt);
+                    let vertices = scratch.vertices(encoder, staging_belt, &vertices);
                     let mut render_pass = clear_pass(encoder, &target.texture.1);
                     draw_kernel_quads(
                         descriptors,
@@ -458,8 +547,8 @@ pub fn apply_together(
                             quad(small, small)
                         })
                         .collect();
-                    let uniforms = uniforms.buffer(descriptors);
-                    let vertices = vertex_buffer(descriptors, &vertices);
+                    let uniforms = uniforms.buffer(&mut scratch, encoder, staging_belt);
+                    let vertices = scratch.vertices(encoder, staging_belt, &vertices);
                     let mut render_pass = clear_pass(encoder, &target.texture.1);
                     // Bilinear: the kernel's taps sample between pairs of texels.
                     draw_kernel_quads(
@@ -544,21 +633,27 @@ pub fn apply_together(
                     _ => unreachable!("only supported filters are batched"),
                 }
             }
-            let kernel_uniforms = kernel_uniforms.buffer(descriptors);
-            let other_uniforms = other_uniforms.buffer(descriptors);
+            let kernel_uniforms = kernel_uniforms.buffer(&mut scratch, encoder, staging_belt);
+            let other_uniforms = other_uniforms.buffer(&mut scratch, encoder, staging_belt);
             let kernel_vertices: Vec<_> = kernel_quads
                 .into_iter()
                 .map(|(texture, quads)| {
                     let count = quads.len();
-                    (texture, count, vertex_buffer(descriptors, &quads))
+                    (
+                        texture,
+                        count,
+                        scratch.vertices(encoder, staging_belt, &quads),
+                    )
                 })
                 .collect();
-            let glow_vertices = vertex_buffer(
-                descriptors,
+            let glow_vertices = scratch.vertices(
+                encoder,
+                staging_belt,
                 &glow_quads.iter().map(|(_, _, q)| *q).collect::<Vec<_>>(),
             );
-            let color_matrix_vertices = vertex_buffer(
-                descriptors,
+            let color_matrix_vertices = scratch.vertices(
+                encoder,
+                staging_belt,
                 &color_matrix_quads
                     .iter()
                     .map(|(_, q)| *q)

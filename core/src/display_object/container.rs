@@ -210,6 +210,7 @@ pub trait TDisplayObjectContainer<'gc>:
         child: DisplayObject<'gc>,
         depth: Depth,
     ) -> Option<DisplayObject<'gc>> {
+        child.base().reset_interpolation();
         let removed_child = self
             .raw_container_mut(context.gc())
             .replace_at_depth(child, depth);
@@ -274,6 +275,7 @@ pub trait TDisplayObjectContainer<'gc>:
         child: DisplayObject<'gc>,
         index: usize,
     ) {
+        child.base().reset_interpolation();
         let this: DisplayObject<'_> = (*self).into();
         let parent_changed = if let Some(old_parent) = child.parent() {
             if !DisplayObject::ptr_eq(old_parent, this) {

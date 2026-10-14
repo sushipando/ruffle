@@ -69,9 +69,12 @@ pub enum PerfFlag {
     /// Drop the tessellations of shapes that weren't drawn for a while (see
     /// `Player::evict_unused_tessellations` in core).
     EvictMeshes,
+    /// Present frames so that each stays on screen for a whole number of display refreshes
+    /// (desktop, see `MainWindow::pace_present` there).
+    PacedPresent,
 }
 
-const NAMES: [&str; 25] = [
+const NAMES: [&str; 26] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -97,9 +100,10 @@ const NAMES: [&str; 25] = [
     "direct-blends",
     "release-shapes",
     "evict-meshes",
+    "paced-present",
 ];
 
-static FLAGS: [AtomicBool; 25] = [
+static FLAGS: [AtomicBool; 26] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -125,6 +129,7 @@ static FLAGS: [AtomicBool; 25] = [
     AtomicBool::new(true),  // direct-blends
     AtomicBool::new(true),  // release-shapes
     AtomicBool::new(true),  // evict-meshes
+    AtomicBool::new(true),  // paced-present
 ];
 
 #[inline]

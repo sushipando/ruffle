@@ -34,6 +34,7 @@ mod container;
 mod edit_text;
 pub(crate) mod graphic;
 mod interactive;
+pub mod interpolation;
 mod loader_display;
 mod morph_shape;
 mod movie_clip;
@@ -117,6 +118,10 @@ pub struct BitmapCache {
 
     /// Whether we warned that this bitmap was too large to be cached
     warned_for_oversize: bool,
+
+    /// The movie frame in which the contents last changed (see `interpolation`): frames
+    /// drawn between movie frames redraw the cache then, since its contents are blended.
+    changed_tick: u32,
 }
 
 impl BitmapCache {
@@ -316,6 +321,9 @@ pub struct DisplayObjectBase<'gc> {
     // (Split into several fields for easier access)
     matrix: Cell<Matrix>,
     color_transform: Cell<ColorTransform>,
+    /// The transform before the current frame changed it (see `interpolation`).
+    #[collect(require_static)]
+    interpolation: interpolation::InterpolationData,
     perspective_projection: Cell<Option<PerspectiveProjection>>,
     tz: Cell<f64>,
 
@@ -393,6 +401,7 @@ impl Default for DisplayObjectBase<'_> {
             clip_depth: Default::default(),
             matrix: Default::default(),
             color_transform: Default::default(),
+            interpolation: Default::default(),
             perspective_projection: Default::default(),
             tz: Cell::new(0.0),
             rotation: Cell::new(Degrees::from_radians(0.0)),
@@ -449,30 +458,48 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn transform(&self, apply_matrix: bool) -> Transform {
         Transform {
             matrix: if apply_matrix {
-                self.matrix.get()
+                self.matrix()
             } else {
                 Matrix::IDENTITY
             },
-            color_transform: self.color_transform.get(),
+            color_transform: self.color_transform(),
             perspective_projection: self.perspective_projection.get(),
             tz: self.tz.get(),
         }
     }
 
+    /// The matrix (blended with the previous frame's while drawing between frames, see
+    /// `interpolation`).
     pub fn matrix(&self) -> Matrix {
-        self.matrix.get()
+        self.interpolation
+            .matrix(self.matrix.get(), self.color_transform.get())
+    }
+
+    /// Records the transform from before this frame changes it (see `interpolation`).
+    fn before_transform_change(&self) {
+        self.interpolation
+            .before_change(self.matrix.get(), self.color_transform.get());
+    }
+
+    /// The object was (re)placed in the current frame, so its transform isn't blended
+    /// with what it was before (see `interpolation`).
+    pub fn reset_interpolation(&self) {
+        self.interpolation.reset();
     }
 
     pub fn set_matrix(&self, matrix: Matrix) {
+        self.before_transform_change();
         self.matrix.set(matrix);
         self.set_scale_rotation_cached(false);
     }
 
     pub fn color_transform(&self) -> ColorTransform {
-        self.color_transform.get()
+        self.interpolation
+            .color_transform(self.matrix.get(), self.color_transform.get())
     }
 
     pub fn set_color_transform(&self, color_transform: ColorTransform) {
+        self.before_transform_change();
         self.color_transform.set(color_transform);
     }
 
@@ -496,6 +523,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.tx != x;
         matrix.tx = x;
+        self.before_transform_change();
         self.matrix.set(matrix);
         self.set_transformed_by_script(true);
         changed
@@ -509,6 +537,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.ty != y;
         matrix.ty = y;
+        self.before_transform_change();
         self.matrix.set(matrix);
         self.set_transformed_by_script(true);
         changed
@@ -597,6 +626,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.b = (scale_x * sin_x) as f32;
         matrix.c = (scale_y * -sin_y) as f32;
         matrix.d = (scale_y * cos_y) as f32;
+        self.before_transform_change();
         self.matrix.set(matrix);
 
         changed
@@ -632,6 +662,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.a = (cos * value.unit()) as f32;
         matrix.b = (sin * value.unit()) as f32;
+        self.before_transform_change();
         self.matrix.set(matrix);
 
         changed
@@ -668,6 +699,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.c = (-sin * value.unit()) as f32;
         matrix.d = (cos * value.unit()) as f32;
+        self.before_transform_change();
         self.matrix.set(matrix);
 
         changed
@@ -706,6 +738,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut tf = self.color_transform.get();
         let changed = tf.a_multiply != value;
         tf.a_multiply = value;
+        self.before_transform_change();
         self.color_transform.set(tf);
         changed
     }
@@ -891,6 +924,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         }
         if let Some(cache) = &mut *self.bitmap_cache_mut() {
             cache.make_dirty();
+            cache.changed_tick = interpolation::tick();
         }
         self.set_flag(DisplayObjectFlags::CACHE_INVALIDATED, true);
         true
@@ -1063,7 +1097,9 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
-                if cache.is_dirty(&base_transform.matrix, width, height) {
+                if cache.is_dirty(&base_transform.matrix, width, height)
+                    || interpolation::is_blending_tick(cache.changed_tick)
+                {
                     cache.update(
                         context.renderer,
                         base_transform.matrix,

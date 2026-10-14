@@ -73,10 +73,7 @@ impl PendingPresents {
     fn wait(&self) {
         let mut count = self.count.lock().expect("pending presents lock");
         while *count > 0 {
-            count = self
-                .presented
-                .wait(count)
-                .expect("pending presents lock");
+            count = self.presented.wait(count).expect("pending presents lock");
         }
     }
 }

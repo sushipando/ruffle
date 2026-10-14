@@ -913,6 +913,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     &filtered_together,
                     &self.descriptors,
                     &mut self.active_frame.command_encoder,
+                    &mut self.active_frame.staging_belt,
                     &mut self.offscreen_texture_pool,
                     crate::surface::layer_atlas::max_filter_atlas_size()
                         .min(self.descriptors.limits.max_texture_dimension_2d),
@@ -1611,6 +1612,16 @@ impl RenderTargetMode {
 }
 
 /// Passes Ruffle's perf flags on to the switches of the vendored wgpu-core's patches.
+/// Presents frames so that each stays on screen for at least `seconds` (on Metal, see the
+/// vendored wgpu-core's `ruffle_patch::set_present_min_duration`), which paces them evenly
+/// on the display's refresh grid.
+pub fn set_present_min_duration(seconds: Option<f64>) {
+    #[cfg(not(target_family = "wasm"))]
+    wgpu_core::ruffle_patch::set_present_min_duration(seconds);
+    #[cfg(target_family = "wasm")]
+    let _ = seconds;
+}
+
 fn apply_wgpu_core_switches() {
     #[cfg(not(target_family = "wasm"))]
     wgpu_core::ruffle_patch::set_share_command_buffers(ruffle_render::perf_flags::enabled(

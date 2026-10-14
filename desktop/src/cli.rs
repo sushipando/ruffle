@@ -167,6 +167,12 @@ pub struct Opt {
     #[clap(long, action)]
     pub fullscreen: bool,
 
+    /// Draw this many frames per movie frame, blending the transforms of moving objects
+    /// between movie frames (for example 6 to show a 24 fps movie at 144 fps). Animations
+    /// that change drawings still change at movie frames. 1 disables it.
+    #[clap(long, default_value_t = 1)]
+    pub interpolate: u32,
+
     #[clap(long)]
     pub load_behavior: Option<LoadBehavior>,
 

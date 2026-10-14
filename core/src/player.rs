@@ -961,6 +961,29 @@ impl Player {
         self.set_run_state(RunState::Stepping);
     }
 
+    /// Whether display objects remember their transforms from the previous frame, so that
+    /// frames drawn between movie frames can blend them (see
+    /// `display_object::interpolation`).
+    pub fn set_frame_interpolation(&mut self, enabled: bool) {
+        crate::display_object::interpolation::set_enabled(enabled);
+    }
+
+    /// How far between the previous movie frame (0) and the current one (1) the next
+    /// `render` draws, or `None` to draw the current one.
+    pub fn set_render_fraction(&mut self, fraction: Option<f32>) {
+        crate::display_object::interpolation::set_next_render_fraction(fraction);
+    }
+
+    /// The number of movie frames run so far (changes whenever one runs).
+    pub fn frames_run(&self) -> u32 {
+        crate::display_object::interpolation::tick()
+    }
+
+    /// The duration of a movie frame, in seconds.
+    pub fn frame_duration_seconds(&self) -> f64 {
+        self.frame_time(1.0)
+    }
+
     pub fn needs_render(&self) -> bool {
         self.needs_render
     }
@@ -2067,6 +2090,7 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
+        crate::display_object::interpolation::advance_tick();
         let frame_time = self.frame_time(750_000_000.0);
         let frame_time = Duration::from_nanos(frame_time as u64);
         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
@@ -2111,7 +2135,7 @@ impl Player {
     /// they're drawn again (see `Graphic::get_or_retessellate_handle`).
     fn evict_unused_tessellations(&mut self) {
         /// How long a tessellation is kept without being drawn.
-        const UNUSED_SECONDS: u32 = 30;
+        const UNUSED_SECONDS: u32 = 120;
         /// How often unused tessellations are looked for.
         const SWEEP_SECONDS: u32 = 5;
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -2178,7 +2202,10 @@ impl Player {
                 stage,
             };
 
-            stage.render_viewport(&mut render_context);
+            crate::display_object::interpolation::with_render_fraction(
+                crate::display_object::interpolation::next_render_fraction(),
+                || stage.render_viewport(&mut render_context),
+            );
 
             #[cfg(feature = "egui")]
             {
