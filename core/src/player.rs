@@ -2152,12 +2152,9 @@ impl Player {
         }
         LAST_SWEEP.store(now, std::sync::atomic::Ordering::Relaxed);
         let cutoff = now - UNUSED_SECONDS;
-        let evicted = self.enter_arena(|_, gc_root, _| {
+        let evicted = self.enter_arena(|mc, gc_root, _| {
             let mut evicted = 0;
-            for movie in gc_root.library.known_movies() {
-                let Some(library) = gc_root.library.library_for_movie(movie) else {
-                    continue;
-                };
+            for library in gc_root.library.movie_libraries(mc) {
                 for character in library.characters().values() {
                     if let crate::character::Character::Graphic(graphic) = character {
                         evicted += graphic.evict_unused_tessellations(cutoff);

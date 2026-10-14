@@ -724,7 +724,7 @@ preload data, and classes that the content keeps.
 `RUFFLE_PERF` now prints the number of meshes and the size of their buffers
 (`[gpu-mem]`). Over 6 content changes, they went from 43 MB to 208 MB (6,000 →
 21,000 meshes), about half of the memory growth: a shape keeps its tessellations for as
-long as its movie lives, and the test content keeps every movie it has loaded.
+long as its movie lives, and every loaded movie was kept (until 42).
 
 Each cached tessellation now remembers when it was last drawn (in seconds, updated
 once per rendered frame), and every 5 seconds the player drops the tessellations of
@@ -1021,6 +1021,42 @@ Effect, 20 content changes, before and after (both with 22):
 | GC heap | up to 2.3M objects | at most 0.92M |
 | RSS after 19 changes | 2.29 GB | 1.99 GB (~68 MB per change) |
 
+### 42. Loaded movies and their classes can be freed
+
+*Files: `core/src/library.rs` (`WeakKeyMap`, `MovieLibraries`, `Avm2ClassRegistry`),
+`core/src/player.rs` (`evict_unused_tessellations`).*
+
+The `Library` kept every movie ever loaded. `MovieLibraries` mapped each `SwfMovie` to its
+`MovieLibrary` (its symbol definitions, fonts and the movie's `ApplicationDomain`), and
+`Avm2ClassRegistry` mapped every class named in a `SymbolClass` tag to its movie and
+symbol. Neither ever removed an entry, and both held the movie strongly. So content
+that loads each batch of SWFs into a fresh `ApplicationDomain`, then drops the domain
+and calls `unloadAndStop` on the loaders when it replaces its content, still kept every
+SWF it had ever loaded: its data, parsed symbols, meshes, classes and methods.
+
+Both maps are now `WeakKeyMap`s. They're keyed by a weak pointer to the movie (or class),
+with ephemeron values (see 17), so an entry lives exactly as long as its key is reachable
+from outside the map. A movie's library refers to the movie but no longer keeps it alive.
+Entries of collected keys are dropped as the map grows.
+
+As with the dictionary (17), a value may only be read after `upgrade`, not `is_dropped`.
+At first the mesh eviction pass used `is_dropped`. It crashed (segfault in
+`Player::render`) when it ran during an incremental sweep: it read a library whose movie
+wasn't dropped yet, but whose symbols already were. A unit test (`library::tests`)
+stops a collection right after marking and checks this.
+
+Effect, five 60-second rounds alternating between a medium and a heavy scene. Scenes
+differ between runs, so these are indicative:
+
+| | Before | After |
+|---|---|---|
+| RSS | 570 → 647 MB | 591 → 614 MB |
+| GC objects in the medium scene, each visit | 211K → 214K → 268K | 173K → 176K → 184K |
+| Meshes | 34 → 55 MB, growing | 20-65 MB, by scene |
+
+With `RUFFLE_GC_MAX_CYCLE_SECS=2`, seven rounds: RSS 553 MB at the start, then 358-502 MB,
+and 164-192K GC objects in the medium scene each time. No crashes.
+
 ### Results
 
 Laptop display (2880x1800 fullscreen), seven 60-second rounds alternating between a heavy
@@ -1034,7 +1070,8 @@ and a medium scene. Scenes differ between runs, so these are indicative:
 
 With all fixes, reachable GC objects grew 0.26M → 0.46M over the seven rounds. Most
 of that is classes, vtables, methods and clips of SWFs not loaded before (for
-example `ClassData` 7.7K → 25K), which the content keeps. The total heap is ~2.7x the
+example `ClassData` 7.7K → 25K), which stayed alive (the library kept every loaded
+movie, see 42). The total heap is ~2.7x the
 reachable part with gc-arena's default pacing.
 
 RSS barely changed, though, so most of it isn't GC objects. At the end: ~1.3 GB of

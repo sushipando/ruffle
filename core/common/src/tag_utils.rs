@@ -24,6 +24,11 @@ impl<'gc> SwfMovie<'gc> {
         SwfMovieWeak(Gc::downgrade(self.0))
     }
 
+    /// A weak pointer to this movie, as a key of a weakly keyed map.
+    pub fn erased_weak(self) -> GcWeak<'gc, ()> {
+        GcWeak::erase(Gc::downgrade(self.0))
+    }
+
     pub fn as_ptr(self) -> *const SwfMovieData {
         Gc::as_ptr(self.0)
     }

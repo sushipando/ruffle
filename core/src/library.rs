@@ -8,7 +8,8 @@ use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
 use crate::prelude::*;
 use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
-use gc_arena::{Collect, Mutation};
+use gc_arena::collect::Trace;
+use gc_arena::{Collect, GcWeak, Mutation};
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::utils::remove_invalid_jpeg_data;
@@ -23,14 +24,87 @@ use std::collections::HashMap;
 #[collect(no_drop)]
 struct MovieSymbol<'gc>(SwfMovie<'gc>, CharacterId);
 
+/// A map whose keys are held weakly, and whose values are ephemerons: a value is only
+/// kept alive while its key is reachable from outside the map, even if the value refers
+/// back to its key. (A movie's library refers to the movie, and a class's symbol to the
+/// class's movie, so with strong keys no loaded movie could ever be freed.)
+///
+/// Once a key is collected, its value may have been collected too, so it's never
+/// accessed again; such entries are dropped as the map grows.
+struct WeakKeyMap<'gc, V> {
+    /// Each key's weak pointer and value, by the key's address. Collected keys are still
+    /// traced (weakly), which keeps their allocations, and so their addresses, from being
+    /// reused while they're in here.
+    entries: FnvHashMap<usize, (GcWeak<'gc, ()>, V)>,
+    /// The number of entries at which to next drop those of collected keys.
+    prune_at: usize,
+}
+
+unsafe impl<'gc, V: Collect<'gc>> Collect<'gc> for WeakKeyMap<'gc, V> {
+    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
+        for (key, value) in self.entries.values() {
+            cc.trace(key);
+            if !key.is_dropped() && cc.ephemeron_key_reachable(*key) {
+                cc.trace(value);
+            }
+        }
+    }
+}
+
+impl<'gc, V> WeakKeyMap<'gc, V> {
+    const MIN_PRUNE_AT: usize = 64;
+
+    fn new() -> Self {
+        Self {
+            entries: FnvHashMap::default(),
+            prune_at: Self::MIN_PRUNE_AT,
+        }
+    }
+
+    /// The value of a key, which must be alive (holding it strongly guarantees that).
+    fn get(&self, key: GcWeak<'gc, ()>) -> Option<&V> {
+        self.entries
+            .get(&(key.as_ptr() as usize))
+            .map(|(_, value)| value)
+    }
+
+    /// The value of a key (which must be alive), inserting `default()` if there's none.
+    fn get_or_insert_with(&mut self, key: GcWeak<'gc, ()>, default: impl FnOnce() -> V) -> &mut V {
+        let addr = key.as_ptr() as usize;
+        if self.entries.len() >= self.prune_at && !self.entries.contains_key(&addr) {
+            self.prune();
+        }
+        &mut self
+            .entries
+            .entry(addr)
+            .or_insert_with(|| (key, default()))
+            .1
+    }
+
+    /// The values of keys that are alive. (Not just those that aren't dropped yet: while
+    /// sweeping, an unreachable key may outlive objects its value refers to.)
+    fn values<'a>(&'a self, mc: &'a Mutation<'gc>) -> impl Iterator<Item = &'a V> {
+        self.entries
+            .values()
+            .filter(move |(key, _)| key.upgrade(mc).is_some())
+            .map(|(_, value)| value)
+    }
+
+    /// Drops the entries of collected keys.
+    fn prune(&mut self) {
+        self.entries.retain(|_, (key, _)| !key.is_dropped());
+        self.prune_at = (self.entries.len() * 2).max(Self::MIN_PRUNE_AT);
+    }
+}
+
 /// The mappings between class objects and library characters defined by
 /// `SymbolClass`.
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct Avm2ClassRegistry<'gc> {
     /// A list of AVM2 class objects and the character IDs they are expected to
-    /// instantiate.
-    class_map: HashMap<Avm2Class<'gc>, MovieSymbol<'gc>>,
+    /// instantiate. Kept for as long as the class is alive.
+    class_map: WeakKeyMap<'gc, MovieSymbol<'gc>>,
 }
 
 impl Default for Avm2ClassRegistry<'_> {
@@ -42,7 +116,7 @@ impl Default for Avm2ClassRegistry<'_> {
 impl<'gc> Avm2ClassRegistry<'gc> {
     pub fn new() -> Self {
         Self {
-            class_map: HashMap::new(),
+            class_map: WeakKeyMap::new(),
         }
     }
 
@@ -51,7 +125,7 @@ impl<'gc> Avm2ClassRegistry<'gc> {
     /// A value of `None` indicates that this AVM2 class is not associated with
     /// a library symbol.
     pub fn class_symbol(&self, class_def: Avm2Class<'gc>) -> Option<(SwfMovie<'gc>, CharacterId)> {
-        match self.class_map.get(&class_def) {
+        match self.class_map.get(class_def.erased_weak()) {
             Some(MovieSymbol(movie, symbol)) => Some((*movie, *symbol)),
             None => None,
         }
@@ -64,7 +138,7 @@ impl<'gc> Avm2ClassRegistry<'gc> {
         movie: SwfMovie<'gc>,
         symbol: CharacterId,
     ) {
-        if let Some(old) = self.class_map.get(&class_def) {
+        if let Some(old) = self.class_map.get(class_def.erased_weak()) {
             if SwfMovie::ptr_eq(&movie, &old.0) && symbol != old.1 {
                 // Flash player actually allows using the same class in multiple SymbolClass
                 // entries in the same swf, with *different* symbol ids. Whichever one
@@ -85,7 +159,8 @@ impl<'gc> Avm2ClassRegistry<'gc> {
             // instantiates the clip on the timeline.
             return;
         }
-        self.class_map.insert(class_def, MovieSymbol(movie, symbol));
+        self.class_map
+            .get_or_insert_with(class_def.erased_weak(), || MovieSymbol(movie, symbol));
     }
 }
 
@@ -373,27 +448,23 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
     }
 }
 
+/// Each movie's library, kept for as long as the movie is alive.
 #[derive(Collect)]
 #[collect(no_drop)]
-struct MovieLibraries<'gc>(HashMap<SwfMovie<'gc>, MovieLibrary<'gc>>);
+struct MovieLibraries<'gc>(WeakKeyMap<'gc, MovieLibrary<'gc>>);
 
 impl<'gc> MovieLibraries<'gc> {
     fn new() -> Self {
-        Self(HashMap::new())
+        Self(WeakKeyMap::new())
     }
 
     fn get(&self, key: SwfMovie<'gc>) -> Option<&MovieLibrary<'gc>> {
-        self.0.get(&key)
+        self.0.get(key.erased_weak())
     }
 
     fn get_or_insert_mut(&mut self, movie: SwfMovie<'gc>) -> &mut MovieLibrary<'gc> {
         self.0
-            .entry(movie)
-            .or_insert_with(|| MovieLibrary::new(movie))
-    }
-
-    fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
-        self.0.keys().copied()
+            .get_or_insert_with(movie.erased_weak(), || MovieLibrary::new(movie))
     }
 }
 
@@ -452,8 +523,20 @@ impl<'gc> Library<'gc> {
         self.movie_libraries.get_or_insert_mut(movie)
     }
 
-    pub fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
-        self.movie_libraries.known_movies()
+    /// The movies that are alive and have a library.
+    pub fn known_movies<'a>(
+        &'a self,
+        mc: &'a Mutation<'gc>,
+    ) -> impl Iterator<Item = SwfMovie<'gc>> + 'a {
+        self.movie_libraries(mc).map(|library| library.swf)
+    }
+
+    /// The libraries of the movies that are alive.
+    pub fn movie_libraries<'a>(
+        &'a self,
+        mc: &'a Mutation<'gc>,
+    ) -> impl Iterator<Item = &'a MovieLibrary<'gc>> {
+        self.movie_libraries.0.values(mc)
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)
@@ -829,5 +912,76 @@ impl<'gc> FontMap<'gc> {
 
     pub fn iter_all(&self) -> impl Iterator<Item = Font<'gc>> {
         self.0.values().copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gc_arena::lock::RefLock;
+    use gc_arena::{Arena, Gc, Rootable};
+
+    type Map<'gc> = WeakKeyMap<'gc, Gc<'gc, u32>>;
+
+    #[derive(Collect)]
+    #[collect(no_drop)]
+    struct Root<'gc> {
+        map: Gc<'gc, RefLock<Map<'gc>>>,
+        kept: Gc<'gc, RefLock<Vec<Gc<'gc, u32>>>>,
+    }
+
+    fn values(arena: &Arena<Rootable![Root<'_>]>) -> Vec<u32> {
+        arena.mutate(|mc, root| {
+            let mut values: Vec<u32> = root.map.borrow().values(mc).map(|v| **v).collect();
+            values.sort_unstable();
+            values
+        })
+    }
+
+    #[test]
+    fn weak_key_map_drops_unreachable_keys() {
+        let mut arena = Arena::<Rootable![Root<'_>]>::new(|mc| Root {
+            map: Gc::new(mc, RefLock::new(WeakKeyMap::new())),
+            kept: Gc::new(mc, RefLock::new(Vec::new())),
+        });
+        arena.mutate(|mc, root| {
+            let mut map = root.map.borrow_mut(mc);
+            for i in 0..10 {
+                // Each value refers to its key, like a movie's library refers to the movie.
+                let key = Gc::new(mc, i);
+                map.get_or_insert_with(GcWeak::erase(Gc::downgrade(key)), || key);
+                if i % 2 == 0 {
+                    root.kept.borrow_mut(mc).push(key);
+                }
+            }
+        });
+        assert_eq!(values(&arena), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // While sweeping, the unreachable keys aren't dropped yet, but their values (which
+        // may be swept first) must not be returned.
+        arena.finish_marking().unwrap().start_sweeping();
+        assert_eq!(values(&arena), [0, 2, 4, 6, 8]);
+
+        arena.finish_cycle();
+        assert_eq!(values(&arena), [0, 2, 4, 6, 8]);
+        arena.mutate(|mc, root| {
+            let map = root.map.borrow();
+            assert_eq!(map.entries.len(), 10);
+            assert_eq!(
+                map.entries
+                    .values()
+                    .filter(|(key, _)| key.is_dropped())
+                    .count(),
+                5
+            );
+            drop(map);
+            let mut map = root.map.borrow_mut(mc);
+            map.prune();
+            assert_eq!(map.entries.len(), 5);
+        });
+
+        // The values of reachable keys stay alive.
+        arena.finish_cycle();
+        assert_eq!(values(&arena), [0, 2, 4, 6, 8]);
     }
 }

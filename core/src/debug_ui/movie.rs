@@ -88,7 +88,7 @@ impl MovieListWindow {
                         });
                     })
                     .body(|mut body| {
-                        let movies = context.library.known_movies();
+                        let movies = context.library.known_movies(context.gc());
 
                         for movie in movies {
                             let url_lower = movie.url().to_ascii_lowercase();

@@ -22,7 +22,7 @@ use bitflags::bitflags;
 use fnv::FnvHashMap;
 use gc_arena::barrier::unlock;
 use gc_arena::lock::{OnceLock, RefLock};
-use gc_arena::{Collect, Gc, Lock, Mutation};
+use gc_arena::{Collect, Gc, GcWeak, Lock, Mutation};
 use swf::avm2::types::Trait as AbcTrait;
 
 use std::cell::{Cell, Ref};
@@ -244,6 +244,11 @@ impl<'gc> ClassData<'gc> {
 impl<'gc> Class<'gc> {
     pub fn as_ptr(self) -> *const () {
         Gc::as_ptr(self.0).cast()
+    }
+
+    /// A weak pointer to this class, as a key of a weakly keyed map.
+    pub fn erased_weak(self) -> GcWeak<'gc, ()> {
+        GcWeak::erase(Gc::downgrade(self.0))
     }
 
     /// Create an unlinked class from its name, superclass, and traits.
