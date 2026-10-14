@@ -611,145 +611,62 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return;
         };
 
-        // Cache entries with identical local filters (see `is_local_filter`) are
-        // filtered all at once, after all cache entries are drawn. That's only possible
-        // if no other cache entry draws their texture (expecting it to be filtered).
+        // Cache entries are drawn and filtered in levels: an entry that draws other cache
+        // entries' textures comes after them, so that they're complete by then. Within a
+        // level, filters are applied to many entries at once where possible (see
+        // `filters::batch` and `layer_atlas::apply_filters_batched`), after all of the
+        // level's entries are drawn.
         let cache_textures: Vec<wgpu::Texture> = cache_entries
             .iter()
             .map(|entry| as_texture(&entry.handle).texture.clone())
             .collect();
-        let mut referenced = vec![];
-        for entry in &cache_entries {
-            collect_bitmaps(&entry.commands, &mut referenced);
-        }
-        let mut filter_groups: Vec<(Vec<Filter>, Vec<usize>)> = vec![];
-        // Cache entries whose filters are applied together, whatever they are (see
-        // `filters::batch`).
-        let mut filtered_together: Vec<usize> = vec![];
-        if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::FilterBatching) {
-            let together = ruffle_render::perf_flags::enabled(
-                ruffle_render::perf_flags::PerfFlag::FilterTogether,
-            ) && ruffle_render::perf_flags::enabled(
-                ruffle_render::perf_flags::PerfFlag::BlurMerge,
-            ) && ruffle_render::filters::rendering_for_display();
-            for (index, entry) in cache_entries.iter().enumerate() {
-                let texture = &cache_textures[index];
-                if !entry.filters.is_empty()
-                    && texture.width() <= crate::surface::layer_atlas::max_batched_filter_size()
-                    && texture.height() <= crate::surface::layer_atlas::max_batched_filter_size()
-                    && !referenced.contains(&entry.handle)
-                {
-                    if together && entry.filters.iter().all(crate::filters::can_apply_together) {
-                        filtered_together.push(index);
-                        continue;
-                    }
-                    if !entry
-                        .filters
-                        .iter()
-                        .all(crate::surface::layer_atlas::is_local_filter)
-                    {
-                        continue;
-                    }
-                    match filter_groups
-                        .iter_mut()
-                        .find(|(filters, _)| *filters == entry.filters)
-                    {
-                        Some((_, members)) => members.push(index),
-                        None => filter_groups.push((entry.filters.clone(), vec![index])),
-                    }
-                }
-            }
-            filter_groups.retain(|(_, members)| members.len() >= 2);
-        }
-        if std::env::var_os("RUFFLE_FILTER_DEBUG").is_some() {
-            static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if FRAME
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                .is_multiple_of(120)
-            {
-                let describe = |filters: &[Filter]| {
-                    filters
-                        .iter()
-                        .map(|f| match f {
-                            Filter::BlurFilter(b) => format!(
-                                "Blur({:.1}x{:.1} q{})",
-                                b.blur_x.to_f32(),
-                                b.blur_y.to_f32(),
-                                b.num_passes()
-                            ),
-                            Filter::GlowFilter(g) => format!(
-                                "Glow({:.1}x{:.1} q{} #{:02x}{:02x}{:02x}{:02x} s{:.2}{}{})",
-                                g.blur_x.to_f32(),
-                                g.blur_y.to_f32(),
-                                g.num_passes(),
-                                g.color.r,
-                                g.color.g,
-                                g.color.b,
-                                g.color.a,
-                                g.strength.to_f32(),
-                                if g.is_inner() { " inner" } else { "" },
-                                if g.is_knockout() { " knockout" } else { "" }
-                            ),
-                            other => other.name().to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join("+")
-                };
-                for (filters, members) in &filter_groups {
-                    let sizes: Vec<_> = members
-                        .iter()
-                        .map(|&i| {
-                            format!(
-                                "{}x{}",
-                                cache_textures[i].width(),
-                                cache_textures[i].height()
-                            )
-                        })
-                        .collect();
-                    eprintln!(
-                        "[filters] group of {}: {} on {}",
-                        members.len(),
-                        describe(filters),
-                        sizes.join(" ")
-                    );
-                }
-                for (index, entry) in cache_entries.iter().enumerate() {
-                    if !entry.filters.is_empty()
-                        && !filter_groups.iter().any(|(_, m)| m.contains(&index))
-                    {
-                        eprintln!(
-                            "[filters] single: {} on {}x{}",
-                            describe(&entry.filters),
-                            cache_textures[index].width(),
-                            cache_textures[index].height()
-                        );
-                    }
-                }
-            }
-        }
-        let mut filter_batched = vec![false; cache_entries.len()];
-        for (_, members) in &filter_groups {
-            for &member in members {
-                filter_batched[member] = true;
-            }
-        }
-        for &index in &filtered_together {
-            filter_batched[index] = true;
-        }
-        let filtered_together: Vec<(wgpu::Texture, Vec<Filter>)> = filtered_together
-            .into_iter()
-            .map(|index| {
-                (
-                    cache_textures[index].clone(),
-                    cache_entries[index].filters.clone(),
-                )
+        let cache_handles: Vec<_> = cache_entries.iter().map(|e| e.handle.clone()).collect();
+        let references: Vec<Vec<usize>> = cache_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut bitmaps = vec![];
+                collect_bitmaps(&entry.commands, &mut bitmaps);
+                bitmaps
+                    .iter()
+                    .filter_map(|bitmap| cache_handles.iter().position(|h| h == bitmap))
+                    .filter(|&other| other != index)
+                    .collect()
             })
             .collect();
+        let mut levels = vec![0usize; cache_entries.len()];
+        for _ in 0..cache_entries.len() {
+            let mut changed = false;
+            for index in 0..cache_entries.len() {
+                let level = references[index]
+                    .iter()
+                    .map(|&other| levels[other] + 1)
+                    .max()
+                    .unwrap_or(0)
+                    // Cycles can't happen, but don't loop forever if they do.
+                    .min(cache_entries.len());
+                if level != levels[index] {
+                    levels[index] = level;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let max_level = levels.iter().copied().max().unwrap_or(0);
+        let batching =
+            ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::FilterBatching);
+        let together =
+            ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::FilterTogether)
+                && ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::BlurMerge,
+                )
+                && ruffle_render::filters::rendering_for_display();
 
         // Cache entries whose contents are simple enough are all drawn together in an
         // atlas, and copied into their textures. They mustn't use other cache entries'
         // textures, as those may not be drawn yet.
-        let cache_handles: Vec<_> = cache_entries.iter().map(|e| e.handle.clone()).collect();
         let is_atlased: Vec<bool> = cache_entries
             .iter()
             .map(|entry| {
@@ -801,162 +718,242 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             );
         }
 
-        for (index, (entry, atlased)) in cache_entries.into_iter().zip(is_atlased).enumerate() {
-            let entry = entry.expect("entries are only taken once");
-            crate::perf_counters::count(crate::perf_counters::Counter::CacheEntry);
-            if !entry.filters.is_empty() {
-                crate::perf_counters::count(crate::perf_counters::Counter::CacheEntryFiltered);
+        for level in 0..=max_level {
+            let members: Vec<usize> = (0..levels.len())
+                .filter(|&index| levels[index] == level)
+                .collect();
+            let mut filter_groups: Vec<(Vec<Filter>, Vec<usize>)> = vec![];
+            // Entries whose filters are applied together, whatever they are.
+            let mut filtered_together: Vec<usize> = vec![];
+            if batching {
+                for &index in &members {
+                    let entry = cache_entries[index]
+                        .as_ref()
+                        .expect("entries are only taken once");
+                    let texture = &cache_textures[index];
+                    if entry.filters.is_empty()
+                        || texture.width() > crate::surface::layer_atlas::max_batched_filter_size()
+                        || texture.height() > crate::surface::layer_atlas::max_batched_filter_size()
+                    {
+                        continue;
+                    }
+                    if together && entry.filters.iter().all(crate::filters::can_apply_together) {
+                        filtered_together.push(index);
+                        continue;
+                    }
+                    if !entry
+                        .filters
+                        .iter()
+                        .all(crate::surface::layer_atlas::is_local_filter)
+                    {
+                        continue;
+                    }
+                    match filter_groups
+                        .iter_mut()
+                        .find(|(filters, _)| *filters == entry.filters)
+                    {
+                        Some((_, group)) => group.push(index),
+                        None => filter_groups.push((entry.filters.clone(), vec![index])),
+                    }
+                }
+                filter_groups.retain(|(_, group)| group.len() >= 2);
             }
-            let texture = as_texture(&entry.handle);
-            let surface = Surface::new(
-                &self.descriptors,
-                self.surface.quality(),
-                texture.texture.width(),
-                texture.texture.height(),
-                wgpu::TextureFormat::Rgba8Unorm,
-            );
-            let clear = wgpu::Color {
-                r: f64::from(entry.clear.r) / 255.0,
-                g: f64::from(entry.clear.g) / 255.0,
-                b: f64::from(entry.clear.b) / 255.0,
-                a: f64::from(entry.clear.a) / 255.0,
-            };
-            if entry.filters.is_empty() || filter_batched[index] {
-                if !atlased {
-                    surface.draw_commands(
-                        RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear),
-                        &self.descriptors,
-                        &self.meshes,
-                        entry.commands,
-                        &mut self.active_frame.staging_belt,
-                        &self.active_frame.dynamic_transforms,
-                        &mut self
-                            .profiler
-                            .scope("Draw to CAB", &mut self.active_frame.command_encoder),
-                        LayerRef::None,
-                        &mut self.offscreen_texture_pool,
-                    );
-                }
-            } else {
-                let mut scope = self
-                    .profiler
-                    .scope("Filters", &mut self.active_frame.command_encoder);
-                // We're relying on there being no impotent filters here,
-                // so that we can safely start by using the actual CAB texture.
-                // It's guaranteed that at least one filter would have used it and moved the target to something else,
-                // letting us safely copy back to it later.
-                let mut target: Option<CommandTarget> = if atlased {
-                    // Already drawn into the texture.
-                    None
-                } else {
-                    Some(surface.draw_commands(
-                        RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear),
-                        &self.descriptors,
-                        &self.meshes,
-                        entry.commands,
-                        &mut self.active_frame.staging_belt,
-                        &self.active_frame.dynamic_transforms,
-                        &mut scope.scope("Draw to CAB"),
-                        LayerRef::None,
-                        &mut self.offscreen_texture_pool,
-                    ))
-                };
-                if crate::perf_counters::enabled() {
-                    let (w, h) = (texture.texture.width(), texture.texture.height());
-                    let size = match w * h {
-                        0..=4096 => "tiny",
-                        4097..=65536 => "small",
-                        65537..=262144 => "medium",
-                        _ => "large",
-                    };
-                    let names: Vec<_> = entry.filters.iter().map(|f| f.name()).collect();
-                    crate::perf_counters::count_named(format!("cab/{size}/{}", names.join("+")));
-                }
-                for filter in entry.filters {
-                    crate::perf_counters::count(crate::perf_counters::Counter::Filter);
-                    let source = match &target {
-                        Some(target) => target.color_texture(),
-                        None => &texture.texture,
-                    };
-                    target = Some(self.descriptors.filters.apply(
-                        &self.descriptors,
-                        &mut scope.scope(filter.name()),
-                        &mut self.offscreen_texture_pool,
-                        &mut self.active_frame.staging_belt,
-                        FilterSource::for_entire_texture(source),
-                        filter,
-                    ));
-                }
-                let target = target.expect("there's at least one filter");
-                let result = target.color_texture();
-                if result.sample_count() == 1
-                    && result.size() == texture.texture.size()
-                    && result.format() == texture.texture.format()
-                {
-                    // Same as the copy pipeline below, but without a render pass.
-                    scope.copy_texture_to_texture(
-                        result.as_image_copy(),
-                        texture.texture.as_image_copy(),
-                        result.size(),
-                    );
-                } else {
-                    run_copy_pipeline(
-                        &self.descriptors,
-                        texture.texture.format(),
-                        &texture.texture.create_view(&Default::default()),
-                        target.color_view(),
-                        target.globals(),
-                        target.color_texture().sample_count(),
-                        &mut scope.scope("Copy filtered to CAB"),
-                    );
+            if std::env::var_os("RUFFLE_FILTER_DEBUG").is_some() {
+                log_cache_filters(
+                    level,
+                    &members,
+                    &cache_entries,
+                    &cache_textures,
+                    &filter_groups,
+                    &filtered_together,
+                );
+            }
+            let mut filter_batched = vec![false; levels.len()];
+            for (_, group) in &filter_groups {
+                for &index in group {
+                    filter_batched[index] = true;
                 }
             }
-            // Periodically flush GPU work to prevent OOM when many cache entries
-            // accumulate (e.g. when a large container's cacheAsBitmap is skipped
-            // but its hundreds of children each have their own bitmap caches).
-            self.active_frame.maybe_flush(&self.descriptors);
-        }
+            for &index in &filtered_together {
+                filter_batched[index] = true;
+            }
+            let filtered_together: Vec<(wgpu::Texture, Vec<Filter>)> = filtered_together
+                .into_iter()
+                .map(|index| {
+                    (
+                        cache_textures[index].clone(),
+                        cache_entries[index]
+                            .as_ref()
+                            .expect("entries are only taken once")
+                            .filters
+                            .clone(),
+                    )
+                })
+                .collect();
 
-        if !filtered_together.is_empty() {
-            let skipped = crate::filters::apply_together(
-                &filtered_together,
-                &self.descriptors,
-                &mut self.active_frame.command_encoder,
-                &mut self.offscreen_texture_pool,
-                crate::surface::layer_atlas::max_filter_atlas_size()
-                    .min(self.descriptors.limits.max_texture_dimension_2d),
-            );
-            for index in skipped {
-                let (texture, filters) = &filtered_together[index];
-                filter_texture_in_place(
+            for &index in &members {
+                let entry = cache_entries[index]
+                    .take()
+                    .expect("entries are only taken once");
+                let atlased = is_atlased[index];
+                crate::perf_counters::count(crate::perf_counters::Counter::CacheEntry);
+                if !entry.filters.is_empty() {
+                    crate::perf_counters::count(crate::perf_counters::Counter::CacheEntryFiltered);
+                }
+                let texture = as_texture(&entry.handle);
+                let surface = Surface::new(
                     &self.descriptors,
-                    &mut self.active_frame.command_encoder,
-                    &mut self.offscreen_texture_pool,
-                    &mut self.active_frame.staging_belt,
-                    texture,
-                    filters,
+                    self.surface.quality(),
+                    texture.texture.width(),
+                    texture.texture.height(),
+                    wgpu::TextureFormat::Rgba8Unorm,
                 );
+                let clear = wgpu::Color {
+                    r: f64::from(entry.clear.r) / 255.0,
+                    g: f64::from(entry.clear.g) / 255.0,
+                    b: f64::from(entry.clear.b) / 255.0,
+                    a: f64::from(entry.clear.a) / 255.0,
+                };
+                if entry.filters.is_empty() || filter_batched[index] {
+                    if !atlased {
+                        surface.draw_commands(
+                            RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear),
+                            &self.descriptors,
+                            &self.meshes,
+                            entry.commands,
+                            &mut self.active_frame.staging_belt,
+                            &self.active_frame.dynamic_transforms,
+                            &mut self
+                                .profiler
+                                .scope("Draw to CAB", &mut self.active_frame.command_encoder),
+                            LayerRef::None,
+                            &mut self.offscreen_texture_pool,
+                        );
+                    }
+                } else {
+                    let mut scope = self
+                        .profiler
+                        .scope("Filters", &mut self.active_frame.command_encoder);
+                    // We're relying on there being no impotent filters here,
+                    // so that we can safely start by using the actual CAB texture.
+                    // It's guaranteed that at least one filter would have used it and moved the target to something else,
+                    // letting us safely copy back to it later.
+                    let mut target: Option<CommandTarget> = if atlased {
+                        // Already drawn into the texture.
+                        None
+                    } else {
+                        Some(surface.draw_commands(
+                            RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear),
+                            &self.descriptors,
+                            &self.meshes,
+                            entry.commands,
+                            &mut self.active_frame.staging_belt,
+                            &self.active_frame.dynamic_transforms,
+                            &mut scope.scope("Draw to CAB"),
+                            LayerRef::None,
+                            &mut self.offscreen_texture_pool,
+                        ))
+                    };
+                    if crate::perf_counters::enabled() {
+                        let (w, h) = (texture.texture.width(), texture.texture.height());
+                        let size = match w * h {
+                            0..=4096 => "tiny",
+                            4097..=65536 => "small",
+                            65537..=262144 => "medium",
+                            _ => "large",
+                        };
+                        let names: Vec<_> = entry.filters.iter().map(|f| f.name()).collect();
+                        crate::perf_counters::count_named(format!(
+                            "cab/{size}/{}",
+                            names.join("+")
+                        ));
+                    }
+                    for filter in entry.filters {
+                        crate::perf_counters::count(crate::perf_counters::Counter::Filter);
+                        let source = match &target {
+                            Some(target) => target.color_texture(),
+                            None => &texture.texture,
+                        };
+                        target = Some(self.descriptors.filters.apply(
+                            &self.descriptors,
+                            &mut scope.scope(filter.name()),
+                            &mut self.offscreen_texture_pool,
+                            &mut self.active_frame.staging_belt,
+                            FilterSource::for_entire_texture(source),
+                            filter,
+                        ));
+                    }
+                    let target = target.expect("there's at least one filter");
+                    let result = target.color_texture();
+                    if result.sample_count() == 1
+                        && result.size() == texture.texture.size()
+                        && result.format() == texture.texture.format()
+                    {
+                        // Same as the copy pipeline below, but without a render pass.
+                        scope.copy_texture_to_texture(
+                            result.as_image_copy(),
+                            texture.texture.as_image_copy(),
+                            result.size(),
+                        );
+                    } else {
+                        run_copy_pipeline(
+                            &self.descriptors,
+                            texture.texture.format(),
+                            &texture.texture.create_view(&Default::default()),
+                            target.color_view(),
+                            target.globals(),
+                            target.color_texture().sample_count(),
+                            &mut scope.scope("Copy filtered to CAB"),
+                        );
+                    }
+                }
+                // Periodically flush GPU work to prevent OOM when many cache entries
+                // accumulate (e.g. when a large container's cacheAsBitmap is skipped
+                // but its hundreds of children each have their own bitmap caches).
+                self.active_frame.maybe_flush(&self.descriptors);
             }
-        }
-        for (filters, members) in filter_groups {
-            let textures: Vec<_> = members.iter().map(|&i| cache_textures[i].clone()).collect();
-            let skipped = crate::surface::layer_atlas::apply_filters_batched(
-                &filters,
-                &textures,
-                &self.descriptors,
-                &mut self.active_frame.command_encoder,
-                &mut self.offscreen_texture_pool,
-                &mut self.active_frame.staging_belt,
-            );
-            for index in skipped {
-                filter_texture_in_place(
+
+            if !filtered_together.is_empty() {
+                let skipped = crate::filters::apply_together(
+                    &filtered_together,
+                    &self.descriptors,
+                    &mut self.active_frame.command_encoder,
+                    &mut self.offscreen_texture_pool,
+                    crate::surface::layer_atlas::max_filter_atlas_size()
+                        .min(self.descriptors.limits.max_texture_dimension_2d),
+                );
+                for index in skipped {
+                    let (texture, filters) = &filtered_together[index];
+                    filter_texture_in_place(
+                        &self.descriptors,
+                        &mut self.active_frame.command_encoder,
+                        &mut self.offscreen_texture_pool,
+                        &mut self.active_frame.staging_belt,
+                        texture,
+                        filters,
+                    );
+                }
+            }
+            for (filters, members) in filter_groups {
+                let textures: Vec<_> = members.iter().map(|&i| cache_textures[i].clone()).collect();
+                let skipped = crate::surface::layer_atlas::apply_filters_batched(
+                    &filters,
+                    &textures,
                     &self.descriptors,
                     &mut self.active_frame.command_encoder,
                     &mut self.offscreen_texture_pool,
                     &mut self.active_frame.staging_belt,
-                    &textures[index],
-                    &filters,
                 );
+                for index in skipped {
+                    filter_texture_in_place(
+                        &self.descriptors,
+                        &mut self.active_frame.command_encoder,
+                        &mut self.offscreen_texture_pool,
+                        &mut self.active_frame.staging_belt,
+                        &textures[index],
+                        &filters,
+                    );
+                }
             }
         }
 
@@ -1851,6 +1848,98 @@ impl ActiveFrame {
                 self.submit_direct(descriptors);
             }
         }
+    }
+}
+
+/// Prints the filters of a level's cache entries, and how they're applied
+/// (`RUFFLE_FILTER_DEBUG`), every 120 frames.
+fn log_cache_filters(
+    level: usize,
+    members: &[usize],
+    cache_entries: &[Option<BitmapCacheEntry>],
+    cache_textures: &[wgpu::Texture],
+    filter_groups: &[(Vec<Filter>, Vec<usize>)],
+    filtered_together: &[usize],
+) {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    static FRAME: AtomicU32 = AtomicU32::new(0);
+    static PRINTING: AtomicBool = AtomicBool::new(false);
+    if level == 0 {
+        let frame = FRAME.fetch_add(1, Ordering::Relaxed);
+        PRINTING.store(frame.is_multiple_of(120), Ordering::Relaxed);
+    }
+    if !PRINTING.load(Ordering::Relaxed) {
+        return;
+    }
+    let describe = |filters: &[Filter]| {
+        filters
+            .iter()
+            .map(|f| match f {
+                Filter::BlurFilter(b) => format!(
+                    "Blur({:.1}x{:.1} q{})",
+                    b.blur_x.to_f32(),
+                    b.blur_y.to_f32(),
+                    b.num_passes()
+                ),
+                Filter::GlowFilter(g) => format!(
+                    "Glow({:.1}x{:.1} q{} #{:02x}{:02x}{:02x}{:02x} s{:.2}{}{})",
+                    g.blur_x.to_f32(),
+                    g.blur_y.to_f32(),
+                    g.num_passes(),
+                    g.color.r,
+                    g.color.g,
+                    g.color.b,
+                    g.color.a,
+                    g.strength.to_f32(),
+                    if g.is_inner() { " inner" } else { "" },
+                    if g.is_knockout() { " knockout" } else { "" }
+                ),
+                other => other.name().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("+")
+    };
+    for (filters, group) in filter_groups {
+        let sizes: Vec<_> = group
+            .iter()
+            .map(|&i| {
+                format!(
+                    "{}x{}",
+                    cache_textures[i].width(),
+                    cache_textures[i].height()
+                )
+            })
+            .collect();
+        eprintln!(
+            "[filters] level {level}, group of {}: {} on {}",
+            group.len(),
+            describe(filters),
+            sizes.join(" ")
+        );
+    }
+    for &index in members {
+        let Some(entry) = &cache_entries[index] else {
+            continue;
+        };
+        if entry.filters.is_empty() || filter_groups.iter().any(|(_, g)| g.contains(&index)) {
+            continue;
+        }
+        let texture = &cache_textures[index];
+        let path = if filtered_together.contains(&index) {
+            "together"
+        } else if texture.width().max(texture.height())
+            > crate::surface::layer_atlas::max_batched_filter_size()
+        {
+            "single (too large)"
+        } else {
+            "single"
+        };
+        eprintln!(
+            "[filters] level {level}, {path}: {} on {}x{}",
+            describe(&entry.filters),
+            texture.width(),
+            texture.height()
+        );
     }
 }
 
