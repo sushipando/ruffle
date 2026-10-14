@@ -41,7 +41,7 @@ struct VTableData<'gc> {
     slot_table: Box<[SlotInfo<'gc>]>,
 
     /// method_table is indexed by `disp_id`
-    method_table: Box<[ClassBoundMethod<'gc>]>,
+    method_table: MethodTable<'gc>,
 }
 
 impl PartialEq for VTable<'_> {
@@ -179,7 +179,7 @@ impl<'gc> VTable<'gc> {
     }
 
     pub fn get_method(self, disp_id: usize) -> Option<Method<'gc>> {
-        self.0.method_table.get(disp_id).cloned().map(|x| x.method)
+        self.0.method_table.get(disp_id).map(|x| x.method)
     }
 
     pub fn get_full_method(self, disp_id: usize) -> Option<&'gc ClassBoundMethod<'gc>> {
@@ -209,11 +209,22 @@ impl<'gc> VTable<'gc> {
         slot.set(value);
     }
 
+    /// Replaces the scopes of this class's methods (not of methods it inherits, whose
+    /// entries are shared with the superclass; this is only used for `Object`).
     pub fn replace_scopes_with(self, mc: &Mutation<'gc>, new_scope: ScopeChain<'gc>) {
-        let methods = field!(Gc::write(mc, self.0), VTableData, method_table).as_deref();
-        for i in 0..methods.len() {
-            unlock!(&methods[i], ClassBoundMethod, scope).set(Some(new_scope));
+        let table = field!(Gc::write(mc, self.0), VTableData, method_table);
+        let own = field!(table, MethodTable, own).as_deref();
+        for i in 0..own.len() {
+            unlock!(&own[i], ClassBoundMethod, scope).set(Some(new_scope));
         }
+        let overrides = field!(table, MethodTable, overrides).as_deref();
+        for i in 0..overrides.len() {
+            let entry = &overrides[i];
+            let entry = field!(entry, OverriddenMethod, entry);
+            unlock!(entry, ClassBoundMethod, scope).set(Some(new_scope));
+        }
+        // Subclasses defined from now on get the new scopes.
+        self.0.method_table.flattened.take();
     }
 
     fn init_vtable(
@@ -277,7 +288,10 @@ impl<'gc> VTable<'gc> {
         let mut slot_metadata_table = HashMap::new();
         let mut disp_metadata_table = HashMap::new();
         let mut slot_table = Vec::new();
+        // All methods, while building; inherited ones end up shared (see `MethodTable`).
         let mut method_table = Vec::new();
+        let mut base_methods = None;
+        let mut overridden = Vec::new();
 
         // Subclasses cannot "override" slots in superclasses, so we only
         // maintain the list of slots that were declared by the subclass. At the
@@ -292,7 +306,9 @@ impl<'gc> VTable<'gc> {
             slot_metadata_table = superclass_vtable.0.slot_metadata_table.clone();
             disp_metadata_table = superclass_vtable.0.disp_metadata_table.clone();
             slot_table.extend_from_slice(&superclass_vtable.0.slot_table);
-            method_table.extend_from_slice(&superclass_vtable.0.method_table);
+            let base = superclass_vtable.0.method_table.flattened();
+            method_table.extend_from_slice(&base);
+            base_methods = Some(base);
 
             first_slot_offset = superclass_vtable.slot_count();
 
@@ -342,6 +358,7 @@ impl<'gc> VTable<'gc> {
                             }
 
                             method_table[disp_id] = entry;
+                            overridden.push(disp_id);
                         }
                         // note: ideally overwriting other property types
                         // should be a VerifyError
@@ -375,6 +392,7 @@ impl<'gc> VTable<'gc> {
                             }
 
                             method_table[disp_id] = entry;
+                            overridden.push(disp_id);
                         }
                         Some(Property::Virtual { get: None, .. }) => {
                             let disp_id = method_table.len();
@@ -419,6 +437,7 @@ impl<'gc> VTable<'gc> {
                             }
 
                             method_table[disp_id] = entry;
+                            overridden.push(disp_id);
                         }
                         Some(Property::Virtual { set: None, .. }) => {
                             let disp_id = method_table.len();
@@ -541,7 +560,7 @@ impl<'gc> VTable<'gc> {
             slot_metadata_table,
             disp_metadata_table,
             slot_table: slot_table.into_boxed_slice(),
-            method_table: method_table.into_boxed_slice(),
+            method_table: MethodTable::new(base_methods, method_table, overridden),
         })
     }
 
@@ -735,6 +754,114 @@ impl<'gc> VTableTraits<'gc> {
                     map.insert(QName::new(ns, name), *property);
                 }
                 Rc::new(map)
+            })
+            .clone()
+    }
+}
+
+/// A vtable's methods, indexed by `disp_id`: the superclass's methods (shared, not
+/// copied) with this class's overrides, followed by this class's new methods.
+///
+/// Like `VTableTraits`: copying the superclass's method table for every class took ~70
+/// MB in content that defines thousands of MovieClip subclasses
+/// (with ~200 inherited methods each).
+#[derive(Default)]
+pub struct MethodTable<'gc> {
+    /// The superclass's methods, flattened.
+    base: Option<Rc<[ClassBoundMethod<'gc>]>>,
+    /// Overridden methods of `base`, sorted by `disp_id`.
+    overrides: Box<[OverriddenMethod<'gc>]>,
+    /// This class's new methods, from `disp_id` `base.len()` on.
+    own: Box<[ClassBoundMethod<'gc>]>,
+    /// All of the above in a single table, made once this vtable's class has a subclass.
+    flattened: std::cell::RefCell<Option<Rc<[ClassBoundMethod<'gc>]>>>,
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub struct OverriddenMethod<'gc> {
+    disp_id: usize,
+    entry: ClassBoundMethod<'gc>,
+}
+
+unsafe impl<'gc> Collect<'gc> for MethodTable<'gc> {
+    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
+        cc.trace(&self.base);
+        cc.trace(&self.overrides);
+        cc.trace(&self.own);
+        // (Only holds what's in the other fields, so setting it doesn't need a write barrier.)
+        if let Some(flattened) = &*self.flattened.borrow() {
+            cc.trace(flattened);
+        }
+    }
+}
+
+impl<'gc> MethodTable<'gc> {
+    /// Splits a vtable's complete method table into its own entries and the ones it
+    /// shares with `base` (which it starts with), given the `disp_id`s it overrode.
+    fn new(
+        base: Option<Rc<[ClassBoundMethod<'gc>]>>,
+        mut all: Vec<ClassBoundMethod<'gc>>,
+        mut overridden: Vec<usize>,
+    ) -> Self {
+        let base_len = base.as_ref().map_or(0, |base| base.len());
+        let own = all.split_off(base_len).into_boxed_slice();
+        overridden.retain(|&disp_id| disp_id < base_len);
+        overridden.sort_unstable();
+        overridden.dedup();
+        let overrides = overridden
+            .into_iter()
+            .map(|disp_id| OverriddenMethod {
+                disp_id,
+                entry: all[disp_id].clone(),
+            })
+            .collect();
+        Self {
+            base,
+            overrides,
+            own,
+            flattened: Default::default(),
+        }
+    }
+
+    fn base_len(&self) -> usize {
+        self.base.as_ref().map_or(0, |base| base.len())
+    }
+
+    pub fn len(&self) -> usize {
+        self.base_len() + self.own.len()
+    }
+
+    pub fn get(&self, disp_id: usize) -> Option<&ClassBoundMethod<'gc>> {
+        let base_len = self.base_len();
+        if disp_id < base_len {
+            if !self.overrides.is_empty()
+                && let Ok(index) = self
+                    .overrides
+                    .binary_search_by_key(&disp_id, |overridden| overridden.disp_id)
+            {
+                return Some(&self.overrides[index].entry);
+            }
+            self.base.as_ref().map(|base| &base[disp_id])
+        } else {
+            self.own.get(disp_id - base_len)
+        }
+    }
+
+    /// The whole table, for subclasses to share.
+    fn flattened(&self) -> Rc<[ClassBoundMethod<'gc>]> {
+        if let Some(base) = &self.base
+            && self.overrides.is_empty()
+            && self.own.is_empty()
+        {
+            return base.clone();
+        }
+        self.flattened
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                (0..self.len())
+                    .map(|disp_id| self.get(disp_id).expect("in range").clone())
+                    .collect()
             })
             .clone()
     }
