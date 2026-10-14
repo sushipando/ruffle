@@ -19,6 +19,8 @@ use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
 use std::cell::{OnceCell, RefCell, RefMut};
+use std::ops::Range;
+use std::rc::Rc;
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -47,19 +49,27 @@ pub struct GraphicData<'gc> {
 
 impl<'gc> Graphic<'gc> {
     /// Construct a `Graphic` from it's associated `Shape` tag.
+    ///
+    /// `source` is where the tag's body is in the movie's data, so that the shape can be
+    /// parsed again after its records are released (see `ShapeRecords`).
     pub fn from_swf_tag(
         context: &mut UpdateContext<'gc>,
         swf_shape: swf::Shape,
         movie: SwfMovie<'gc>,
+        source: Option<Range<usize>>,
     ) -> Self {
         let shared = GraphicShared {
             id: swf_shape.id,
             shape_bounds: swf_shape.shape_bounds,
             edge_bounds: swf_shape.edge_bounds,
-            shape: swf_shape,
+            is_empty: swf_shape.shape.is_empty(),
+            shape: ShapeRecords::new(swf_shape, source),
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
         };
+        // Most shapes are never drawn (other frames, hidden parts of symbols), and drawn
+        // ones are parsed again when they're tessellated.
+        shared.shape.release();
 
         Graphic(Gc::new(
             context.gc(),
@@ -79,18 +89,22 @@ impl<'gc> Graphic<'gc> {
             id: 0,
             shape_bounds: Default::default(),
             edge_bounds: Default::default(),
-            shape: swf::Shape {
-                version: 32,
-                id: 0,
-                shape_bounds: Default::default(),
-                edge_bounds: Default::default(),
-                flags: swf::ShapeFlag::empty(),
-                styles: swf::ShapeStyles {
-                    fill_styles: Vec::new(),
-                    line_styles: Vec::new(),
+            is_empty: true,
+            shape: ShapeRecords::new(
+                swf::Shape {
+                    version: 32,
+                    id: 0,
+                    shape_bounds: Default::default(),
+                    edge_bounds: Default::default(),
+                    flags: swf::ShapeFlag::empty(),
+                    styles: swf::ShapeStyles {
+                        fill_styles: Vec::new(),
+                        line_styles: Vec::new(),
+                    },
+                    shape: Vec::new(),
                 },
-                shape: Vec::new(),
-            },
+                None,
+            ),
             movie: *context.root_swf,
             scaled_handle: RefCell::new(TessellationCache::new()),
         };
@@ -149,11 +163,15 @@ impl<'gc> Graphic<'gc> {
             .library
             .library_for_movie(shared.movie)
             .expect("Graphic's movie has a library");
+        let shape = shared.shape.get(shared.movie);
         let new_handle = context.renderer.register_shape_with_scale(
-            (&shared.shape).into(),
+            (&*shape).into(),
             &MovieLibrarySource { library },
             current_scale,
         );
+        // Not needed until the next tessellation (or hit test).
+        drop(shape);
+        shared.shape.release();
 
         {
             let mut cache = shared.scaled_handle.borrow_mut();
@@ -248,7 +266,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 
         if let Some(drawing) = self.0.drawing.get() {
             drawing.borrow().render(context);
-        } else if !self.0.shared.get().shape.shape.is_empty() {
+        } else if !self.0.shared.get().is_empty {
             let transform = context.transform_stack.transform();
 
             // Calculate the current scale from the transform, to determine if
@@ -283,8 +301,9 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
                     return true;
                 }
             } else {
-                let shape = &self.0.shared.get().shape;
-                return ruffle_render::shape_utils::shape_hit_test(shape, point, &local_matrix);
+                let shared = self.0.shared.get();
+                let shape = shared.shape.get(shared.movie);
+                return ruffle_render::shape_utils::shape_hit_test(&shape, point, &local_matrix);
             }
         }
 
@@ -333,7 +352,10 @@ struct GraphicShared<'gc> {
     id: CharacterId,
 
     #[collect(require_static)]
-    shape: swf::Shape,
+    shape: ShapeRecords,
+
+    /// Whether the shape has no records (and so isn't drawn).
+    is_empty: bool,
 
     #[collect(require_static)]
     shape_bounds: Rectangle<Twips>,
@@ -343,4 +365,92 @@ struct GraphicShared<'gc> {
 
     #[collect(require_static)]
     scaled_handle: RefCell<TessellationCache>,
+}
+
+/// A shape's definition (its styles and records), which is only needed to tessellate
+/// it and to hit test it. A movie can define thousands of shapes, and
+/// most are never drawn, so shapes don't keep it: it's parsed again from the tag in the
+/// movie's data (which stays in memory) when it's needed, and dropped again after
+/// tessellating (for example, at another scale after the window is resized). Shapes that
+/// are hit tested keep it until they're tessellated again.
+struct ShapeRecords {
+    parsed: RefCell<Option<Rc<swf::Shape>>>,
+    /// Where the DefineShape tag's body is in the movie's data, and its version.
+    source: Option<(Range<usize>, u8)>,
+}
+
+/// The approximate memory of all parsed shape definitions (for `RUFFLE_PERF`).
+pub static PARSED_SHAPE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn parsed_size(shape: &swf::Shape) -> usize {
+    shape.shape.capacity() * std::mem::size_of::<swf::ShapeRecord>()
+        + shape
+            .shape
+            .iter()
+            .map(|record| match record {
+                swf::ShapeRecord::StyleChange(change) => {
+                    std::mem::size_of::<swf::StyleChangeData>()
+                        + change.new_styles.as_ref().map_or(0, |styles| {
+                            styles.fill_styles.capacity() * std::mem::size_of::<swf::FillStyle>()
+                                + styles.line_styles.capacity()
+                                    * std::mem::size_of::<swf::LineStyle>()
+                        })
+                }
+                _ => 0,
+            })
+            .sum::<usize>()
+        + shape.styles.fill_styles.capacity() * std::mem::size_of::<swf::FillStyle>()
+        + shape.styles.line_styles.capacity() * std::mem::size_of::<swf::LineStyle>()
+}
+
+impl ShapeRecords {
+    fn new(shape: swf::Shape, source: Option<Range<usize>>) -> Self {
+        let version = shape.version;
+        PARSED_SHAPE_BYTES.fetch_add(parsed_size(&shape), std::sync::atomic::Ordering::Relaxed);
+        Self {
+            parsed: RefCell::new(Some(Rc::new(shape))),
+            source: source.map(|range| (range, version)),
+        }
+    }
+
+    /// The shape's definition, parsed again if it was released.
+    fn get(&self, movie: SwfMovie<'_>) -> Rc<swf::Shape> {
+        if let Some(shape) = &*self.parsed.borrow() {
+            return shape.clone();
+        }
+        let (range, version) = self
+            .source
+            .clone()
+            .expect("only shapes with a source are released");
+        let mut reader = swf::read::Reader::new(&movie.data()[range], movie.version());
+        let shape = Rc::new(
+            reader
+                .read_define_shape(version)
+                .expect("the shape was parsed from this data before"),
+        );
+        PARSED_SHAPE_BYTES.fetch_add(parsed_size(&shape), std::sync::atomic::Ordering::Relaxed);
+        *self.parsed.borrow_mut() = Some(shape.clone());
+        shape
+    }
+
+    /// Drops the parsed definition, if it can be parsed again.
+    fn release(&self) {
+        if self.source.is_some()
+            && ruffle_render::perf_flags::enabled(
+                ruffle_render::perf_flags::PerfFlag::ReleaseShapes,
+            )
+            && let Some(shape) = self.parsed.borrow_mut().take()
+        {
+            PARSED_SHAPE_BYTES.fetch_sub(parsed_size(&shape), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for ShapeRecords {
+    fn drop(&mut self) {
+        if let Some(shape) = self.parsed.get_mut() {
+            PARSED_SHAPE_BYTES.fetch_sub(parsed_size(shape), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }

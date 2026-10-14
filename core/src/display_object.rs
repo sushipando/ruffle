@@ -32,7 +32,7 @@ mod avm2_button;
 mod bitmap;
 mod container;
 mod edit_text;
-mod graphic;
+pub(crate) mod graphic;
 mod interactive;
 mod loader_display;
 mod morph_shape;

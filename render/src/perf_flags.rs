@@ -63,9 +63,12 @@ pub enum PerfFlag {
     /// Draw a blend's content directly with the blend mode, instead of in a layer, when
     /// that's the same (a single bitmap, or a single shape with a single fill).
     DirectBlends,
+    /// Drop the parsed definitions of tessellated shapes, and parse them again from the
+    /// movie's data when needed (see `ShapeRecords` in core).
+    ReleaseShapes,
 }
 
-const NAMES: [&str; 23] = [
+const NAMES: [&str; 24] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -89,9 +92,10 @@ const NAMES: [&str; 23] = [
     "cache-bind-groups",
     "filter-together",
     "direct-blends",
+    "release-shapes",
 ];
 
-static FLAGS: [AtomicBool; 23] = [
+static FLAGS: [AtomicBool; 24] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -115,6 +119,7 @@ static FLAGS: [AtomicBool; 23] = [
     AtomicBool::new(true),  // cache-bind-groups
     AtomicBool::new(true),  // filter-together
     AtomicBool::new(true),  // direct-blends
+    AtomicBool::new(true),  // release-shapes
 ];
 
 #[inline]

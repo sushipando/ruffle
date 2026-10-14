@@ -93,7 +93,7 @@ impl PerfStats {
         let busy_ms =
             self.run_frame.total_ms() + self.render.total_ms() + self.tick_other.total_ms();
         eprintln!(
-            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}% | gc objects {} orphans {} loaders {}",
+            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}% | gc objects {} orphans {} loaders {} | parsed shapes {}MB",
             self.run_frame.count as f64 / secs,
             self.run_frame.avg_ms(),
             self.run_frame.max_ms(),
@@ -106,6 +106,9 @@ impl PerfStats {
             self.gc_objects,
             self.orphans,
             self.loaders,
+            crate::display_object::graphic::PARSED_SHAPE_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                / 1_000_000,
         );
         self.window_start = Instant::now();
         self.run_frame = Bucket::default();

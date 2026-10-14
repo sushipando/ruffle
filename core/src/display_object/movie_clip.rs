@@ -3543,9 +3543,16 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
         version: u8,
     ) -> Result<(), Error> {
+        // Where the tag is in the movie's data, so that it can be parsed again later.
+        let movie = self.movie();
+        let data = movie.data().as_ptr_range();
+        let start = reader.get_ref().as_ptr();
         let swf_shape = reader.read_define_shape(version)?;
+        let end = reader.get_ref().as_ptr();
+        let source = (data.start <= start && start <= end && end <= data.end)
+            .then(|| (start as usize - data.start as usize)..(end as usize - data.start as usize));
         let id = swf_shape.id;
-        let graphic = Graphic::from_swf_tag(context, swf_shape, self.movie());
+        let graphic = Graphic::from_swf_tag(context, swf_shape, movie, source);
         self.library_mut(context)
             .register_character(id, Character::Graphic(graphic));
         Ok(())
