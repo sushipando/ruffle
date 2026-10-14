@@ -2106,8 +2106,50 @@ impl Player {
     }
 
     #[instrument(level = "debug", skip_all)]
+    /// Frees the meshes of shapes that weren't drawn for a while, such as those of
+    /// content that's no longer shown but whose movie stays loaded. They're tessellated again if
+    /// they're drawn again (see `Graphic::get_or_retessellate_handle`).
+    fn evict_unused_tessellations(&mut self) {
+        /// How long a tessellation is kept without being drawn.
+        const UNUSED_SECONDS: u32 = 30;
+        /// How often unused tessellations are looked for.
+        const SWEEP_SECONDS: u32 = 5;
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        static LAST_SWEEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+        let now = START.get_or_init(Instant::now).elapsed().as_secs() as u32;
+        crate::tessellation_cache::set_clock(now);
+        let last = LAST_SWEEP.load(std::sync::atomic::Ordering::Relaxed);
+        if now < last + SWEEP_SECONDS
+            || now < UNUSED_SECONDS
+            || !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::EvictMeshes)
+        {
+            return;
+        }
+        LAST_SWEEP.store(now, std::sync::atomic::Ordering::Relaxed);
+        let cutoff = now - UNUSED_SECONDS;
+        let evicted = self.enter_arena(|_, gc_root, _| {
+            let mut evicted = 0;
+            for movie in gc_root.library.known_movies() {
+                let Some(library) = gc_root.library.library_for_movie(movie) else {
+                    continue;
+                };
+                for character in library.characters().values() {
+                    if let crate::character::Character::Graphic(graphic) = character {
+                        evicted += graphic.evict_unused_tessellations(cutoff);
+                    }
+                }
+            }
+            evicted
+        });
+        if self.perf_stats.is_some() && evicted > 0 {
+            eprintln!("[meshes] dropped {evicted} tessellations not drawn for {UNUSED_SECONDS} s");
+        }
+    }
+
     pub fn render(&mut self) {
         let render_start = Instant::now();
+        self.evict_unused_tessellations();
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {

@@ -66,9 +66,12 @@ pub enum PerfFlag {
     /// Drop the parsed definitions of tessellated shapes, and parse them again from the
     /// movie's data when needed (see `ShapeRecords` in core).
     ReleaseShapes,
+    /// Drop the tessellations of shapes that weren't drawn for a while (see
+    /// `Player::evict_unused_tessellations` in core).
+    EvictMeshes,
 }
 
-const NAMES: [&str; 24] = [
+const NAMES: [&str; 25] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -93,9 +96,10 @@ const NAMES: [&str; 24] = [
     "filter-together",
     "direct-blends",
     "release-shapes",
+    "evict-meshes",
 ];
 
-static FLAGS: [AtomicBool; 24] = [
+static FLAGS: [AtomicBool; 25] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -120,6 +124,7 @@ static FLAGS: [AtomicBool; 24] = [
     AtomicBool::new(true),  // filter-together
     AtomicBool::new(true),  // direct-blends
     AtomicBool::new(true),  // release-shapes
+    AtomicBool::new(true),  // evict-meshes
 ];
 
 #[inline]

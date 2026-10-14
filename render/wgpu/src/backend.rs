@@ -360,12 +360,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
             .collect();
 
-        Mesh {
-            draws,
-            vertex_buffer,
-            index_buffer,
-            bounds,
-        }
+        Mesh::new(draws, vertex_buffer, index_buffer, bounds)
     }
 
     fn clamp_bitmap(&self, bitmap: &mut Bitmap) -> bool {

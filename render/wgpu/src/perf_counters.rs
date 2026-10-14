@@ -84,6 +84,11 @@ pub fn end_frame() {
         line.push_str(&format!(" {name} {:.1}", value as f64 / frames_f));
     }
     eprintln!("{line}  (per frame)");
+    eprintln!(
+        "[gpu-mem] meshes {} ({} MB)",
+        crate::mesh::MESH_COUNT.load(Ordering::Relaxed),
+        crate::mesh::MESH_BYTES.load(Ordering::Relaxed) / 1_000_000
+    );
     let mut named = std::mem::take(&mut *NAMED.lock().expect("perf counters lock"));
     if !named.is_empty() {
         named.sort_by_key(|(_, count)| std::cmp::Reverse(*count));

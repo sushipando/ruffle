@@ -25,6 +25,43 @@ pub struct Mesh {
 
 impl ShapeHandleImpl for Mesh {}
 
+/// The number of meshes and the size of their buffers (for `RUFFLE_PERF`).
+pub static MESH_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static MESH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Mesh {
+    pub fn new(
+        draws: Vec<Draw>,
+        vertex_buffer: wgpu::Buffer,
+        index_buffer: wgpu::Buffer,
+        bounds: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        MESH_COUNT.fetch_add(1, Ordering::Relaxed);
+        MESH_BYTES.fetch_add(
+            vertex_buffer.size() + index_buffer.size(),
+            Ordering::Relaxed,
+        );
+        Self {
+            draws,
+            vertex_buffer,
+            index_buffer,
+            bounds,
+        }
+    }
+}
+
+impl Drop for Mesh {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        MESH_COUNT.fetch_sub(1, Ordering::Relaxed);
+        MESH_BYTES.fetch_sub(
+            self.vertex_buffer.size() + self.index_buffer.size(),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 pub fn as_mesh(handle: &ShapeHandle) -> &Mesh {
     <dyn Any>::downcast_ref(&*handle.0).expect("Shape handle must be a WGPU ShapeData")
 }

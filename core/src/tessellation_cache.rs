@@ -10,9 +10,23 @@ const RETESSELLATION_SCALE_THRESHOLD_INVERSE: f32 = 1.0 / RETESSELLATION_SCALE_T
 /// The maximum number of retessellated shapes to cache per original shape.
 const RETESSELLATION_CACHE_SIZE: usize = 4;
 
+/// Seconds since the player started, updated once per rendered frame (see `set_clock`).
+/// Entries remember when they were last used, so that unused ones can be dropped
+/// (see `evict_unused_since`).
+static CLOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn set_clock(seconds: u32) {
+    CLOCK.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn clock() -> u32 {
+    CLOCK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TessellationCache {
-    entries: [Option<(f32, ShapeHandle)>; RETESSELLATION_CACHE_SIZE],
+    /// Each entry's scale, handle, and when it was last used (see `clock`).
+    entries: [Option<(f32, ShapeHandle, u32)>; RETESSELLATION_CACHE_SIZE],
     len: usize,
 }
 
@@ -41,7 +55,7 @@ impl TessellationCache {
         let mut best_deviation = f32::INFINITY;
 
         for (index, entry) in self.entries[..self.len].iter().enumerate() {
-            if let Some((cached_scale, _)) = entry {
+            if let Some((cached_scale, _, _)) = entry {
                 let ratio = f32::abs(target_scale / cached_scale);
 
                 // Check if the cached scale is within the retessellation threshold of the target scale.
@@ -70,7 +84,7 @@ impl TessellationCache {
     pub(crate) fn insert(&mut self, scale: f32, handle: ShapeHandle) {
         if self.len < RETESSELLATION_CACHE_SIZE {
             // If the cache is not full, simply add the new entry at the end.
-            self.entries[self.len] = Some((scale, handle));
+            self.entries[self.len] = Some((scale, handle, clock()));
             self.len += 1;
             return;
         }
@@ -80,7 +94,25 @@ impl TessellationCache {
             self.entries[i - 1] = self.entries[i].take();
         }
 
-        self.entries[self.len - 1] = Some((scale, handle));
+        self.entries[self.len - 1] = Some((scale, handle, clock()));
+    }
+
+    /// Drops the entries that weren't used since `cutoff` (see `clock`), returning how
+    /// many were dropped. Their meshes are freed once nothing else uses them.
+    pub(crate) fn evict_unused_since(&mut self, cutoff: u32) -> usize {
+        let mut kept = 0;
+        for index in 0..self.len {
+            let entry = self.entries[index].take();
+            if let Some(entry) = entry
+                && entry.2 >= cutoff
+            {
+                self.entries[kept] = Some(entry);
+                kept += 1;
+            }
+        }
+        let evicted = self.len - kept;
+        self.len = kept;
+        evicted
     }
 
     /// Returns the number of cached entries currently stored in the cache.
@@ -92,14 +124,15 @@ impl TessellationCache {
     fn touch_entry(&mut self, index: usize) -> ShapeHandle {
         if index == self.len - 1 {
             // The entry is already the most recently used, so we can return its handle directly.
-            return self.entries[index]
-                .as_ref()
-                .expect("tessellation cache entry exists")
-                .1
-                .clone();
+            let entry = self.entries[index]
+                .as_mut()
+                .expect("tessellation cache entry exists");
+            entry.2 = clock();
+            return entry.1.clone();
         }
 
-        let entry = self.entries[index].take().expect("entry exists");
+        let mut entry = self.entries[index].take().expect("entry exists");
+        entry.2 = clock();
 
         for i in index + 1..self.len {
             self.entries[i - 1] = self.entries[i].take();

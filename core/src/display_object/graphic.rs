@@ -188,6 +188,19 @@ impl<'gc> Graphic<'gc> {
     }
 }
 
+impl<'gc> Graphic<'gc> {
+    /// Drops this shape's tessellations that weren't drawn since `cutoff` (see
+    /// `tessellation_cache::clock`), returning how many were dropped.
+    pub fn evict_unused_tessellations(self, cutoff: u32) -> usize {
+        self.0
+            .shared
+            .get()
+            .scaled_handle
+            .borrow_mut()
+            .evict_unused_since(cutoff)
+    }
+}
+
 impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
     fn base(self) -> Gc<'gc, DisplayObjectBase<'gc>> {
         HasPrefixField::as_prefix_gc(self.0)
