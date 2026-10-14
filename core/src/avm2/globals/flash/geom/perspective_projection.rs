@@ -7,7 +7,7 @@ use crate::avm2::object::Matrix3DObject;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::{Activation, Error, Object, TObject as _, Value};
 use crate::avm2_stub_setter;
-use crate::display_object::TDisplayObject;
+use crate::display_object::{DisplayObject, TDisplayObject};
 use ruffle_render::perspective_projection::PerspectiveProjection;
 
 fn get_width<'gc>(activation: &mut Activation<'_, 'gc>, this: Object<'gc>) -> f64 {
@@ -21,6 +21,17 @@ fn get_width<'gc>(activation: &mut Activation<'_, 'gc>, this: Object<'gc>) -> f6
         None => 500.0,
         // Stage's PerspectiveProjection
         Some(dobj) if dobj.as_stage().is_some() => 500.0,
+        // The root of loaded content uses its own movie's width.
+        Some(dobj)
+            if dobj.is_root()
+                && !activation
+                    .context
+                    .stage
+                    .root_clip()
+                    .is_some_and(|root| DisplayObject::ptr_eq(dobj, root)) =>
+        {
+            dobj.movie().width().to_pixels()
+        }
         // Associated with other DO.
         Some(_dobj) => activation.context.stage.stage_size().0 as f64,
     }

@@ -1,0 +1,8 @@
+num_ticks = 2
+
+# The output.txt is obtained from the AIR 51.3 runtime (adl) for macOS.
+[approximations]
+epsilon = 0.001
+number_patterns = [
+    'focalLength = ([0-9.]+)',
+]

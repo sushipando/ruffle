@@ -1,0 +1,19 @@
+// main root
+fieldOfView = 55
+focalLength = 384.1964111328125
+projectionCenter = (x=200, y=150)
+// loaded root
+fieldOfView = 55
+focalLength = 614.7142944335938
+projectionCenter = (x=320, y=240)
+// root of a child of the loaded root
+true
+fieldOfView = 55
+focalLength = 614.7142944335938
+projectionCenter = (x=320, y=240)
+// loaded root after removing the Loader
+fieldOfView = 55
+focalLength = 614.7142944335938
+projectionCenter = (x=320, y=240)
+// new Sprite
+null

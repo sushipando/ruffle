@@ -839,6 +839,28 @@ Redrawing a cache between movie frames only when something inside it moves (rath
 whenever it changed in that movie frame) was tried and didn't help: in those scenes nearly
 all of them contain moving parts.
 
+### 43. Roots of loaded movies have a default `PerspectiveProjection`
+
+*Files: `core/src/display_object/movie_clip.rs` (`replace_with_movie`),
+`core/src/avm2/globals/flash/geom/perspective_projection.rs` (`get_width`); test
+`avm2/perspective_projection_loaded`.*
+
+Animate's layer depth feature compiles a helper class (`privatePkg.___LayerProp___`) into
+the SWF. On every `exitFrame`, each instance reads
+`root.transform.perspectiveProjection.focalLength`. Only the player's root movie had a
+default `PerspectiveProjection`; for the root of a movie loaded with `Loader`, the getter
+returned `null`. So in loaded content, every such object threw a `TypeError` on every
+frame, which Ruffle logs with a stack trace, and the layer's color effects, filters and
+visibility were never applied. One loaded movie with two such objects logged 528 errors in
+6 seconds.
+
+The root of a loaded movie now gets the same default as the player's root (field of view
+55, centered on the movie). As in Flash, its `focalLength` uses the loaded movie's width
+rather than the stage's. The test's expected output comes from the AIR 51.3 runtime
+(`adl`). Its SWFs are compiled with Ruffle's `tools/asc/asc.jar` (against the
+`playerglobal_import.abc` in the build output), because the AIR SDK's compiler emits ABC
+47.16, which Ruffle doesn't parse. That movie renders identically before and after.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

@@ -398,6 +398,13 @@ impl<'gc> MovieClip<'gc> {
         write.flags.set(MovieClipFlags::PLAYING);
         write.current_frame.set(0);
         write.audio_stream.take();
+
+        if is_root {
+            // Like the player's root, the root of loaded content always has a
+            // PerspectiveProjection; generated timeline code reads
+            // `root.transform.perspectiveProjection` without a null check.
+            self.set_perspective_projection(None);
+        }
     }
 
     pub fn set_initialized(self) {
