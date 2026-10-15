@@ -932,6 +932,7 @@ pub fn set_selection<'gc>(
             begin_index as usize,
             end_index as usize,
         )));
+        this.scroll_to_caret(this.hscroll());
     }
 
     Ok(Value::Undefined)

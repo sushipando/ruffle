@@ -1,0 +1,7 @@
+num_ticks = 1
+
+# The values depend on the font. In the AIR 51.3 runtime (with its own `_sans`), the
+# same sequence follows the same rule: scrolling starts once the caret is past the
+# visible width (96 px), in steps of 24 px, and holds while the caret is visible.
+[player_options]
+with_default_font = true

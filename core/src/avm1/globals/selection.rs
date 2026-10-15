@@ -96,6 +96,7 @@ pub fn set_selection<'gc>(
             .max(0);
         let selection = TextSelection::for_range(start as usize, end as usize);
         edit_box.set_selection(Some(selection));
+        edit_box.scroll_to_caret(edit_box.hscroll());
     }
     Ok(Value::Undefined)
 }

@@ -1548,6 +1548,42 @@ impl<'gc> EditText<'gc> {
         self.0.hscroll.get()
     }
 
+    /// Scrolls sideways so that the caret is visible, like Flash does whenever the caret
+    /// is moved (typing, keys, the mouse, `setSelection`), starting from `hscroll` (text
+    /// changes reset the scroll, which Flash doesn't). When the caret is past an edge,
+    /// the text scrolls to the nearest multiple of a quarter of the visible width that
+    /// shows it. Fields with word wrap don't scroll sideways.
+    pub fn scroll_to_caret(self, hscroll: f64) {
+        if self.0.flags.get().contains(EditTextFlag::WORD_WRAP) {
+            return;
+        }
+        let Some(selection) = self.selection() else {
+            return;
+        };
+        let caret = selection.to;
+        // Where the caret is drawn, as `getCharBoundaries` measures (without scrolling).
+        let x = match self.char_bounds(caret) {
+            Some(bounds) => bounds.x_min,
+            None => match caret.checked_sub(1).and_then(|last| self.char_bounds(last)) {
+                Some(bounds) => bounds.x_max,
+                None => Self::GUTTER,
+            },
+        }
+        .to_pixels();
+        let visible = (self.0.bounds.get().width() - Self::GUTTER * 2).to_pixels();
+        let step = (visible / 4.0).floor();
+        if step < 1.0 {
+            return;
+        }
+        let mut scroll = hscroll.max(0.0);
+        if x - scroll > visible {
+            scroll = ((x - visible) / step).ceil() * step;
+        } else if x < scroll {
+            scroll = (x / step).floor() * step;
+        }
+        self.0.hscroll.set(scroll.clamp(0.0, self.maxhscroll()));
+    }
+
     pub fn set_hscroll(self, hscroll: f64) {
         self.0.hscroll.set(hscroll);
         self.invalidate_cached_bitmap();
@@ -1710,6 +1746,7 @@ impl<'gc> EditText<'gc> {
             return;
         };
 
+        let hscroll = self.hscroll();
         let mut changed = false;
         let is_selectable = self.is_selectable();
         match control_code {
@@ -1820,6 +1857,7 @@ impl<'gc> EditText<'gc> {
                 }
             }
         }
+        self.scroll_to_caret(hscroll);
         if changed {
             let mut activation = Avm1Activation::from_nothing(
                 context,
@@ -1864,7 +1902,9 @@ impl<'gc> EditText<'gc> {
                 let new_selection = cursor.map(|(from, to)| {
                     TextSelection::for_range(old_ime_start + from, old_ime_start + to)
                 });
+                let hscroll = self.hscroll();
                 self.set_selection(new_selection);
+                self.scroll_to_caret(hscroll);
             }
             ImeEvent::Commit(text) => self.text_input(text, context),
         };
@@ -2080,9 +2120,11 @@ impl<'gc> EditText<'gc> {
             text = &text[0..self.available_chars()];
         }
 
+        let hscroll = self.hscroll();
         self.replace_text(selection.start(), selection.end(), text, context);
         let new_pos = selection.start() + text.len();
         self.set_selection(Some(TextSelection::for_position(new_pos)));
+        self.scroll_to_caret(hscroll);
 
         let mut activation = Avm1Activation::from_nothing(
             context,
@@ -2516,6 +2558,7 @@ impl<'gc> EditText<'gc> {
         // Update selection
         let selection = self.calculate_selection_at(position, selection_mode);
         self.set_selection(Some(selection));
+        self.scroll_to_caret(self.hscroll());
     }
 
     fn handle_drag(self, position: usize) {
@@ -2539,6 +2582,7 @@ impl<'gc> EditText<'gc> {
         let current_selection = self.calculate_selection_at(position, selection_mode);
         let new_selection = TextSelection::span_across(first_selection, current_selection);
         self.set_selection(Some(new_selection));
+        self.scroll_to_caret(self.hscroll());
     }
 
     pub fn set_avm2_class(self, mc: &Mutation<'gc>, class: Avm2ClassObject<'gc>) {

@@ -1012,6 +1012,21 @@ The same scene, switching the flag every 10 seconds:
 Each goto costs more in a scene with more objects (1.4 ms in a crowded scene without the
 change), so larger scenes should gain more.
 
+### 49. Text fields scroll sideways to keep the caret visible
+
+*Files: `core/src/display_object/edit_text.rs` (`scroll_to_caret`); test
+`avm2/textfield_scroll_to_caret`.*
+
+Ruffle never changed a text field's `scrollH` by itself, and every text change reset it to
+0. So text typed past the end of a narrow input field was hidden, with the caret. Flash
+scrolls a field without word wrap whenever the caret moves (typing, keys, the mouse,
+`setSelection`, but not `replaceSelectedText` or setting the text). In the AIR 51.3
+runtime, with a 100 px field (96 px visible), the rule was exact over 20 caret positions:
+when the caret is past the right edge, `scrollH` becomes the smallest multiple of a
+quarter of the visible width (24 px) that shows it; past the left edge, the largest
+multiple at or before it; otherwise it stays. Ruffle now does the same, starting from the
+scroll before the text changed.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
