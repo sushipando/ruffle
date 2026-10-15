@@ -1444,10 +1444,22 @@ impl Player {
                 self.mutate_with_update_context(|context| context.stage.inverse_view_matrix());
             let prev_mouse_position = self.mouse_position;
             self.mouse_position = inverse_view_matrix * Point::from_pixels(x, y);
+            let is_move = matches!(event, InputEvent::MouseMove { .. });
 
             // Update the dragged object here to keep it constantly in sync with the mouse position.
             self.mutate_with_update_context(|context| {
                 Self::update_drag(context);
+                // A pressed text field extends its selection wherever the mouse goes,
+                // whatever contains it (`mouseEnabled = false` on a parent only affects
+                // the parent, but the clip event broadcast stops there).
+                if is_move
+                    && let Some(text) = context
+                        .mouse_data
+                        .pressed
+                        .and_then(|pressed| pressed.as_displayobject().as_edit_text())
+                {
+                    text.drag_selection_to_mouse(context);
+                }
             });
 
             let is_mouse_moved = prev_mouse_position != self.mouse_position;

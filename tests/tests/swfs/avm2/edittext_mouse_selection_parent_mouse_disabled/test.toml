@@ -1,0 +1,4 @@
+num_frames = 4
+
+[player_options]
+with_default_font = true

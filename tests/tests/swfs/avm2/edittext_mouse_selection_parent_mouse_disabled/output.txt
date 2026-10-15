@@ -1,0 +1,3 @@
+frame 1: range selected false
+frame 2: range selected true
+frame 3: range selected true

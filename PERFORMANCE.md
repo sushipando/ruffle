@@ -1027,6 +1027,18 @@ quarter of the visible width (24 px) that shows it; past the left edge, the larg
 multiple at or before it; otherwise it stays. Ruffle now does the same, starting from the
 scroll before the text changed.
 
+### 50. A text selection follows the mouse whatever contains the field
+
+*Files: `core/src/player.rs` (mouse move handling), `core/src/display_object/edit_text.rs`
+(`drag_selection_to_mouse`); test `avm2/edittext_mouse_selection_parent_mouse_disabled`.*
+
+A pressed text field extended its selection when the mouse moved, through the clip event
+broadcast. That broadcast stops at objects with `mouseEnabled = false`, but in AVM2 that
+property only affects the object itself (`mouseChildren` affects its children). So a text
+field inside such a container couldn't be selected by dragging. The player now passes
+every mouse move to the pressed text field directly, which also uses the mouse position
+after the move (the broadcast saw the previous one).
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

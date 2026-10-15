@@ -2561,6 +2561,14 @@ impl<'gc> EditText<'gc> {
         self.scroll_to_caret(self.hscroll());
     }
 
+    /// Extends the selection of this pressed text field to the mouse (see `Player`'s
+    /// mouse move handling).
+    pub fn drag_selection_to_mouse(self, context: &UpdateContext<'gc>) {
+        if let Some(position) = self.screen_position_to_index(*context.mouse_position) {
+            self.handle_drag(position);
+        }
+    }
+
     fn handle_drag(self, position: usize) {
         if !self.is_selectable() {
             return;
@@ -3090,15 +3098,6 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
             }
 
             return ClipEventResult::Handled;
-        }
-
-        if let ClipEvent::MouseMove = event {
-            // If a mouse has moved and this EditTest is pressed, we need to update the selection.
-            if InteractiveObject::option_ptr_eq(context.mouse_data.pressed, Some(self.into()))
-                && let Some(position) = self.screen_position_to_index(*context.mouse_position)
-            {
-                self.handle_drag(position);
-            }
         }
 
         ClipEventResult::NotHandled
