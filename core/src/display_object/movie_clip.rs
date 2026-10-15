@@ -2586,6 +2586,9 @@ impl<'gc> MovieClip<'gc> {
                             e,
                             "Error running AVM2 frame script",
                         );
+                        // Flash stops a clip whose frame script throws, whether or not the
+                        // error is handled (`play()` resumes it).
+                        self.stop(activation.context);
                     }
 
                     self.0

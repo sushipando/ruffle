@@ -1068,6 +1068,27 @@ The sliced shape is tessellated on its own and kept, one per shape, until the ob
 scale, grid or bounds change (a sliced shape that's being resized is tessellated each
 frame).
 
+### 52. A clip whose frame script throws stops
+
+*Files: `core/src/display_object/movie_clip.rs` (`run_local_frame_scripts`); tests
+`avm2/frame_script_error_stops_clip`, `avm2/frame_script_error_stops_clip_nested`.*
+
+In the AIR 51.3 runtime, a movie clip whose frame script throws stops on that frame, as if
+the script had called `stop()`: `play()` and `gotoAndPlay()` resume it, and it stops again
+the next time the script throws. That holds whether or not an `uncaughtErrorEvents`
+listener handles the error. Ruffle kept playing.
+
+It matters for timelines authored as "show a frame, `stop()`, wait for a button". Flash
+writes the properties of a component placed on a frame (a generated `__setProp_…` call) at
+the start of that frame's script. When the component contains a button with a movie clip in
+its up state, constructing the button runs the whole stage's frame scripts early (Ruffle
+does this too, as Flash does), before the parent's variable for the component is set, so
+the property write throws. In Flash the clip still stops at that frame; Ruffle played on
+past it. The script isn't run again in either.
+
+(Ruffle doesn't dispatch `uncaughtErrorEvents` yet, so the tests run in release mode, where
+neither runtime prints the handled errors.)
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

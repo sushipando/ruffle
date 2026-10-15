@@ -1,0 +1,26 @@
+Body ctor
+tick 1: body frame 2
+Holder ctor start, parent.__id0_=null, btn=null
+Body frame 2 script, __id0_=null
+Holder ctor end, parent.__id0_=null, btn=[object SimpleButton]
+tick 2: body frame 2
+tick 3: body frame 2
+tick 4: body frame 2
+play()
+tick 5: body frame 3
+tick 6: body frame 4
+tick 7: body frame 1
+tick 8: body frame 2
+Holder ctor start, parent.__id0_=null, btn=null
+Body frame 2 script, __id0_=null
+Holder ctor end, parent.__id0_=null, btn=[object SimpleButton]
+tick 9: body frame 2
+gotoAndPlay(3)
+tick 10: body frame 4
+tick 11: body frame 1
+tick 12: body frame 2
+Holder ctor start, parent.__id0_=null, btn=null
+Body frame 2 script, __id0_=null
+Holder ctor end, parent.__id0_=null, btn=[object SimpleButton]
+tick 13: body frame 2
+tick 14: body frame 2

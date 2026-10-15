@@ -1,0 +1,8 @@
+# test.swf is the classes compiled with asc.jar plus a timeline: the main timeline places
+# `body` (Body, 4 frames), whose frame 2 places a Holder (a shape) named `__id0_`.
+num_frames = 15
+
+[player_options]
+# Uncaught errors are not printed in release mode, as in the expected output (the movie
+# handles them).
+mode = "Release"
