@@ -39,6 +39,8 @@ pub struct GuiController {
     window: Arc<Window>,
     last_update: Instant,
     repaint_after: Duration,
+    /// Whether egui drew anything (menu bar, context menu, dialogs, debug tools) last time.
+    shows_ui: bool,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
     movie_view_renderer: Arc<MovieViewRenderer>,
@@ -207,6 +209,7 @@ impl GuiController {
             window,
             last_update: Instant::now(),
             repaint_after: Duration::ZERO,
+            shows_ui: true,
             surface,
             surface_format,
             movie_view_renderer,
@@ -291,7 +294,11 @@ impl GuiController {
         }
 
         let response = self.egui_winit.on_window_event(&self.window, event);
-        if response.repaint {
+        // egui asks for a repaint on every mouse move. When it shows nothing, that would
+        // only present the movie's last frame again (and it gets the input with the next
+        // frame anyway).
+        let pointer_only = matches!(event, WindowEvent::CursorMoved { .. });
+        if response.repaint && (self.shows_ui || !pointer_only) {
             self.window.request_redraw();
         }
         response.consumed
@@ -439,6 +446,7 @@ impl GuiController {
             .egui_winit
             .egui_ctx()
             .tessellate(full_output.shapes, full_output.pixels_per_point);
+        self.shows_ui = !clipped_primitives.is_empty();
 
         let scale_factor = self.window.scale_factor() as f32;
         let screen_descriptor = egui_wgpu::ScreenDescriptor {

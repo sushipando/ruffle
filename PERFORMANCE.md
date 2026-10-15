@@ -880,6 +880,22 @@ Filters now leave invalid bounds alone. The new image test (a glowing square hol
 empty, blurred child) matches the AIR 51.3 runtime within 4 levels; without the fix the
 glow is missing.
 
+### 45. The movie isn't drawn again for repaints only the GUI asked for
+
+*Files: `desktop/src/app.rs` (`movie_dirty`), `desktop/src/gui/controller.rs` (`shows_ui`).*
+
+egui asks for a repaint on every mouse move, and every repaint drew the whole movie and
+presented it, on top of the frames scheduled by the movie (and by `--interpolate`). Moving
+the mouse could add a frame per display refresh, and the extra presents broke the even
+pacing of 40. Now:
+
+* A mouse move only asks for a repaint when egui showed something last time (the menu
+  bar, a context menu, a dialog); otherwise egui gets the input with the next frame.
+* The movie is only drawn when it may look different: a scheduled frame, the player's
+  `needs_render` (a new movie frame, `updateAfterEvent`, a button changing state), a
+  resize, or the window becoming visible again. Other repaints draw the GUI over the
+  movie's last frame. A paused movie is drawn on every repaint, as before.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

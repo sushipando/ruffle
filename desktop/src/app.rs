@@ -57,6 +57,10 @@ struct MainWindow {
     frame_start: Option<Instant>,
     /// The next frame to draw (counted from `frame_start`).
     next_subframe: u32,
+    /// Whether the movie must be drawn again for the next redraw, apart from when the player
+    /// says so (`Player::needs_render`). Other redraws (asked for by the GUI) only draw the
+    /// GUI over the movie's last frame.
+    movie_dirty: bool,
     event_loop_proxy: EventLoopProxy<RuffleEvent>,
 }
 
@@ -106,11 +110,14 @@ impl MainWindow {
             if !self.minimized && !self.occluded {
                 let start = Instant::now();
                 let mut player = self.player.get();
-                if let Some(ref mut player) = player {
+                if let Some(ref mut player) = player
+                    // Even if the movie is paused, user interaction with debug tools can change the render output
+                    && (self.movie_dirty || player.needs_render() || !player.is_playing())
+                {
+                    self.movie_dirty = false;
                     let fraction = self.render_fraction(player.frame_duration_seconds());
                     player.set_render_fraction(fraction);
                     self.pace_present(player.frame_duration_seconds());
-                    // Even if the movie is paused, user interaction with debug tools can change the render output
                     player.render();
                 }
 
@@ -147,6 +154,7 @@ impl MainWindow {
                         scale_factor: viewport_scale_factor,
                     });
                 }
+                self.movie_dirty = true;
                 self.gui.window().request_redraw();
                 if matches!(self.loaded, LoadingState::WaitingForResize) {
                     self.loaded = LoadingState::Loaded;
@@ -156,6 +164,7 @@ impl MainWindow {
                 self.occluded = occluded;
                 if !occluded {
                     // Nothing repaints us on its own if the movie is paused.
+                    self.movie_dirty = true;
                     self.gui.window().request_redraw();
                 }
             }
@@ -512,6 +521,7 @@ impl MainWindow {
                 self.adaptation.skipped += index - self.next_subframe;
             }
             self.next_subframe = index + 1;
+            self.movie_dirty = true;
             self.gui.window().request_redraw();
         }
         self.adapt_interpolation(now);
@@ -791,6 +801,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 adaptation: InterpolationAdaptation::new(),
                 frame_start: None,
                 next_subframe: 0,
+                movie_dirty: true,
                 event_loop_proxy,
             });
         }
