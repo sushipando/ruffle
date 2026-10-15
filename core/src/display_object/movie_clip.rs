@@ -206,6 +206,10 @@ pub struct MovieClipData<'gc> {
     #[collect(require_static)]
     queued_goto: Cell<Option<GotoInfo>>,
 
+    /// The `Stage::frame_epoch` in which this clip and everything below it were found to
+    /// have nothing to do in frame construction and frame scripts (see `settle`), or 0.
+    settled_epoch: Cell<u32>,
+
     current_frame: Cell<FrameNumber>,
 
     flags: Cell<MovieClipFlags>,
@@ -258,6 +262,7 @@ impl<'gc> MovieClipData<'gc> {
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
             queued_goto: Cell::new(None),
+            settled_epoch: Cell::new(0),
             drop_target: Lock::new(None),
             queued_tags: Default::default(),
             hit_area: Lock::new(None),
@@ -827,6 +832,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_has_pending_script(self, value: bool) {
+        if value {
+            self.unsettle();
+        }
         self.0.has_pending_script.set(value);
     }
 
@@ -835,7 +843,85 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_last_queued_script_frame(self, frame: Option<FrameNumber>) {
+        if frame.is_none() {
+            self.unsettle();
+        }
         self.0.last_queued_script_frame.set(frame);
+    }
+
+    /// Whether this clip is settled in the current frame: frame construction and frame
+    /// scripts have nothing to do for it and everything below it, so they skip it.
+    fn is_settled(self, context: &UpdateContext<'gc>) -> bool {
+        self.0.settled_epoch.get() == context.stage.frame_epoch()
+            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipSettled)
+    }
+
+    /// Something about this clip changed that frame construction or frame scripts may have
+    /// to act on (a goto, a change of its children, a frame script added or queued): it and
+    /// its ancestors aren't settled anymore. An ancestor of a settled clip can only be
+    /// settled if the clip is, so this stops at the first clip that isn't.
+    pub fn unsettle(self) {
+        let mut clip = Some(self);
+        while let Some(mc) = clip {
+            if mc.0.settled_epoch.replace(0) == 0 {
+                break;
+            }
+            clip = mc.parent().and_then(|parent| parent.as_movie_clip());
+        }
+    }
+
+    /// Marks this clip as settled in the current frame (see `is_settled`) if frame
+    /// construction and frame scripts would now do nothing for it and its children.
+    ///
+    /// Every goto (in SWF10+) runs frame construction and frame scripts for the whole
+    /// stage, and some content does that many times per frame. After the first time in a
+    /// frame, almost every clip has been constructed and has run its frame script, so most
+    /// of the walk does nothing. Settled marks only last for the current frame, and
+    /// `unsettle` removes them whenever that may change.
+    fn settle(self, context: &UpdateContext<'gc>) {
+        if !self.movie().is_action_script_3()
+            || self.0.object2.get().is_none()
+            || !self.0.initialized()
+            || self.frames_loaded() < self.header_frames() as i32
+            || self.is_executing_avm2_frame_script()
+            || self.0.loop_queued()
+            || self.0.queued_goto.get().is_some()
+        {
+            return;
+        }
+        // A frame script that `run_local_frame_scripts` would run: one that's pending, or
+        // that frame construction would make pending (`check_has_pending_script`), and
+        // that hasn't run for this frame yet.
+        let frame = self.0.queued_script_frame.get();
+        if (self.has_pending_script() || self.has_frame_script(self.current_frame()))
+            && self.last_queued_script_frame() != Some(frame)
+            && self.has_frame_script(frame)
+        {
+            return;
+        }
+        let epoch = context.stage.frame_epoch();
+        for child in self.iter_render_list() {
+            let settled = match child {
+                DisplayObject::MovieClip(mc) => mc.0.settled_epoch.get() == epoch,
+                // Their frame construction only constructs their AVM2 object, and they
+                // have no frame scripts or children.
+                DisplayObject::Graphic(_)
+                | DisplayObject::MorphShape(_)
+                | DisplayObject::Text(_)
+                | DisplayObject::EditText(_)
+                | DisplayObject::Video(_) => {
+                    !child.movie().is_action_script_3() || child.object2().is_some()
+                }
+                DisplayObject::Bitmap(_) => true,
+                // Buttons construct and run frame scripts for all their states, and
+                // other containers aren't tracked.
+                _ => false,
+            };
+            if !settled {
+                return;
+            }
+        }
+        self.0.settled_epoch.set(epoch);
     }
 
     pub fn set_programmatically_played(self) {
@@ -904,6 +990,7 @@ impl<'gc> MovieClip<'gc> {
     /// This is treated as an 'explicit' goto: frame scripts and other frame
     /// lifecycle events will be retriggered.
     pub fn goto_frame(self, context: &mut UpdateContext<'gc>, goto_info: GotoInfo) {
+        self.unsettle();
         // Clamp frame number in bounds.
         let goto_info = GotoInfo {
             frame: goto_info.frame.max(1),
@@ -1386,6 +1473,7 @@ impl<'gc> MovieClip<'gc> {
         run_sounds: bool,
         is_action_script_3: bool,
     ) {
+        self.unsettle();
         let shared = Gc::as_ref(self.0.shared.get());
 
         let next_frame = self.determine_next_frame();
@@ -1648,6 +1736,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn run_goto(mut self, context: &mut UpdateContext<'gc>, frame: FrameNumber, is_implicit: bool) {
+        self.unsettle();
         if cfg!(feature = "timeline_debug") {
             tracing::debug!(
                 "[{}]: {} from frame {} to frame {}",
@@ -2151,6 +2240,7 @@ impl<'gc> MovieClip<'gc> {
         callable: Option<Avm2Object<'gc>>,
         context: &mut UpdateContext<'gc>,
     ) {
+        self.unsettle();
         let current_frame = self.current_frame();
 
         let write = unlock!(Gc::write(context.gc(), self.0), MovieClipData, cell);
@@ -2590,6 +2680,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     /// Construct objects placed on this frame.
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        if self.is_settled(context) {
+            return;
+        }
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2654,11 +2747,15 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if self.is_settled(context) {
+            return;
+        }
         self.run_local_frame_scripts(context);
 
         for child in self.iter_render_list() {
             child.run_frame_scripts(context);
         }
+        self.settle(context);
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
@@ -2873,6 +2970,8 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
     }
 
     fn raw_container_mut(&self, mc: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
+        // Its children change.
+        self.unsettle();
         let write = unlock!(Gc::write(mc, self.0), MovieClipData, cell);
         RefMut::map(write.borrow_mut(), |r| &mut r.container)
     }

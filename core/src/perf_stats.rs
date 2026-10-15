@@ -14,6 +14,17 @@ pub fn enabled() -> bool {
     tessellation_stats::enabled()
 }
 
+static INNER_GOTO_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INNER_GOTOS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Adds the time a goto spent running frame construction and frame scripts for the whole
+/// stage (see `run_inner_goto_frame`).
+pub fn record_inner_goto(d: Duration) {
+    use std::sync::atomic::Ordering;
+    INNER_GOTO_NANOS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    INNER_GOTOS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Adds the time it took to register a shape for tessellation (parsing it, and
 /// tessellating it unless the renderer does that later) during the current render.
 pub fn record_tessellation(d: Duration) {
@@ -116,7 +127,7 @@ impl PerfStats {
         let busy_ms =
             self.run_frame.total_ms() + self.render.total_ms() + self.tick_other.total_ms();
         eprintln!(
-            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}% | gc objects {} orphans {} loaders {} | parsed shapes {}MB | tessellation {:.1}ms max {:.1}ms ({} shapes)",
+            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}% | gc objects {} orphans {} loaders {} | parsed shapes {}MB | tessellation {:.1}ms max {:.1}ms ({} shapes) | nested gotos {} {:.1}ms",
             self.run_frame.count as f64 / secs,
             self.run_frame.avg_ms(),
             self.run_frame.max_ms(),
@@ -135,6 +146,8 @@ impl PerfStats {
             self.tessellation.total_ms(),
             self.tessellation.max_ms(),
             self.tessellated_shapes,
+            INNER_GOTOS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            INNER_GOTO_NANOS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
         );
         self.window_start = Instant::now();
         self.run_frame = Bucket::default();

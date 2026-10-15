@@ -77,6 +77,7 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
         return;
     }
 
+    stage.next_frame_epoch();
     *context.frame_phase = FramePhase::Enter;
     OrphanManager::each_orphan_obj(context, |orphan, context| {
         orphan.enter_frame(context);
@@ -134,6 +135,7 @@ pub fn run_inner_goto_frame<'gc>(
         return;
     }
 
+    let start = crate::perf_stats::enabled().then(web_time::Instant::now);
     let stage = context.stage;
     let old_phase = *context.frame_phase;
 
@@ -171,6 +173,9 @@ pub fn run_inner_goto_frame<'gc>(
     context.orphan_manager.cleanup_dead_orphans(context.gc());
 
     *context.frame_phase = old_phase;
+    if let Some(start) = start {
+        crate::perf_stats::record_inner_goto(start.elapsed());
+    }
 }
 
 /// Broadcast a `enterFrame` event to all `DisplayObject`s.

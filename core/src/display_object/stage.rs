@@ -121,6 +121,9 @@ pub struct StageData<'gc> {
     /// The display state of the stage.
     display_state: Cell<StageDisplayState>,
 
+    /// Identifies the current frame for `MovieClip::settle` (never 0).
+    frame_epoch: Cell<u32>,
+
     /// The alignment of the stage.
     align: Cell<StageAlign>,
 
@@ -168,6 +171,7 @@ impl<'gc> Stage<'gc> {
                 stage_size: Cell::new((0, 0)),
                 scale_mode: Default::default(),
                 forced_scale_mode: Cell::new(false),
+                frame_epoch: Cell::new(1),
                 display_state: Cell::new(if fullscreen {
                     StageDisplayState::FullScreen
                 } else {
@@ -308,6 +312,17 @@ impl<'gc> Stage<'gc> {
     /// Used by AVM1 `stage.width`/`height` and AVM2 `Stage.stageWidth`/`stageHeight` properties.
     /// If `scale_mode` is `StageScaleMode::NO_SCALE`, this returns the size of the viewport.
     /// Otherwise, this returns the size of the SWF file.
+    /// Identifies the current frame for `MovieClip::settle`.
+    pub fn frame_epoch(self) -> u32 {
+        self.0.frame_epoch.get()
+    }
+
+    /// Starts a new frame for `MovieClip::settle`: no clip is settled in it yet.
+    pub fn next_frame_epoch(self) {
+        let next = self.0.frame_epoch.get().wrapping_add(1).max(1);
+        self.0.frame_epoch.set(next);
+    }
+
     pub fn stage_size(self) -> (u32, u32) {
         self.0.stage_size.get()
     }

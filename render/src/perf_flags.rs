@@ -75,9 +75,12 @@ pub enum PerfFlag {
     /// Tessellate the shapes registered for a frame together, on several threads, before
     /// the frame is drawn (see `Mesh` in the wgpu backend).
     ParallelTessellation,
+    /// Skip movie clips with nothing to do when a goto runs frame construction and frame
+    /// scripts for the whole stage (see `MovieClip::settle` in core).
+    SkipSettled,
 }
 
-const NAMES: [&str; 27] = [
+const NAMES: [&str; 28] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -105,9 +108,10 @@ const NAMES: [&str; 27] = [
     "evict-meshes",
     "paced-present",
     "parallel-tessellation",
+    "skip-settled",
 ];
 
-static FLAGS: [AtomicBool; 27] = [
+static FLAGS: [AtomicBool; 28] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -135,6 +139,7 @@ static FLAGS: [AtomicBool; 27] = [
     AtomicBool::new(true),  // evict-meshes
     AtomicBool::new(true),  // paced-present
     AtomicBool::new(true),  // parallel-tessellation
+    AtomicBool::new(true),  // skip-settled
 ];
 
 #[inline]

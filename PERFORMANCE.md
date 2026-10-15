@@ -962,6 +962,56 @@ of the rest is registering the shapes on the main thread while the frame's comma
 built (~14 ms in the worst render): parsing them (37) and converting them to paths. On the
 web, everything stays on one thread.
 
+### 48. Gotos skip the clips that have nothing to do
+
+*Files: `core/src/display_object/movie_clip.rs` (`settle`, `unsettle`, `is_settled`),
+`core/src/display_object/stage.rs` (`frame_epoch`), `core/src/frame_lifecycle.rs`. Flag:
+`skip-settled`.*
+
+In SWF10+, every `gotoAndStop`/`gotoAndPlay` runs frame construction and frame scripts for
+the whole stage and all orphans (`run_inner_goto_frame`), as Flash does. Content that
+switches the frames of its animations from `enterFrame` handlers does that many times
+per frame: in a small scene with a few animated objects, 220-320 gotos per second
+(10-13 per frame) took half of the frame logic time (`nested gotos` on the `[perf]` line).
+After the first walk in a frame, nearly every clip has been constructed and has run its
+frame script, so the walks find nothing to do almost everywhere.
+
+At the end of its frame scripts walk, a movie clip is now marked as settled for the
+current frame if frame construction and frame scripts would do nothing for it and
+everything below it:
+
+* it's an AS3 clip, constructed, initialized and fully loaded, not running its frame
+  script, with no queued goto or loop;
+* it has no frame script that would run: one that's pending, or that frame construction
+  would make pending, and that hasn't run for this frame;
+* each child is a settled clip, or a shape, text field, static text, video or bitmap
+  whose AVM2 object is constructed (their frame construction only constructs it). Buttons
+  construct and run frame scripts for all of their states, so they (and other containers)
+  keep their ancestors from settling.
+
+`construct_frame` and `run_frame_scripts` skip settled clips. The marks only last until
+the next frame starts (`Stage::next_frame_epoch`), and anything that could give a
+settled clip work again removes its mark and its ancestors' (`unsettle`): a goto (or a
+queued one), the timeline running, a change of its children (`raw_container_mut`), a frame
+script being registered or queued. An ancestor of a settled clip can only be settled if
+the clip is, so `unsettle` stops at the first clip that isn't.
+
+The first version only looked at `has_pending_script`, and
+`timeline/frame_script_cleanup_goto2` caught it: a frame script registered during the
+frame scripts phase isn't pending yet, but the next goto's frame construction makes it so
+and runs it.
+
+The same scene, switching the flag every 10 seconds:
+
+| | Off | On |
+|---|---|---|
+| Frame logic | 6.96-7.71 ms | 4.44-4.68 ms |
+| Per nested goto | 0.41-0.45 ms | 0.14-0.15 ms |
+| Nested gotos | 112-123 ms/s | 37-40 ms/s |
+
+Each goto costs more in a scene with more objects (1.4 ms in a crowded scene without the
+change), so larger scenes should gain more.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
@@ -1253,9 +1303,10 @@ Prints once a second to stderr:
 
 The `[perf]` line also shows the GC heap size (`gc objects`), the number of AVM2
 orphan display objects (`orphans`), the number of loaders in the
-`LoadManager` (`loaders`), and the time the rendering thread spent on shapes drawn for
+`LoadManager` (`loaders`), the time the rendering thread spent on shapes drawn for
 the first time at their scale (`tessellation`: in total, in the worst render, and how
-many shapes; see 47).
+many shapes; see 47), and how many gotos ran frame construction and frame scripts for the
+whole stage, and how long that took (`nested gotos`; see 48).
 
 ### GPU time per pass type
 
