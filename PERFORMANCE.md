@@ -44,12 +44,16 @@ between sessions, so the columns compare similar scenes, not the same ones.
 ## Running
 
 ```sh
-cargo build --release -p ruffle_desktop
-./target/release/ruffle_desktop --tcp-connections allow --fullscreen \
+cargo build --profile dist -p ruffle_desktop
+./target/dist/ruffle_desktop --tcp-connections allow --fullscreen \
     <movie URL>
 ```
 
 Movies that use sockets need `--tcp-connections allow`.
+
+The `dist` profile is Ruffle's release profile with full link-time optimization and one
+codegen unit. On an M1 it builds in about 7 minutes after any change (`--release`: about
+1), and the result is a few percent faster (see 46). `--release` works too.
 
 ## Why it was slow
 
@@ -895,6 +899,28 @@ pacing of 40. Now:
   `needs_render` (a new movie frame, `updateAfterEvent`, a button changing state), a
   resize, or the window becoming visible again. Other repaints draw the GUI over the
   movie's last frame. A paused movie is drawn on every repaint, as before.
+
+### 46. Full link-time optimization (`--profile dist`)
+
+*File: `Cargo.toml` (the `dist` profile, unchanged).*
+
+Ruffle's `release` profile has no link-time optimization and 16 codegen units; its `dist`
+profile (the same, with `lto = true` and `codegen-units = 1`) lets the compiler inline and
+optimize across crates. A fixed benchmark movie, three runs of each build alternating, on
+an M1 with the movie at 960x550:
+
+| | `--release` | `--profile dist` |
+|---|---|---|
+| ActionScript work (median of 15) | 105-107 ms | 102-106 ms |
+| Creating and removing 300 library clips (median of 15) | 119-121 ms | 115-117 ms |
+| Frame logic, 15 animated clips with filters and blends | 0.68-0.71 ms | 0.63-0.68 ms |
+| Render (main thread), same scene | 13.9-14.1 ms | 13.5-13.9 ms |
+
+That's 2-6% less CPU time, in every pair of runs. Most of the render time is spent in the
+graphics driver, which link-time optimization doesn't reach. The binary is also smaller
+(24.6 MB instead of 29.7 MB). The cost is build time: about 7 minutes after any change,
+instead of about 1 for an incremental `--release` build. The tests still build with
+`--release`.
 
 ## Memory: long sessions
 
