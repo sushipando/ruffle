@@ -379,8 +379,8 @@ impl<'encoder> CommandRenderer<'encoder> {
 
             self.draw(
                 render_pass,
-                mesh.vertex_buffer.slice(draw.vertices.clone()),
-                mesh.index_buffer.slice(draw.indices.clone()),
+                mesh.buffer.slice(draw.vertices.clone()),
+                mesh.buffer.slice(draw.indices.clone()),
                 num_indices,
                 instance_index,
             );

@@ -482,3 +482,36 @@ impl StrokeVertexConstructor<Vertex> for RuffleVertexCtor {
         }
     }
 }
+
+/// The time spent tessellating shapes on the thread rendering the frame (including
+/// waiting for other threads), for `RUFFLE_PERF` in core.
+pub mod stats {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static NANOS: AtomicU64 = AtomicU64::new(0);
+    static SHAPES: AtomicU32 = AtomicU32::new(0);
+
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Adds time spent on tessellation, and the number of shapes it was for.
+    pub fn record(time: Duration, shapes: u32) {
+        NANOS.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
+        SHAPES.fetch_add(shapes, Ordering::Relaxed);
+    }
+
+    /// Takes the time and number of shapes recorded since the last call.
+    pub fn take() -> (Duration, u32) {
+        (
+            Duration::from_nanos(NANOS.swap(0, Ordering::Relaxed)),
+            SHAPES.swap(0, Ordering::Relaxed),
+        )
+    }
+}

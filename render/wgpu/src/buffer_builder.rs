@@ -72,6 +72,10 @@ impl BufferBuilder {
         })
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.inner
     }

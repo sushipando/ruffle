@@ -5,8 +5,20 @@
 //! running frames (scripts + timeline), rendering, and in the rest of `tick`
 //! (timers, sockets, streams).
 
+use ruffle_render::tessellator::stats as tessellation_stats;
 use std::time::Duration;
 use web_time::Instant;
+
+/// Whether `RUFFLE_PERF` statistics are being collected.
+pub fn enabled() -> bool {
+    tessellation_stats::enabled()
+}
+
+/// Adds the time it took to register a shape for tessellation (parsing it, and
+/// tessellating it unless the renderer does that later) during the current render.
+pub fn record_tessellation(d: Duration) {
+    tessellation_stats::record(d, 1);
+}
 
 #[derive(Default)]
 struct Bucket {
@@ -48,19 +60,27 @@ pub struct PerfStats {
     gc_objects: usize,
     orphans: usize,
     loaders: usize,
+    /// Time spent tessellating shapes, per render.
+    tessellation: Bucket,
+    tessellated_shapes: u32,
 }
 
 impl PerfStats {
     /// Returns `Some` if perf logging was requested through `RUFFLE_PERF`.
     pub fn from_env() -> Option<Self> {
-        std::env::var_os("RUFFLE_PERF").map(|_| Self {
-            window_start: Instant::now(),
-            run_frame: Bucket::default(),
-            render: Bucket::default(),
-            tick_other: Bucket::default(),
-            gc_objects: 0,
-            orphans: 0,
-            loaders: 0,
+        std::env::var_os("RUFFLE_PERF").map(|_| {
+            tessellation_stats::enable();
+            Self {
+                window_start: Instant::now(),
+                run_frame: Bucket::default(),
+                render: Bucket::default(),
+                tick_other: Bucket::default(),
+                gc_objects: 0,
+                orphans: 0,
+                loaders: 0,
+                tessellation: Bucket::default(),
+                tessellated_shapes: 0,
+            }
         })
     }
 
@@ -76,6 +96,9 @@ impl PerfStats {
 
     pub fn record_render(&mut self, d: Duration) {
         self.render.add(d);
+        let (tessellation, shapes) = tessellation_stats::take();
+        self.tessellation.add(tessellation);
+        self.tessellated_shapes += shapes;
         self.maybe_report();
     }
 
@@ -93,7 +116,7 @@ impl PerfStats {
         let busy_ms =
             self.run_frame.total_ms() + self.render.total_ms() + self.tick_other.total_ms();
         eprintln!(
-            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}% | gc objects {} orphans {} loaders {} | parsed shapes {}MB",
+            "[perf] fps {:5.1} | frame avg {:6.2}ms max {:6.2}ms | render {:5.1}/s avg {:6.2}ms max {:6.2}ms | tick-other avg {:5.2}ms max {:6.2}ms | busy {:4.0}% | gc objects {} orphans {} loaders {} | parsed shapes {}MB | tessellation {:.1}ms max {:.1}ms ({} shapes)",
             self.run_frame.count as f64 / secs,
             self.run_frame.avg_ms(),
             self.run_frame.max_ms(),
@@ -109,10 +132,15 @@ impl PerfStats {
             crate::display_object::graphic::PARSED_SHAPE_BYTES
                 .load(std::sync::atomic::Ordering::Relaxed)
                 / 1_000_000,
+            self.tessellation.total_ms(),
+            self.tessellation.max_ms(),
+            self.tessellated_shapes,
         );
         self.window_start = Instant::now();
         self.run_frame = Bucket::default();
         self.render = Bucket::default();
         self.tick_other = Bucket::default();
+        self.tessellation = Bucket::default();
+        self.tessellated_shapes = 0;
     }
 }

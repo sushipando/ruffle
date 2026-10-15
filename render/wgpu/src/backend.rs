@@ -1,9 +1,8 @@
-use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::{BufferPool, TexturePool};
 use crate::context3d::WgpuContext3D;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::FilterSource;
-use crate::mesh::{CommonGradient, Mesh, PendingDraw};
+use crate::mesh::{Mesh, PendingShape, tessellate_all};
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::target::CommandTarget;
 use crate::surface::{LayerRef, Surface};
@@ -18,7 +17,7 @@ use image::imageops::FilterType;
 use ruffle_render::backend::{
     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
 };
-use ruffle_render::backend::{RenderBackend, ShapeHandle, ViewportDimensions};
+use ruffle_render::backend::{RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions};
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
 };
@@ -79,6 +78,8 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     region_surface: Option<((i32, i32, u32, u32), Surface)>,
     meshes: Vec<Mesh>,
     shape_tessellator: ShapeTessellator,
+    /// Shapes registered since the last frame, still to be tessellated (see `Mesh`).
+    pending_shapes: Vec<std::sync::Weak<dyn ShapeHandleImpl>>,
     // This is currently unused - we just store it to report in
     // `get_viewport_dimensions`
     viewport_scale_factor: f64,
@@ -278,6 +279,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             region_surface: None,
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
+            pending_shapes: Vec::new(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
             offscreen_texture_pool: TexturePool::new(),
@@ -292,75 +294,50 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
         scale: f32,
-    ) -> Mesh {
-        let shape_id = shape.id;
-        let lyon_mesh =
-            self.shape_tessellator
-                .tessellate_shape_with_scale(shape, bitmap_source, scale);
-
-        let mut draws = Vec::with_capacity(lyon_mesh.draws.len());
-        let mut uniform_buffer = BufferBuilder::new(
-            &self.descriptors.limits,
-            self.descriptors.limits.min_uniform_buffer_offset_alignment,
-        );
-        let mut vertex_buffer = BufferBuilder::new(&self.descriptors.limits, 0);
-        let mut index_buffer = BufferBuilder::new(&self.descriptors.limits, 0);
-        let mut gradients = Vec::with_capacity(lyon_mesh.gradients.len());
-
-        for gradient in lyon_mesh.gradients {
-            gradients.push(CommonGradient::new(
-                &self.descriptors,
-                gradient,
-                &mut uniform_buffer,
-            ));
+    ) -> ShapeHandle {
+        let pending =
+            PendingShape::new(self.descriptors.clone(), shape, bitmap_source, self, scale);
+        if ruffle_render::perf_flags::enabled(
+            ruffle_render::perf_flags::PerfFlag::ParallelTessellation,
+        ) {
+            let handle = ShapeHandle(Arc::new(Mesh::pending(pending)));
+            self.pending_shapes.push(Arc::downgrade(&handle.0));
+            return handle;
         }
+        let PendingShape { job, finish } = pending;
+        let mesh = job.tessellate(&mut self.shape_tessellator);
+        ShapeHandle(Arc::new(Mesh::ready(finish.build(mesh))))
+    }
 
-        let mut bounds: Option<(f32, f32, f32, f32)> = None;
-        for vertex in lyon_mesh.draws.iter().flat_map(|draw| &draw.vertices) {
-            let (x, y) = (vertex.x, vertex.y);
-            bounds = Some(match bounds {
-                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                None => (x, y, x, y),
-            });
+    /// Tessellates the shapes registered since the last frame (see `Mesh`), on several
+    /// threads when there are enough of them.
+    fn finish_pending_shapes(&mut self) {
+        if self.pending_shapes.is_empty() {
+            return;
         }
-
-        for draw in lyon_mesh.draws {
-            let draw_id = draws.len();
-            if let Some(draw) = PendingDraw::new(
-                self,
-                bitmap_source,
-                draw,
-                shape_id,
-                draw_id,
-                &mut vertex_buffer,
-                &mut index_buffer,
-            ) {
-                draws.push(draw);
+        let start = ruffle_render::tessellator::stats::enabled().then(std::time::Instant::now);
+        let handles: Vec<_> = self
+            .pending_shapes
+            .drain(..)
+            .filter_map(|shape| shape.upgrade())
+            .collect();
+        let mut meshes = Vec::with_capacity(handles.len());
+        let mut jobs = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            let mesh: &Mesh =
+                <dyn Any>::downcast_ref(&**handle).expect("Shape handle must be a WGPU ShapeData");
+            if let Some(PendingShape { job, finish }) = mesh.take_pending() {
+                meshes.push((mesh, finish));
+                jobs.push(job);
             }
         }
-
-        let uniform_buffer = uniform_buffer.finish(
-            &self.descriptors.device,
-            create_debug_label!("Shape {} uniforms", shape_id),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        let vertex_buffer = vertex_buffer.finish(
-            &self.descriptors.device,
-            create_debug_label!("Shape {} vertices", shape_id),
-            wgpu::BufferUsages::VERTEX,
-        );
-        let index_buffer = index_buffer.finish(
-            &self.descriptors.device,
-            create_debug_label!("Shape {} indices", shape_id),
-            wgpu::BufferUsages::INDEX,
-        );
-
-        let draws = draws
-            .into_iter()
-            .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
-            .collect();
-
-        Mesh::new(draws, vertex_buffer, index_buffer, bounds)
+        let tessellated = tessellate_all(jobs, &mut self.shape_tessellator);
+        for ((mesh, finish), tessellated) in meshes.into_iter().zip(tessellated) {
+            mesh.set_tessellated(finish, tessellated);
+        }
+        if let Some(start) = start {
+            ruffle_render::tessellator::stats::record(start.elapsed(), 0);
+        }
     }
 
     fn clamp_bitmap(&self, bitmap: &mut Bitmap) -> bool {
@@ -560,8 +537,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
     ) -> ShapeHandle {
-        let mesh = self.register_shape_internal(shape, bitmap_source, 1.0);
-        ShapeHandle(Arc::new(mesh))
+        self.register_shape_internal(shape, bitmap_source, 1.0)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -571,8 +547,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         bitmap_source: &dyn BitmapSource,
         scale: f32,
     ) -> ShapeHandle {
-        let mesh = self.register_shape_internal(shape, bitmap_source, scale);
-        ShapeHandle(Arc::new(mesh))
+        self.register_shape_internal(shape, bitmap_source, scale)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -582,6 +557,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
+        self.finish_pending_shapes();
         let mut cache_entries = cache_entries;
         if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipCacheFilters)
         {
@@ -1130,6 +1106,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         quality: StageQuality,
         bounds: PixelRegion,
     ) -> Option<Box<dyn SyncHandle>> {
+        self.finish_pending_shapes();
         let texture = as_texture(&handle);
 
         let extent = wgpu::Extent3d {

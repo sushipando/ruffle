@@ -159,6 +159,7 @@ impl<'gc> Graphic<'gc> {
         }
 
         // Tessellate at the current scale
+        let start = crate::perf_stats::enabled().then(web_time::Instant::now);
         let library = context
             .library
             .library_for_movie(shared.movie)
@@ -172,6 +173,9 @@ impl<'gc> Graphic<'gc> {
         // Not needed until the next tessellation (or hit test).
         drop(shape);
         shared.shape.release();
+        if let Some(start) = start {
+            crate::perf_stats::record_tessellation(start.elapsed());
+        }
 
         {
             let mut cache = shared.scaled_handle.borrow_mut();

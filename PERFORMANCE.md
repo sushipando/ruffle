@@ -922,6 +922,46 @@ graphics driver, which link-time optimization doesn't reach. The binary is also 
 instead of about 1 for an incremental `--release` build. The tests still build with
 `--release`.
 
+### 47. New shapes are tessellated on several threads
+
+*Files: `render/wgpu/src/mesh.rs` (`Mesh`, `PendingShape`, `tessellate_all`, `build_mesh`),
+`render/wgpu/src/backend.rs` (`register_shape_internal`, `finish_pending_shapes`),
+`render/src/tessellator.rs` (`stats`), `core/src/perf_stats.rs`. Flag:
+`parallel-tessellation`.*
+
+A shape is tessellated when it's first drawn at a scale (37). When a lot of new content
+appears at once, that's hundreds of shapes in one render, all on the main thread. With the
+new `tessellation` numbers on the `[perf]` line, the worst render of a scene change was
+almost all tessellation: 62 ms, 54 of them for ~500 shapes (a frame lasts 41.7 ms at
+24 fps).
+
+Now registering a shape only copies what tessellating it needs (its paths and styles, the
+sizes of the bitmaps it fills with) into a `TessellationJob`, looks up its bitmaps' handles,
+and returns a pending `Mesh`. Before a frame is drawn (`submit_frame`,
+`render_offscreen`), all pending shapes are tessellated at once, on up to one thread per
+core (at least two shapes each), and their buffers and bind groups are then built on the
+rendering thread (texture bind groups aren't thread-safe). Anything that needs a pending
+mesh earlier tessellates it on the spot, so the meshes and the results are the same either
+way.
+
+What was left was mostly creating buffers: every shape had a vertex, an index and a uniform
+buffer, even without gradients (the only users of the uniforms). Now a shape's vertices
+and indices share one buffer, and the uniform buffer only exists with gradients, so most
+shapes create one buffer instead of three.
+
+Worst render while the content changes (scenes differ between runs):
+
+| | Before | Parallel | Parallel, one buffer |
+|---|---|---|---|
+| Arriving in a heavy scene | 62.0 ms | 37.9 ms | 33.8 ms |
+| Changing to a heavy scene | 57.8 ms | 38.3 ms | 32.1 ms |
+| Building ~1,100 tessellated shapes | (inline) | 20-22 ms | 8.4-8.7 ms |
+
+The parallel tessellation itself takes 2-7 ms for 500-1,100 shapes on an M1 (8 cores). Most
+of the rest is registering the shapes on the main thread while the frame's commands are
+built (~14 ms in the worst render): parsing them (37) and converting them to paths. On the
+web, everything stays on one thread.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
@@ -1212,8 +1252,10 @@ Prints once a second to stderr:
   time per command buffer (patched wgpu-hal).
 
 The `[perf]` line also shows the GC heap size (`gc objects`), the number of AVM2
-orphan display objects (`orphans`), and the number of loaders in the
-`LoadManager` (`loaders`).
+orphan display objects (`orphans`), the number of loaders in the
+`LoadManager` (`loaders`), and the time the rendering thread spent on shapes drawn for
+the first time at their scale (`tessellation`: in total, in the worst render, and how
+many shapes; see 47).
 
 ### GPU time per pass type
 

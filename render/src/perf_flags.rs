@@ -72,9 +72,12 @@ pub enum PerfFlag {
     /// Present frames so that each stays on screen for a whole number of display refreshes
     /// (desktop, see `MainWindow::pace_present` there).
     PacedPresent,
+    /// Tessellate the shapes registered for a frame together, on several threads, before
+    /// the frame is drawn (see `Mesh` in the wgpu backend).
+    ParallelTessellation,
 }
 
-const NAMES: [&str; 26] = [
+const NAMES: [&str; 27] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -101,9 +104,10 @@ const NAMES: [&str; 26] = [
     "release-shapes",
     "evict-meshes",
     "paced-present",
+    "parallel-tessellation",
 ];
 
-static FLAGS: [AtomicBool; 26] = [
+static FLAGS: [AtomicBool; 27] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -130,6 +134,7 @@ static FLAGS: [AtomicBool; 26] = [
     AtomicBool::new(true),  // release-shapes
     AtomicBool::new(true),  // evict-meshes
     AtomicBool::new(true),  // paced-present
+    AtomicBool::new(true),  // parallel-tessellation
 ];
 
 #[inline]
