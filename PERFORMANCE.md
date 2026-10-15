@@ -1039,6 +1039,35 @@ field inside such a container couldn't be selected by dragging. The player now p
 every mouse move to the pressed text field directly, which also uses the mouse position
 after the move (the broadcast saw the previous one).
 
+### 51. 9-slice scaling (`scale9Grid`)
+
+*Files: `core/src/display_object/scale9.rs`, `graphic.rs` and `movie_clip.rs` (`render_self`),
+`core/src/drawing.rs` (`render_sliced`); tests `visual/scale9grid`,
+`visual/scale9grid_timeline`.*
+
+Ruffle stored a sprite's scaling grid (the `DefineScalingGrid` tag or `scale9Grid`) but
+drew everything scaled normally, so stretched panels, input fields and scrollbar thumbs had
+stretched corners and thick or thin borders. In the AIR 51.3 runtime:
+
+- A sprite's own drawing and the shapes directly inside it are sliced; nested sprites,
+  text and bitmaps are scaled normally. A shape with its own grid is sliced too.
+- Only the object's own scale counts: it isn't sliced when it's rotated or skewed, or
+  when it's unscaled inside a scaled parent. When it's scaled inside a scaled or rotated
+  parent, it's sliced by its own scale and then drawn with the parent's transform.
+- Each point (curve control points too) moves on its own, per axis: left of the grid it
+  keeps its distance to the scaled left edge of the object's bounds (without strokes),
+  right of it to the scaled right edge, and inside it's spread evenly between the two.
+  Line widths keep their size.
+- A gradient or bitmap fill is stretched from the bounds of its path to the bounds of the
+  sliced path, so a fill in a corner keeps its size and one in the center fills the
+  stretched center (this is how a bitmap cut into nine pieces stretches without
+  distorting its corners).
+- Hit tests and bounds still use the shapes scaled normally.
+
+The sliced shape is tessellated on its own and kept, one per shape, until the object's
+scale, grid or bounds change (a sliced shape that's being resized is tessellated each
+frame).
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

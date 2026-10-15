@@ -22,6 +22,7 @@ use crate::display_object::container::{ChildContainer, dispatch_removed_event};
 use crate::display_object::interactive::{
     InteractiveObject, InteractiveObjectBase, TInteractiveObject,
 };
+use crate::display_object::scale9::Slicing;
 use crate::display_object::{
     Avm1Button, Avm1TextFieldBinding, Avm2Button, BoundsMode, DisplayObjectBase, DisplayObjectPtr,
     EditText, Graphic, MorphShape, Text, Video,
@@ -46,7 +47,9 @@ use gc_arena::lock::{Lock, RefLock};
 use gc_arena::{Collect, DynamicRoot, Gc, GcWeak, Mutation, Rootable};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_macros::istr;
+use ruffle_render::matrix::Matrix;
 use ruffle_render::perspective_projection::PerspectiveProjection;
+use ruffle_render::transform::Transform;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
@@ -2760,7 +2763,16 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
         if let Some(drawing) = self.drawing() {
-            drawing.render(context);
+            if let Some(slicing) = Slicing::of(self.into()) {
+                let world = context.transform_stack.transform();
+                let transform = Transform {
+                    matrix: slicing.draw_matrix(&world.matrix),
+                    ..world
+                };
+                drawing.render_sliced(context, slicing, Matrix::IDENTITY, transform);
+            } else {
+                drawing.render(context);
+            }
         }
         self.render_children(context);
     }

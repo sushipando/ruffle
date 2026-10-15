@@ -4,6 +4,7 @@ use crate::avm2::{
     StageObject as Avm2StageObject,
 };
 use crate::context::{RenderContext, UpdateContext};
+use crate::display_object::scale9::{SliceCache, Slicing, tessellation_scale};
 use crate::display_object::{BoundsMode, DisplayObjectBase};
 use crate::drawing::Drawing;
 use crate::library::MovieLibrarySource;
@@ -18,6 +19,7 @@ use gc_arena::{Collect, Gc, Mutation};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
+use ruffle_render::transform::Transform;
 use std::cell::{OnceCell, RefCell, RefMut};
 use std::ops::Range;
 use std::rc::Rc;
@@ -45,9 +47,52 @@ pub struct GraphicData<'gc> {
     /// This is lazily allocated on demand, to make `GraphicData` smaller in the common case.
     #[collect(require_static)]
     drawing: OnceCell<Box<RefCell<Drawing>>>,
+    /// The last 9-slice scaled tessellation of the shape (see `scale9`).
+    #[collect(require_static)]
+    sliced: RefCell<SliceCache>,
 }
 
 impl<'gc> Graphic<'gc> {
+    /// Renders this shape with 9-slice scaling: `matrix` is how it's placed in the object
+    /// with the scaling grid, and `transform` is what to draw the sliced shape with.
+    fn render_sliced(
+        self,
+        context: &mut RenderContext<'_, 'gc>,
+        slicing: Slicing,
+        matrix: Matrix,
+        transform: Transform,
+    ) {
+        if let Some(drawing) = self.0.drawing.get() {
+            drawing
+                .borrow()
+                .render_sliced(context, slicing, matrix, transform);
+        } else if !self.0.shared.get().is_empty {
+            let scale = tessellation_scale(&transform.matrix);
+            let handle = self
+                .0
+                .sliced
+                .borrow_mut()
+                .get_or_insert(slicing, matrix, scale, || {
+                    let shared = self.0.shared.get();
+                    let library = context
+                        .library
+                        .library_for_movie(shared.movie)
+                        .expect("Graphic's movie has a library");
+                    let shape = shared.shape.get(shared.movie);
+                    let sliced = slicing.slice((&*shape).into(), &matrix);
+                    let handle = context.renderer.register_shape_with_scale(
+                        sliced.distilled(),
+                        &MovieLibrarySource { library },
+                        scale,
+                    );
+                    drop(shape);
+                    shared.shape.release();
+                    handle
+                });
+            context.commands.render_shape(handle, transform);
+        }
+    }
+
     /// Construct a `Graphic` from it's associated `Shape` tag.
     ///
     /// `source` is where the tag's body is in the movie's data, so that the shape can be
@@ -79,6 +124,7 @@ impl<'gc> Graphic<'gc> {
                 class: Lock::new(None),
                 avm2_object: Lock::new(None),
                 drawing: OnceCell::new(),
+                sliced: Default::default(),
             },
         ))
     }
@@ -117,6 +163,7 @@ impl<'gc> Graphic<'gc> {
                 class: Lock::new(None),
                 avm2_object: Lock::new(None),
                 drawing: OnceCell::new(),
+                sliced: Default::default(),
             },
         ))
     }
@@ -135,6 +182,7 @@ impl<'gc> Graphic<'gc> {
 
     fn set_shared(self, mc: &Mutation<'gc>, shared: Gc<'gc, GraphicShared<'gc>>) {
         unlock!(Gc::write(mc, self.0), GraphicData, shared).set(shared);
+        self.0.sliced.borrow_mut().clear();
     }
 
     /// Returns the best shape handle for the current scale, tessellating if necessary.
@@ -278,6 +326,31 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
                 .intersects(&context.stage.view_bounds())
         {
             // Off-screen; culled
+            return;
+        }
+
+        if let Some(slicing) = Slicing::of(self.into()) {
+            let world = context.transform_stack.transform();
+            let transform = Transform {
+                matrix: slicing.draw_matrix(&world.matrix),
+                ..world
+            };
+            self.render_sliced(context, slicing, Matrix::IDENTITY, transform);
+            return;
+        }
+        if let Some(clip) = self
+            .parent()
+            .filter(|parent| parent.as_movie_clip().is_some())
+            && let Some(slicing) = Slicing::of(clip)
+            && let matrix = self.base().matrix()
+            && let Some(inverse) = matrix.inverse()
+        {
+            let world = context.transform_stack.transform();
+            let transform = Transform {
+                matrix: slicing.draw_matrix(&(world.matrix * inverse)),
+                ..world
+            };
+            self.render_sliced(context, slicing, matrix, transform);
             return;
         }
 

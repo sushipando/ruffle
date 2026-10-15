@@ -38,6 +38,7 @@ pub mod interpolation;
 mod loader_display;
 mod morph_shape;
 mod movie_clip;
+pub mod scale9;
 mod stage;
 mod text;
 mod text_line;

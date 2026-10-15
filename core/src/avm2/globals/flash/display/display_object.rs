@@ -127,7 +127,6 @@ pub fn get_scale9grid<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    avm2_stub_getter!(activation, "flash.display.DisplayObject", "scale9Grid");
     if let Some(dobj) = this.as_display_object() {
         let rect = dobj.scaling_grid();
         return if rect.is_valid() {
@@ -148,8 +147,11 @@ pub fn set_scale9grid<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    avm2_stub_setter!(activation, "flash.display.DisplayObject", "scale9Grid");
     if let Some(dobj) = this.as_display_object() {
+        // Only sprites and shapes draw with their grid.
+        if !matches!(dobj, DisplayObject::MovieClip(_) | DisplayObject::Graphic(_)) {
+            avm2_stub_setter!(activation, "flash.display.DisplayObject", "scale9Grid");
+        }
         let rect = match args.try_get_object(0) {
             None => Rectangle::default(),
             Some(rect) => object_to_rectangle(rect),

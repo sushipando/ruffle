@@ -1,0 +1,12 @@
+num_frames = 1
+
+# A sprite with a DefineScalingGrid tag and a shape from the library, placed stretched,
+# unscaled, rotated and stretched sideways.
+# output.expected.png is from the AIR 51.3 runtime (its window, with the stage at 2x).
+[image_comparisons.output]
+tolerance = 16
+max_outliers = 6000
+
+[player_options]
+with_renderer = { optional = false, quality = "high" }
+viewport_dimensions = { width = 800, height = 600, scale_factor = 1.0 }
