@@ -558,9 +558,7 @@ impl MainWindow {
                 adaptation.raised = false;
                 adaptation.clean_windows = 0;
                 self.interpolate = lower;
-                if std::env::var_os("RUFFLE_PERF").is_some() {
-                    eprintln!("[interpolate] {lower} frames per movie frame (couldn't keep up)");
-                }
+                tracing::info!("[interpolate] {lower} frames per movie frame (couldn't keep up)");
             }
         } else if skipped == 0 {
             adaptation.clean_windows += 1;
@@ -570,13 +568,11 @@ impl MainWindow {
             {
                 adaptation.raised = true;
                 adaptation.clean_windows = 0;
-                if std::env::var_os("RUFFLE_PERF").is_some() {
-                    eprintln!(
-                        "[interpolate] {higher} frames per movie frame (load {:.0}% at {})",
-                        load * 100.0,
-                        self.interpolate
-                    );
-                }
+                tracing::info!(
+                    "[interpolate] {higher} frames per movie frame (load {:.0}% at {})",
+                    load * 100.0,
+                    self.interpolate
+                );
                 self.interpolate = higher;
             } else if adaptation.raised && adaptation.clean_windows >= 3 {
                 // The last raise worked.

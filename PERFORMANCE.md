@@ -819,7 +819,9 @@ again after a while if the GPU and main thread look like they have time for it: 
 busier of the two (GPU time measured from Metal command buffers' start and end times,
 main-thread time from ticking and drawing), scaled by the higher number over the current
 one, must be at most 80%. Without that check, it kept trying 6 in heavy scenes and
-dropping back, with uneven frames each time. `RUFFLE_FIXED_INTERPOLATION` turns the adapting off (for measuring).
+dropping back, with uneven frames each time. Each change is logged (at `info` level,
+shown by default), such as `[interpolate] 3 frames per movie frame (couldn't keep up)`.
+`RUFFLE_FIXED_INTERPOLATION` turns the adapting off (for measuring).
 
 The batched filters (34) used to create their uniform and vertex buffers every pass, which
 was ~13% of render time at 144 fps. They now reuse buffers (`ScratchBuffers`), written
