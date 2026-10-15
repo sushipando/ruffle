@@ -861,6 +861,23 @@ rather than the stage's. The test's expected output comes from the AIR 51.3 runt
 `playerglobal_import.abc` in the build output), because the AIR SDK's compiler emits ABC
 47.16, which Ruffle doesn't parse. That movie renders identically before and after.
 
+### 44. Empty objects with filters have no bounds
+
+*Files: `render/src/filters.rs` (`Filter::calculate_dest_rect`); tests
+`visual/filters/glow_with_empty_filtered_child` and `filters::tests` in `ruffle_render`.*
+
+The bounds of an empty object are `Rectangle::INVALID`, whose coordinates are all the
+same sentinel value. A blur, glow or drop shadow grew that rectangle like any other, and
+the result no longer looked invalid: a rectangle millions of pixels away. So whenever a
+child with such a filter had nothing to draw (for example on some frames of an
+animation), its parent's render bounds grew to millions of pixels. The parent's bitmap
+cache was then refused as too large: it was drawn without its cache, and without its own
+filters. A glowing object lost its glow, and flickered as the empty child came and went.
+
+Filters now leave invalid bounds alone. The new image test (a glowing square holding an
+empty, blurred child) matches the AIR 51.3 runtime within 4 levels; without the fix the
+glow is missing.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

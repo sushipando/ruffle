@@ -1,0 +1,8 @@
+num_frames = 1
+
+# output.expected.png is from the AIR 51.3 runtime (BitmapData.draw of the movie).
+[image_comparisons.output]
+tolerance = 4
+
+[player_options]
+with_renderer = { optional = false, quality = "high" }

@@ -88,6 +88,11 @@ impl Filter {
     }
 
     pub fn calculate_dest_rect(&self, source_rect: Rectangle<Twips>) -> Rectangle<Twips> {
+        // Nothing to filter has no bounds. (Growing the invalid rectangle, whose coordinates
+        // are all the same sentinel, would make it valid and millions of pixels away.)
+        if !source_rect.is_valid() {
+            return source_rect;
+        }
         match self {
             Filter::BlurFilter(filter) => filter.calculate_dest_rect(source_rect),
             Filter::GlowFilter(filter) => filter.calculate_dest_rect(source_rect),
@@ -221,4 +226,38 @@ pub fn view_scale() -> f32 {
 /// filters applied by scripts (whose results scripts can read).
 pub fn rendering_for_display() -> bool {
     VIEW_SCALE.with(|v| v.get()).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swf::{BlurFilter, BlurFilterFlags, Fixed8, Fixed16, GlowFilter, GlowFilterFlags};
+
+    #[test]
+    fn empty_bounds_stay_empty() {
+        let blur = Filter::BlurFilter(BlurFilter {
+            blur_x: Fixed16::from_f64(10.0),
+            blur_y: Fixed16::from_f64(10.0),
+            flags: BlurFilterFlags::from_passes(1),
+        });
+        let glow = Filter::GlowFilter(GlowFilter {
+            color: Color::WHITE,
+            blur_x: Fixed16::from_f64(8.0),
+            blur_y: Fixed16::from_f64(8.0),
+            strength: Fixed8::ONE,
+            flags: GlowFilterFlags::from_passes(1),
+        });
+        for filter in [blur, glow] {
+            assert!(!filter.calculate_dest_rect(Rectangle::INVALID).is_valid());
+
+            let rect = Rectangle {
+                x_min: Twips::from_pixels(10.0),
+                x_max: Twips::from_pixels(20.0),
+                y_min: Twips::from_pixels(10.0),
+                y_max: Twips::from_pixels(20.0),
+            };
+            let grown = filter.calculate_dest_rect(rect);
+            assert!(grown.x_min < rect.x_min && grown.x_max > rect.x_max);
+        }
+    }
 }
