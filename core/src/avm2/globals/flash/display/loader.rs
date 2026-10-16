@@ -16,7 +16,6 @@ use crate::avm2::object::TObject as _;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
 use crate::avm2::{Error, Object};
-use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::display_object::LoaderDisplay;
 use crate::display_object::MovieClip;
@@ -79,16 +78,11 @@ pub fn load<'gc>(
 
     let loader_info = loader_info.as_loader_info_object().unwrap();
 
-    if loader_info.init_event_fired() {
-        // FIXME: When calling load/loadBytes, then calling load/loadBytes again
-        // before the `init` event is fired, the first load is cancelled.
-        avm2_stub_method!(
-            activation,
-            "flash.display.Loader",
-            "load",
-            "reusing a Loader"
-        );
-    }
+    // A load that's still in progress is cancelled.
+    activation
+        .context
+        .load_manager
+        .cancel_avm2_loads(loader_info);
 
     // Unload the loader, in case something was already loaded.
     loader_info.unload(activation.context);
@@ -260,16 +254,11 @@ pub fn load_bytes<'gc>(
 
     let loader_info = loader_info.as_loader_info_object().unwrap();
 
-    if loader_info.init_event_fired() {
-        // FIXME: When calling load/loadBytes, then calling load/loadBytes again
-        // before the `init` event is fired, the first load is cancelled.
-        avm2_stub_method!(
-            activation,
-            "flash.display.Loader",
-            "loadBytes",
-            "reusing a Loader"
-        );
-    }
+    // A load that's still in progress is cancelled.
+    activation
+        .context
+        .load_manager
+        .cancel_avm2_loads(loader_info);
 
     // Unload the loader, in case something was already loaded.
     loader_info.unload(activation.context);
@@ -310,6 +299,29 @@ pub fn load_bytes<'gc>(
             format!("Error in Loader.loadBytes: {e:?}").into(),
         ));
     }
+
+    Ok(Value::Undefined)
+}
+
+/// Cancels a load in progress (unlike `unload`, this keeps what was already loaded).
+pub fn close<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    let loader_info = this
+        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+        .as_object()
+        .unwrap();
+
+    let loader_info = loader_info.as_loader_info_object().unwrap();
+
+    activation
+        .context
+        .load_manager
+        .cancel_avm2_loads(loader_info);
 
     Ok(Value::Undefined)
 }

@@ -1142,6 +1142,27 @@ Checked with a movie of two still sprites (one with `cacheAsBitmap`, one with a 
 child changes height every frame, at 2.618x: the still parts moved by up to 0.97 pixels
 between frames before, and not at all after.
 
+### 55. Loads are cancelled by `Loader.close` and by starting another load
+
+*Files: `core/src/loader.rs` (`LoadManager::cancel_avm2_loads`),
+`core/src/avm2/globals/flash/display/loader.rs` (`load`, `loadBytes`, `close`), `Loader.as`.*
+
+In Flash Player, `Loader.close()` cancels the load in progress, and so does calling `load()`
+or `loadBytes()` again before the first load is done. Ruffle did neither (`close` was a
+stub): every load ran to the end, and its `init` and `complete` events fired on the
+`Loader`'s `LoaderInfo` whenever it finished, and its classes were defined. Content that
+loads a queue of files with one `Loader` (closing it and calling `load` again when the queue
+is rebuilt, and checking the loaded file's class on `complete`) then got `complete` events
+from loads it had replaced, on later frames: each one made it take the next file's class as
+loaded before that file was there, so it skipped one file after another.
+
+Starting a load or calling `close` now removes the `Loader`'s loads in progress from the
+load manager: their downloads may still finish, but are then ignored, without logging an
+error. The `avm2/loader_cancel` test loads one file and then another right away (only the
+second fires events and defines its class), then loads a third and closes the `Loader`
+(nothing fires or is defined). Without the change, the first and third files' classes were
+defined, and the third file fired `init` and `complete`.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

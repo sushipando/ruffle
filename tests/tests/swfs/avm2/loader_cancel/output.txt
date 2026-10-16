@@ -1,0 +1,6 @@
+load ItemA.swf, then ItemB.swf right away
+complete ItemB.swf ItemA=false ItemB=true ItemC=false
+events: init complete
+load ItemC.swf, then close()
+events: 
+ItemA=false ItemB=true ItemC=false

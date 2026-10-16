@@ -249,6 +249,19 @@ impl<'gc> LoadManager<'gc> {
         self.0.remove(handle);
     }
 
+    /// Cancels the loads in progress into an AVM2 `Loader` (given by its `LoaderInfo`), as
+    /// `Loader.close` does, and as starting another load with the same `Loader` does.
+    /// Their downloads may still finish, but are then ignored, so they don't fire events
+    /// or define classes.
+    pub fn cancel_avm2_loads(&mut self, loader_info: LoaderInfoObject<'gc>) {
+        self.0.retain(|_, loader| match loader.vm_data {
+            MovieLoaderVMData::Avm2 {
+                loader_info: other, ..
+            } => !Avm2Object::ptr_eq(other, loader_info),
+            MovieLoaderVMData::Avm1 { .. } => true,
+        });
+    }
+
     /// Retrieve a loader by handle.
     pub fn get_loader(&self, handle: LoaderHandle) -> Option<&MovieLoader<'gc>> {
         self.0.get(handle)
@@ -323,7 +336,14 @@ impl<'gc> LoadManager<'gc> {
         };
         let handle = self.add_loader(loader);
         let loader = self.get_loader_mut(handle).unwrap();
-        loader.movie_loader(player, request, loader_url)
+        let future = loader.movie_loader(player, request, loader_url);
+        // A cancelled load (see `cancel_avm2_loads`) isn't an error.
+        Box::pin(async move {
+            match future.await {
+                Err(Error::Cancelled) => Ok(()),
+                result => result,
+            }
+        })
     }
 
     pub fn load_asset_movie(
