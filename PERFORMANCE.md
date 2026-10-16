@@ -1115,6 +1115,33 @@ never lowered, which would resize the window. Checked on macOS with a window lim
 1440x900 next to a 5120x1440 monitor: fullscreen there was 1440x900 before, and fills the
 monitor after.
 
+### 54. Still parts of cached objects stay still while other parts animate
+
+*Files: `core/src/display_object.rs` (`BitmapCache::origin`, `render_base`).*
+
+An object with `cacheAsBitmap` or filters is drawn into a bitmap that starts at the
+object's bounds on screen, and the bitmap is drawn pixel-snapped. So where the contents end
+up within a pixel depends on where within a pixel the bounds start (Flash Player does the
+same: the image tests match it this way). But whenever an animated part changed the bounds,
+the still parts moved too: a still object with a flickering flame on top bobbed up and down
+by up to a pixel (more with nested caches) as the flame changed height.
+
+The bitmap still starts at the bounds when it's first drawn and whenever the object's scale
+or rotation changes. But while only the contents change, it keeps starting at the same
+position within a pixel relative to the object's origin (the nearest such position at or
+before the bounds), so the contents keep their position. `make_dirty` (contents changed)
+is now a flag instead of an invalid stored matrix, so that the stored matrix still tells
+whether the scale or rotation changed.
+
+Two alternatives also stopped the wobble but moved cached objects away from where Flash
+Player draws them, by up to a pixel (22 and 17 image tests failed): starting the bitmap at a
+whole pixel on screen (keeping the contents' exact position), and starting it a whole number
+of pixels from the object's origin (snapping the origin). All 4585 tests pass this way.
+
+Checked with a movie of two still sprites (one with `cacheAsBitmap`, one with a glow) whose
+child changes height every frame, at 2.618x: the still parts moved by up to 0.97 pixels
+between frames before, and not at all after.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

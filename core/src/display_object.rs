@@ -109,6 +109,13 @@ pub struct BitmapCache {
     /// The offset used to draw the final bitmap (i.e. if a filter increases the size)
     draw_offset: Point<i32>,
 
+    /// Where the bitmap starts relative to the object's origin within a pixel, in twips
+    /// (see `origin`).
+    phase: Point<Twips>,
+
+    /// Whether the contents changed since they were last drawn (see `make_dirty`).
+    contents_changed: bool,
+
     /// The current contents of the cache, if any. Values are post-filters.
     /// The texture may be larger than `used_width` x `used_height` (see `update`).
     bitmap: Option<BitmapInfo>,
@@ -129,19 +136,44 @@ impl BitmapCache {
     /// Forcefully make this BitmapCache invalid and require regeneration.
     /// This should be used for changes that aren't automatically detected, such as children.
     pub fn make_dirty(&mut self) {
-        // Setting the old transform to something invalid is a cheap way of making it invalid,
-        // without reserving an extra field for.
-        self.matrix_a = f32::NAN;
+        self.contents_changed = true;
     }
 
     fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
-        self.matrix_a != other.a
+        self.contents_changed
+            || self.matrix_a != other.a
             || self.matrix_b != other.b
             || self.matrix_c != other.c
             || self.matrix_d != other.d
             || self.source_width != source_width
             || self.source_height != source_height
             || self.bitmap.is_none()
+    }
+
+    /// Where the bitmap starts relative to the object's origin (`matrix`'s translation),
+    /// given its bounds on screen. It's drawn pixel-snapped, so where within a pixel it
+    /// starts decides where the contents end up within a pixel. It starts at the bounds,
+    /// except that while the contents change but not the object's scale or rotation, it
+    /// keeps starting at the same position within a pixel (the nearest at or before the
+    /// bounds): otherwise still parts of an animated object would move by up to a pixel
+    /// whenever the animated parts changed the bounds.
+    fn origin(&mut self, matrix: &Matrix, bounds: &Rectangle<Twips>) -> Point<Twips> {
+        const PX: i32 = Twips::TWIPS_PER_PIXEL;
+        let start = Point::new(bounds.x_min - matrix.tx, bounds.y_min - matrix.ty);
+        let same_scale = self.matrix_a == matrix.a
+            && self.matrix_b == matrix.b
+            && self.matrix_c == matrix.c
+            && self.matrix_d == matrix.d;
+        if self.bitmap.is_none() || !same_scale {
+            self.phase = Point::new(
+                Twips::new(start.x.get().rem_euclid(PX)),
+                Twips::new(start.y.get().rem_euclid(PX)),
+            );
+        }
+        let align = |start: Twips, phase: Twips| {
+            Twips::new(start.get() - (start.get() - phase.get()).rem_euclid(PX))
+        };
+        Point::new(align(start.x, self.phase.x), align(start.y, self.phase.y))
     }
 
     /// Clears any dirtiness and ensure there's an appropriately sized texture allocated.
@@ -169,6 +201,7 @@ impl BitmapCache {
         const ROUND_TO: u32 = 32;
         const SLACK: u32 = 64;
 
+        self.contents_changed = false;
         self.matrix_a = matrix.a;
         self.matrix_b = matrix.b;
         self.matrix_c = matrix.c;
@@ -1033,8 +1066,8 @@ struct DrawCacheInfo {
     bitmap: BitmapInfo,
     dirty: bool,
     base_transform: Transform,
-    bounds: Rectangle<Twips>,
-    draw_offset: Point<i32>,
+    /// Where the bitmap is drawn, relative to the object's origin.
+    offset: Point<Twips>,
     filters: Vec<Filter>,
 }
 
@@ -1074,8 +1107,17 @@ pub fn render_base<'gc>(
         filters.retain(|f| !f.impotent());
 
         if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
-            let width = bounds.width().to_pixels().ceil().max(0.0);
-            let height = bounds.height().to_pixels().ceil().max(0.0);
+            let matrix = &base_transform.matrix;
+            let (origin, width, height) = if bounds.is_valid() {
+                let origin = cache.origin(matrix, &bounds);
+                (
+                    origin,
+                    (bounds.x_max - matrix.tx - origin.x).to_pixels().ceil(),
+                    (bounds.y_max - matrix.ty - origin.y).to_pixels().ceil(),
+                )
+            } else {
+                (Point::new(Twips::ZERO, Twips::ZERO), 0.0, 0.0)
+            };
             if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
                 let width = width as u32;
                 let height = height as u32;
@@ -1098,6 +1140,13 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
+                // In order to render an object to a texture, we need to draw its entire bounds.
+                // Calculate the offset from tx/ty in order to accommodate any drawings that extend the bounds
+                // negatively
+                let offset = Point::new(
+                    origin.x + Twips::from_pixels_i32(draw_offset.x),
+                    origin.y + Twips::from_pixels_i32(draw_offset.y),
+                );
                 if cache.is_dirty(&base_transform.matrix, width, height)
                     || interpolation::is_blending_tick(cache.changed_tick)
                 {
@@ -1129,8 +1178,7 @@ pub fn render_base<'gc>(
                         bitmap,
                         dirty: true,
                         base_transform,
-                        bounds,
-                        draw_offset,
+                        offset,
                         filters,
                     });
                 } else {
@@ -1138,8 +1186,7 @@ pub fn render_base<'gc>(
                         bitmap,
                         dirty: false,
                         base_transform,
-                        bounds,
-                        draw_offset,
+                        offset,
                         filters,
                     });
                 }
@@ -1162,13 +1209,8 @@ pub fn render_base<'gc>(
 
     // We can't hold `cache` (which will hold `base`), so this is split up
     if let Some(cache_info) = cache_info {
-        // In order to render an object to a texture, we need to draw its entire bounds.
-        // Calculate the offset from tx/ty in order to accommodate any drawings that extend the bounds
-        // negatively
-        let offset_x = cache_info.bounds.x_min - cache_info.base_transform.matrix.tx
-            + Twips::from_pixels_i32(cache_info.draw_offset.x);
-        let offset_y = cache_info.bounds.y_min - cache_info.base_transform.matrix.ty
-            + Twips::from_pixels_i32(cache_info.draw_offset.y);
+        let offset_x = cache_info.offset.x;
+        let offset_y = cache_info.offset.y;
 
         if cache_info.dirty {
             let mut transform_stack = TransformStack::new();
