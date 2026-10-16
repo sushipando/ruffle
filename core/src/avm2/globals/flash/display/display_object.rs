@@ -149,7 +149,10 @@ pub fn set_scale9grid<'gc>(
 
     if let Some(dobj) = this.as_display_object() {
         // Only sprites and shapes draw with their grid.
-        if !matches!(dobj, DisplayObject::MovieClip(_) | DisplayObject::Graphic(_)) {
+        if !matches!(
+            dobj,
+            DisplayObject::MovieClip(_) | DisplayObject::Graphic(_)
+        ) {
             avm2_stub_setter!(activation, "flash.display.DisplayObject", "scale9Grid");
         }
         let rect = match args.try_get_object(0) {
