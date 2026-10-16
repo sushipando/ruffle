@@ -34,7 +34,11 @@ struct MainWindow {
     mouse_pos: PhysicalPosition<f64>,
     modifiers: Modifiers,
     min_window_size: LogicalSize<u32>,
-    max_window_size: PhysicalSize<u32>,
+    /// The window's size limit: the area covered by all monitors (see `get_screen_size`),
+    /// raised when monitors are added or rearranged.
+    max_window_size: LogicalSize<u32>,
+    /// When to check the monitors again (see `update_max_window_size`).
+    next_monitor_check: Instant,
     no_gui: bool,
     preferred_width: Option<f64>,
     preferred_height: Option<f64>,
@@ -450,6 +454,8 @@ impl MainWindow {
             }
         }
 
+        self.update_max_window_size();
+
         // Core loop
         // [NA] This used to be called `MainEventsCleared`, but I think the behaviour is different now.
         // We should look at changing our tick to happen somewhere else if we see any behavioural problems.
@@ -607,6 +613,28 @@ impl MainWindow {
             / step)
             .min((self.interpolate - 1) as f64) as u32;
         Some((index + 1) as f32 / self.interpolate as f32)
+    }
+
+    /// Raises the window's size limit when monitors were added or rearranged: otherwise
+    /// the window couldn't be made fullscreen on (or tiled on) a monitor that was connected
+    /// after it opened, if that monitor is larger. The limit is never lowered, which would
+    /// resize the window.
+    fn update_max_window_size(&mut self) {
+        let now = Instant::now();
+        if now < self.next_monitor_check {
+            return;
+        }
+        self.next_monitor_check = now + Duration::from_secs(1);
+        let screen_size = get_screen_size(self.gui.window());
+        let max_window_size = LogicalSize::new(
+            self.max_window_size.width.max(screen_size.width),
+            self.max_window_size.height.max(screen_size.height),
+        );
+        // Only when it changed: setting it also sets the window's size.
+        if max_window_size != self.max_window_size {
+            self.max_window_size = max_window_size;
+            self.gui.window().set_max_inner_size(Some(max_window_size));
+        }
     }
 
     /// Paces presentation: when the display's refresh rate is a whole multiple of the rate
@@ -784,6 +812,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 player,
                 min_window_size,
                 max_window_size,
+                next_monitor_check: Instant::now() + Duration::from_secs(1),
                 no_gui,
                 preferred_width,
                 preferred_height,

@@ -6,7 +6,7 @@ use ruffle_core::events::{
 };
 use std::path::Path;
 use url::Url;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{KeyEvent, Modifiers};
 use winit::keyboard::{
     Key, KeyCode as WinitKeyCode, KeyLocation as WinitKeyLocation, NamedKey,
@@ -355,23 +355,30 @@ pub fn gilrs_button_to_gamepad_button(button: Button) -> Option<GamepadButton> {
     }
 }
 
-pub fn get_screen_size(window: &Window) -> PhysicalSize<u32> {
-    let mut min_x = 0;
-    let mut min_y = 0;
-    let mut max_x = 0;
-    let mut max_y = 0;
+/// The size of the smallest rectangle containing all monitors, in logical pixels.
+///
+/// Each monitor's position and size are converted with its own scale factor, so this is at
+/// least as large as any monitor at that monitor's scale factor, wherever the window is.
+/// (In physical pixels, a window on a high-DPI monitor couldn't grow to the size of a
+/// larger low-DPI monitor, so it couldn't be moved there in fullscreen.)
+pub fn get_screen_size(window: &Window) -> LogicalSize<u32> {
+    let mut min_x = 0.0f64;
+    let mut min_y = 0.0f64;
+    let mut max_x = 0.0f64;
+    let mut max_y = 0.0f64;
 
     for monitor in window.available_monitors() {
-        let size = monitor.size();
-        let position = monitor.position();
+        let scale_factor = monitor.scale_factor();
+        let size: LogicalSize<f64> = monitor.size().to_logical(scale_factor);
+        let position: LogicalPosition<f64> = monitor.position().to_logical(scale_factor);
         min_x = min_x.min(position.x);
         min_y = min_y.min(position.y);
-        max_x = max_x.max(position.x + size.width as i32);
-        max_y = max_y.max(position.y + size.height as i32);
+        max_x = max_x.max(position.x + size.width);
+        max_y = max_y.max(position.y + size.height);
     }
 
-    let width = max_x - min_x;
-    let height = max_y - min_y;
+    let width = (max_x - min_x).ceil() as u32;
+    let height = (max_y - min_y).ceil() as u32;
 
     if width <= 32 || height <= 32 {
         return (i16::MAX as u32, i16::MAX as u32).into();

@@ -1089,6 +1089,25 @@ past it. The script isn't run again in either.
 (Ruffle doesn't dispatch `uncaughtErrorEvents` yet, so the tests run in release mode, where
 neither runtime prints the handled errors.)
 
+### 53. The window's size limit follows the monitors
+
+*Files: `desktop/src/util.rs` (`get_screen_size`), `desktop/src/app.rs`
+(`update_max_window_size`).*
+
+The desktop window is limited to the area covered by all monitors. That limit was measured
+once, when the window opened, in physical pixels, and then converted with the scale factor
+of the monitor the window opened on. So a window opened before a larger monitor was
+connected (or opened on a high-DPI monitor next to a larger low-DPI one) couldn't grow to
+that monitor's size. Made fullscreen there (on macOS: native fullscreen, or moved there in
+fullscreen), it stayed at its old size in the middle of a black screen, and it couldn't be
+tiled there.
+
+The limit is now measured in logical pixels, with each monitor's own scale factor, and the
+monitors are checked again every second: the limit is raised when they cover more. It's
+never lowered, which would resize the window. Checked on macOS with a window limited to
+1440x900 next to a 5120x1440 monitor: fullscreen there was 1440x900 before, and fills the
+monitor after.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
