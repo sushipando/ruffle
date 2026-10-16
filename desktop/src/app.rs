@@ -75,33 +75,62 @@ struct InterpolationAdaptation {
     drawn: u32,
     /// Frames between movie frames skipped in the current second.
     skipped: u32,
-    /// Seconds in a row without skipped frames.
+    /// Seconds without skipped frames since the number of frames last changed.
     clean_windows: u32,
     /// How many such seconds to wait before drawing more frames again.
     retry_after: u32,
-    /// Whether the number of frames was raised recently (and may have to go back down).
-    raised: bool,
+    /// Seconds since the number of frames was raised, while that may still turn out not to
+    /// work (until `TRIAL_SECONDS`; one second of skipped frames lowers it again then).
+    since_raise: Option<u32>,
+    /// The load (the busier of the GPU and the main thread) in the second before the last
+    /// raise.
+    load_before_raise: f64,
+    /// The load before the last raise that didn't work: once the load is clearly lower than
+    /// that, it tries again without waiting for `retry_after`.
+    failed_load: Option<f64>,
     /// Whether frames were skipped in the last second (it's lowered after two such).
     behind: bool,
     /// Time the main thread spent ticking and drawing in the current second.
     busy: Duration,
+    /// Whether ticking or drawing once took at least `STALL` in the current second.
+    stalled: bool,
     /// Never changes the number of frames (`RUFFLE_FIXED_INTERPOLATION`, for measuring).
     fixed: bool,
 }
 
 impl InterpolationAdaptation {
+    /// Seconds without skipped frames before drawing more frames again, at least.
+    const MIN_WAIT: u32 = 4;
+    /// Seconds without skipped frames before drawing more frames again, at most (after
+    /// several raises that didn't work).
+    const MAX_WAIT: u32 = 64;
+    /// Seconds after which a raise counts as having worked.
+    const TRIAL_SECONDS: u32 = 10;
+    /// How long ticking or drawing takes for it to count as a stall, as when loading new
+    /// content (longer than any steady-state hitch).
+    const STALL: Duration = Duration::from_millis(100);
+
     fn new() -> Self {
         Self {
             window_start: Instant::now(),
             drawn: 0,
             skipped: 0,
             clean_windows: 0,
-            retry_after: 4,
-            raised: false,
+            retry_after: Self::MIN_WAIT,
+            since_raise: None,
+            load_before_raise: 0.0,
+            failed_load: None,
             behind: false,
             busy: Duration::ZERO,
+            stalled: false,
             fixed: std::env::var_os("RUFFLE_FIXED_INTERPOLATION").is_some(),
         }
+    }
+
+    /// Counts time the main thread spent ticking or drawing.
+    fn add_busy(&mut self, time: Duration) {
+        self.busy += time;
+        self.stalled |= time >= Self::STALL;
     }
 }
 
@@ -126,7 +155,7 @@ impl MainWindow {
                 }
 
                 self.gui.render(player);
-                self.adaptation.busy += start.elapsed();
+                self.adaptation.add_busy(start.elapsed());
             }
 
             // Important that we return here, or we'll get a feedback loop with egui
@@ -484,7 +513,7 @@ impl MainWindow {
                     }
                     next
                 });
-                self.adaptation.busy += tick_start.elapsed();
+                self.adaptation.add_busy(tick_start.elapsed());
                 self.next_tick_time = self.next_frame_time;
                 if let Some(start) = new_frame_start {
                     let missed = self.interpolate.saturating_sub(self.next_subframe);
@@ -501,10 +530,12 @@ impl MainWindow {
         }
     }
 
-    /// The time between frames drawn between movie frames, if they are.
+    /// The time between frames drawn between movie frames, if they are (with
+    /// `--interpolate`, also while only one is drawn per movie frame because more didn't
+    /// keep up: they're counted then, to tell when to draw more again).
     fn subframe_duration(&self) -> Option<Duration> {
         let player = self.player.get()?;
-        (self.interpolate > 1 && player.is_playing()).then(|| {
+        (self.max_interpolate > 1 && player.is_playing()).then(|| {
             Duration::from_secs_f64(player.frame_duration_seconds() / self.interpolate as f64)
         })
     }
@@ -544,9 +575,12 @@ impl MainWindow {
     /// Lowers the number of frames drawn per movie frame while more than a tenth of them
     /// are skipped (they couldn't be drawn in time), to the next divisor of
     /// `max_interpolate`: evenly spaced frames look smoother than more frames at uneven
-    /// times. Tries a higher number again after a while without skipped frames, if the
-    /// GPU and the main thread look like they have time for it (assuming their work grows
-    /// with the number of frames drawn), and waits longer each time that fails.
+    /// times. Tries the next higher number after a few seconds without skipped frames.
+    /// How busy the GPU is doesn't tell whether that will fit: GPUs whose clock follows
+    /// their load (such as Apple's) look about as busy with less work. So when frames are
+    /// skipped soon after raising, it goes back down and waits twice as long before trying
+    /// again, unless the load gets clearly lower than it was before that raise, or a stall
+    /// (such as loading new content) suggests that what's shown changed.
     fn adapt_interpolation(&mut self, now: Instant) {
         let adaptation = &mut self.adaptation;
         let window = now.duration_since(adaptation.window_start);
@@ -556,33 +590,58 @@ impl MainWindow {
         let (drawn, skipped) = (adaptation.drawn, adaptation.skipped);
         let cpu = adaptation.busy.as_secs_f64() / window.as_secs_f64();
         let load = ruffle_render_wgpu::backend::gpu_busy_fraction().map_or(cpu, |gpu| gpu.max(cpu));
+        let stalled = std::mem::take(&mut adaptation.stalled);
         adaptation.window_start = now;
         adaptation.drawn = 0;
         adaptation.skipped = 0;
         adaptation.busy = Duration::ZERO;
+        if stalled {
+            // What was learned about the content may no longer hold.
+            adaptation.clean_windows = 0;
+            adaptation.retry_after = InterpolationAdaptation::MIN_WAIT;
+            adaptation.failed_load = None;
+        }
         let divisors: Vec<u32> = (1..=self.max_interpolate)
             .filter(|n| self.max_interpolate.is_multiple_of(*n))
             .collect();
         let total = drawn + skipped;
         let behind = total > 0 && skipped * 10 > total;
         let was_behind = std::mem::replace(&mut adaptation.behind, behind);
-        if behind && (was_behind || adaptation.raised) {
+        let on_trial = adaptation.since_raise.is_some();
+        if behind && (was_behind || on_trial) {
             if let Some(&lower) = divisors.iter().rev().find(|&&n| n < self.interpolate) {
-                if adaptation.raised {
-                    adaptation.retry_after = (adaptation.retry_after * 2).min(64);
+                if on_trial {
+                    adaptation.retry_after =
+                        (adaptation.retry_after * 2).min(InterpolationAdaptation::MAX_WAIT);
+                    adaptation.failed_load = Some(adaptation.load_before_raise);
                 }
-                adaptation.raised = false;
+                adaptation.since_raise = None;
                 adaptation.clean_windows = 0;
                 self.interpolate = lower;
                 tracing::info!("[interpolate] {lower} frames per movie frame (couldn't keep up)");
             }
-        } else if skipped == 0 {
+            return;
+        }
+        if let Some(seconds) = &mut adaptation.since_raise {
+            *seconds += 1;
+            if *seconds >= InterpolationAdaptation::TRIAL_SECONDS {
+                // The last raise worked.
+                adaptation.since_raise = None;
+                adaptation.retry_after = InterpolationAdaptation::MIN_WAIT;
+                adaptation.failed_load = None;
+            }
+        }
+        if skipped == 0 {
             adaptation.clean_windows += 1;
-            if adaptation.clean_windows >= adaptation.retry_after
+            let lighter = adaptation
+                .failed_load
+                .is_some_and(|failed| load <= failed * 0.85);
+            if (adaptation.clean_windows >= adaptation.retry_after
+                || (adaptation.clean_windows >= InterpolationAdaptation::MIN_WAIT && lighter))
                 && let Some(&higher) = divisors.iter().find(|&&n| n > self.interpolate)
-                && load * higher as f64 / self.interpolate as f64 <= 0.8
             {
-                adaptation.raised = true;
+                adaptation.since_raise = Some(0);
+                adaptation.load_before_raise = load;
                 adaptation.clean_windows = 0;
                 tracing::info!(
                     "[interpolate] {higher} frames per movie frame (load {:.0}% at {})",
@@ -590,10 +649,6 @@ impl MainWindow {
                     self.interpolate
                 );
                 self.interpolate = higher;
-            } else if adaptation.raised && adaptation.clean_windows >= 3 {
-                // The last raise worked.
-                adaptation.raised = false;
-                adaptation.retry_after = 4;
             }
         }
     }

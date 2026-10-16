@@ -818,14 +818,21 @@ The desktop player wakes up at each frame's time (only ticking the player when a
 frame or timer is due; ticking also runs mouse picking), presents frames paced at the
 frame interval (40), and skips frames that are already late. When more than a tenth of
 the frames are skipped for two seconds (not counting one-off stalls), it draws fewer:
-the next divisor of N, so that frames stay evenly spaced (6 → 3 → 2 → 1), and tries more
-again after a while if the GPU and main thread look like they have time for it: the
-busier of the two (GPU time measured from Metal command buffers' start and end times,
-main-thread time from ticking and drawing), scaled by the higher number over the current
-one, must be at most 80%. Without that check, it kept trying 6 in heavy scenes and
-dropping back, with uneven frames each time. Each change is logged (at `info` level,
-shown by default), such as `[interpolate] 3 frames per movie frame (couldn't keep up)`.
-`RUFFLE_FIXED_INTERPOLATION` turns the adapting off (for measuring).
+the next divisor of N, so that frames stay evenly spaced (6 → 3 → 2 → 1). After 4 seconds
+without skipped frames, it tries the next higher number. If frames are skipped again
+within 10 seconds of that, it goes back down after one such second and waits twice as
+long before the next try (up to 64 seconds), so a heavy scene costs one uneven second
+about once a minute. It tries again sooner when the load (the busier of the GPU, measured
+from Metal command buffers' start and end times, and the main thread, from ticking and
+drawing) gets 15% lower than it was before the try that failed, and after a stall of
+100 ms or more (such as when loading new content), since the content may have changed.
+It used to raise only when the load, scaled by the higher number over the current one,
+stayed at most 80%, which rarely held: the GPU's clock follows its load, so it looks
+about as busy with less work (a scene at 55% GPU busy with 3 frames per movie frame was
+71% busy with 6, not 110%), and at 5120x1440 it stayed at 3 after any drop. It also never
+raised from 1, where frames weren't scheduled or counted. Each change is logged (at
+`info` level, shown by default), such as `[interpolate] 3 frames per movie frame
+(couldn't keep up)`. `RUFFLE_FIXED_INTERPOLATION` turns the adapting off (for measuring).
 
 The batched filters (34) used to create their uniform and vertex buffers every pass, which
 was ~13% of render time at 144 fps. They now reuse buffers (`ScratchBuffers`), written
