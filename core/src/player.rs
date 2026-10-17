@@ -650,6 +650,16 @@ impl Player {
         time_til_next.max(FloatDuration::ZERO).to_std()
     }
 
+    /// How long ago the current movie frame was due (the time that already counts towards
+    /// the next one). Unlike `time_til_next_frame`, this doesn't depend on timers.
+    pub fn time_since_frame_due(&self) -> Duration {
+        let millis = self
+            .frame_accumulator
+            .as_millis()
+            .clamp(0.0, self.frame_duration().as_millis());
+        FloatDuration::from_millis(millis).to_std()
+    }
+
     pub fn is_playing(&self) -> bool {
         match self.run_state {
             RunState::Playing | RunState::Stepping => true,

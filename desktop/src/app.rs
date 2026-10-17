@@ -528,10 +528,9 @@ impl MainWindow {
                     player.tick(dt);
                     let next = new_time + player.time_til_next_frame();
                     if player.frames_run() != frames_before {
-                        new_frame_start =
-                            Some(next.checked_sub(Duration::from_secs_f64(
-                                player.frame_duration_seconds(),
-                            )));
+                        // When the frame that ran was due. (Not from `next`, which is
+                        // earlier when a timer is due before the next frame.)
+                        new_frame_start = Some(new_time.checked_sub(player.time_since_frame_due()));
                     }
                     next
                 });

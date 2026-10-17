@@ -1182,6 +1182,23 @@ is released too (those events used to be dropped). Checked by holding Shift whil
 to another window, releasing it there, and clicking in the movie after coming back: the
 click had `shiftKey` set before, and not after.
 
+### 57. Frames between movie frames are timed from the frame clock
+
+*Files: `core/src/player.rs` (`time_since_frame_due`), `desktop/src/app.rs`.*
+
+The frames drawn between movie frames (41) are timed from when the movie frame that ran was
+due. That was derived from `time_til_next_frame`, which returns the time until the next
+movie frame or the next timer, whichever comes first: whenever a timer was due before the
+next frame, the frame seemed to have been due up to a frame earlier than it was. Its frames
+in between then looked late, were skipped, and counted as frames that couldn't be drawn in
+time, so content that uses timers a lot dropped to fewer frames and failed every try to
+go back up.
+
+`Player::time_since_frame_due` gives the time since the frame was due from the frame clock
+alone. Effect (24 fps with timers, `--interpolate 6`, a Metal System Trace while moving
+around): before, it stayed at 1 frame per movie frame (25 presented per second, each on
+screen for anywhere from 1 to 8 refreshes); after, it kept 3 (71 per second).
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
