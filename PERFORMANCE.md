@@ -764,9 +764,9 @@ rates, all tests pass.
 
 ### 40. Frames presented at an even pace
 
-*Files: wgpu-hal fork (`src/metal/mod.rs`, `set_present_min_duration`), wgpu-core fork
-(`src/ruffle_patch.rs`), `render/wgpu/src/backend.rs`,
-`desktop/src/app.rs` (`pace_present`).*
+*Files: wgpu-hal fork (`src/metal/mod.rs`, `set_present_time`), wgpu-core fork
+(`src/ruffle_patch.rs`), `render/wgpu/src/backend.rs`, `desktop/src/app.rs`
+(`pacing_delay`, `present_time`), `desktop/src/gui/controller.rs`.*
 
 Much Flash content runs at 24 fps. On a 144 Hz
 display, a Metal System Trace of 24 fps content showed frames presented 33-50 ms
@@ -774,15 +774,27 @@ apart instead of every 41.7 ms: frames were presented as soon as they were drawn
 drawing times vary, so each frame stayed on screen for 5, 6 or 7 refreshes, which makes
 smooth motion (such as a rotating part) look uneven.
 
-Frames are now presented with `presentDrawable:afterMinimumDuration:` (patched
-wgpu-hal), which keeps each frame on screen for at least that long after the previous
-one appeared. The desktop player sets it from the display's refresh rate when the rate
-frames are drawn at divides it (for example 24 fps on 144 Hz: 6 refreshes; it uses
-half a refresh less than that, so rounding never adds one). Otherwise frames are
-presented as soon as possible.
+When the display's refresh rate is a whole multiple of the rate frames are drawn at (for
+example 24 fps on 144 Hz, or 6 frames per movie frame with `--interpolate 6`), each frame
+is now shown at a time taken from the movie's clock: when it was due, plus a fixed delay
+to draw it (`presentDrawable:atTime:`, patched wgpu-hal). The delay is two frame
+intervals, but at most four refreshes: with three drawables, frames presented further
+ahead would make drawing the next one wait for a drawable. Frames are then shown for the
+same number of refreshes, and one that isn't ready in time is shown late on its own,
+without delaying the ones after it. Otherwise frames are presented as soon as possible.
+Flag: `paced-present`.
 
-Effect (24 fps, 144 Hz, from the trace's displayed-surface intervals): 107 of 108 frames
-on screen for exactly 41.7 ms (6 refreshes), before 33-50 ms. Flag: `paced-present`.
+This first used `presentDrawable:afterMinimumDuration:`, which keeps each frame on screen
+for at least a duration after the previous one appeared. That was just as even, but after
+one late frame, frames presented as often as they're shown never caught up: each waited
+for the one before it. Every hiccup (and every extra present, see 45) added a frame of
+delay for good, until all three drawables held frames waiting to be shown and acquiring
+one blocked. In a trace of a busy scene, the delay from presenting a frame to showing it
+went from 32 to 83 ms after one hiccup and stayed there, and the main thread spent 80% of
+its time waiting for a drawable (while the CPU did 18% real work and the GPU was 20%
+busy). Since the frame scheduler counted those frames as late, it dropped to 1 frame per
+movie frame. With present times, the same kind of scene kept 2-3 frames per movie frame
+with a median delay of 16-19 ms.
 
 ### 41. Frames drawn between movie frames (`--interpolate N`)
 
@@ -816,7 +828,11 @@ replacing objects' contents (frame-by-frame animation). So:
 
 The desktop player wakes up at each frame's time (only ticking the player when a movie
 frame or timer is due; ticking also runs mouse picking), presents frames paced at the
-frame interval (40), and skips frames that are already late. When more than a tenth of
+frame interval (40), and skips frames that are already late: with paced presents, those
+whose time to be shown has passed (a frame may start late, such as the first after a
+movie frame, which waits for the movie frame to run, and still be shown on time), and
+otherwise those whose next frame is due. A frame drawn after it was to be shown counts as
+skipped too. When more than a tenth of
 the frames are skipped for two seconds (not counting one-off stalls), it draws fewer:
 the next divisor of N, so that frames stay evenly spaced (6 → 3 → 2 → 1). After 4 seconds
 without skipped frames, it tries the next higher number. If frames are skipped again
@@ -824,7 +840,7 @@ within 10 seconds of that, it goes back down after one such second and waits twi
 long before the next try (up to 64 seconds), so a heavy scene costs one uneven second
 about once a minute. It tries again sooner when the load (the busier of the GPU, measured
 from Metal command buffers' start and end times, and the main thread, from ticking and
-drawing) gets 15% lower than it was before the try that failed, and after a stall of
+drawing, not counting waiting for a drawable) gets 15% lower than it was before the try that failed, and after a stall of
 100 ms or more (such as when loading new content), since the content may have changed.
 It used to raise only when the load, scaled by the higher number over the current one,
 stayed at most 80%, which rarely held: the GPU's clock follows its load, so it looks
@@ -905,7 +921,11 @@ pacing of 40. Now:
 * The movie is only drawn when it may look different: a scheduled frame, the player's
   `needs_render` (a new movie frame, `updateAfterEvent`, a button changing state), a
   resize, or the window becoming visible again. Other repaints draw the GUI over the
-  movie's last frame. A paused movie is drawn on every repaint, as before.
+  movie's last frame, and present nothing when the GUI shows nothing (and didn't before):
+  the screen already shows that. A paused movie is drawn on every repaint, as before.
+* While frames are drawn between movie frames, changes from input (such as a button
+  changing state on a click) are drawn with the next scheduled frame, instead of at once
+  as an extra frame. Each extra frame delayed the paced frames after it (see 40).
 
 ### 46. Full link-time optimization (`--profile dist`)
 
@@ -1454,7 +1474,8 @@ tags. Changes are marked `Ruffle patch` in the sources.
     Effect: 1283 → 129 samples; render CPU per pass 0.10 → 0.04 ms.
   * wgpu-core: **render passes sharing command buffers** on Metal (see 20), with a
     runtime switch in `ruffle_patch.rs`.
-  * wgpu-hal (Metal): **presenting after a minimum duration** (see 40) and **GPU busy
+  * wgpu-hal (Metal): **presenting at a given time** (see 40), **presenting after a
+    minimum duration** (no longer used) and **GPU busy
     time on request** (see 41), switched through `ruffle_patch.rs` too.
 * [sushipando/gc-arena](https://github.com/sushipando/gc-arena): branch `perf` on upstream
   `v0.7.0`, tag `perf-0.7.0-1`.

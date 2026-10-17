@@ -41,7 +41,7 @@ struct MainWindow {
     /// The window's size limit: the area covered by all monitors (see `get_screen_size`),
     /// raised when monitors are added or rearranged.
     max_window_size: LogicalSize<u32>,
-    /// When to check the monitors again (see `update_max_window_size`).
+    /// When to check the monitors again (see `update_monitor`).
     next_monitor_check: Instant,
     no_gui: bool,
     preferred_width: Option<f64>,
@@ -69,6 +69,10 @@ struct MainWindow {
     /// says so (`Player::needs_render`). Other redraws (asked for by the GUI) only draw the
     /// GUI over the movie's last frame.
     movie_dirty: bool,
+    /// The frame (counted from `frame_start`) that the next redraw draws.
+    drawn_subframe: u32,
+    /// The display's refresh interval in seconds, if known (see `update_monitor`).
+    refresh_interval: Option<f64>,
     event_loop_proxy: EventLoopProxy<RuffleEvent>,
 }
 
@@ -147,19 +151,29 @@ impl MainWindow {
             if !self.minimized && !self.occluded {
                 let start = Instant::now();
                 let mut player = self.player.get();
+                let mut movie_drawn = false;
+                let mut present_time = None;
                 if let Some(ref mut player) = player
                     // Even if the movie is paused, user interaction with debug tools can change the render output
                     && (self.movie_dirty || player.needs_render() || !player.is_playing())
                 {
                     self.movie_dirty = false;
-                    let fraction = self.render_fraction(player.frame_duration_seconds());
-                    player.set_render_fraction(fraction);
-                    self.pace_present(player.frame_duration_seconds());
+                    player.set_render_fraction(self.render_fraction());
+                    present_time = self.present_time(player.frame_duration_seconds());
                     player.render();
+                    movie_drawn = true;
                 }
 
-                self.gui.render(player);
-                self.adaptation.add_busy(start.elapsed());
+                let waited = self.gui.render(player, movie_drawn, present_time);
+                // A frame drawn after it was to be shown is shown late (and the ones around
+                // it for longer): for `adapt_interpolation`, that's as bad as skipping it.
+                if present_time.is_some_and(|time| Instant::now() > time) {
+                    self.adaptation.skipped += 1;
+                }
+                // Waiting for a surface texture (for the frames before to be shown) isn't
+                // work.
+                self.adaptation
+                    .add_busy(start.elapsed().saturating_sub(waited));
             }
 
             // Important that we return here, or we'll get a feedback loop with egui
@@ -505,7 +519,7 @@ impl MainWindow {
             }
         }
 
-        self.update_max_window_size();
+        self.update_monitor();
 
         // Core loop
         // [NA] This used to be called `MainEventsCleared`, but I think the behaviour is different now.
@@ -568,10 +582,22 @@ impl MainWindow {
             return;
         };
         let now = Instant::now();
-        let due = (now.saturating_duration_since(start).as_secs_f64() / step.as_secs_f64()) as u32;
+        let elapsed = now.saturating_duration_since(start).as_secs_f64();
+        let due = (elapsed / step.as_secs_f64()) as u32;
         if due >= self.next_subframe && self.next_subframe < self.interpolate {
-            // Skip frames that are already late.
-            let index = due.min(self.interpolate - 1);
+            // Skip frames that are already late: whose time to be shown has passed, when
+            // presentation is paced (a frame may start late, for example the first after a
+            // movie frame, which waits for the movie frame to run, and still be shown on
+            // time), or otherwise, when the next one is due.
+            let frame_duration = step.as_secs_f64() * self.interpolate as f64;
+            let late = self
+                .pacing_delay(frame_duration)
+                .map_or(step.as_secs_f64(), |delay| delay.as_secs_f64());
+            let on_time = ((elapsed - late) / step.as_secs_f64()).floor() + 1.0;
+            let index = (on_time.max(0.0) as u32)
+                .max(self.next_subframe)
+                .min(self.interpolate - 1);
+            self.drawn_subframe = index;
             self.adaptation.drawn += 1;
             // A stall (such as loading) skips many frames at once; that's not a sign that
             // drawing fewer frames would help.
@@ -677,30 +703,30 @@ impl MainWindow {
     /// How far between the previous movie frame and the current one a frame drawn now
     /// should be (`None` without interpolation): the frames between movie frames are
     /// spread evenly, the last one showing the current movie frame.
-    fn render_fraction(&self, frame_duration: f64) -> Option<f32> {
-        if self.interpolate <= 1 {
+    fn render_fraction(&self) -> Option<f32> {
+        if self.interpolate <= 1 || self.frame_start.is_none() {
             return None;
         }
-        let start = self.frame_start?;
-        let step = frame_duration / self.interpolate as f64;
-        let index = (Instant::now()
-            .saturating_duration_since(start)
-            .as_secs_f64()
-            / step)
-            .min((self.interpolate - 1) as f64) as u32;
+        let index = self.drawn_subframe.min(self.interpolate - 1);
         Some((index + 1) as f32 / self.interpolate as f32)
     }
 
-    /// Raises the window's size limit when monitors were added or rearranged: otherwise
-    /// the window couldn't be made fullscreen on (or tiled on) a monitor that was connected
-    /// after it opened, if that monitor is larger. The limit is never lowered, which would
-    /// resize the window.
-    fn update_max_window_size(&mut self) {
+    /// Once a second: re-reads the display's refresh rate, and raises the window's size
+    /// limit when monitors were added or rearranged. Otherwise the window couldn't be made
+    /// fullscreen on (or tiled on) a monitor that was connected after it opened, if that
+    /// monitor is larger. The limit is never lowered, which would resize the window.
+    fn update_monitor(&mut self) {
         let now = Instant::now();
         if now < self.next_monitor_check {
             return;
         }
         self.next_monitor_check = now + Duration::from_secs(1);
+        self.refresh_interval = self
+            .gui
+            .window()
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .map(|millihertz| 1000.0 / millihertz as f64);
         let screen_size = get_screen_size(self.gui.window());
         let max_window_size = LogicalSize::new(
             self.max_window_size.width.max(screen_size.width),
@@ -713,27 +739,38 @@ impl MainWindow {
         }
     }
 
-    /// Paces presentation: when the display's refresh rate is a whole multiple of the rate
-    /// frames are drawn at (for example 144 Hz, and a 24 fps movie drawn 6 times per
-    /// frame), each frame is shown for the same number of refreshes, instead of whenever
-    /// it happens to be ready (which made animations look uneven). Otherwise frames are
-    /// presented as soon as possible.
-    fn pace_present(&self, frame_duration: f64) {
-        let refresh = self
-            .gui
-            .window()
-            .current_monitor()
-            .and_then(|monitor| monitor.refresh_rate_millihertz())
-            .map(|millihertz| 1000.0 / millihertz as f64);
+    /// How long after it's due a frame is shown, when presentation is paced: when the
+    /// display's refresh rate is a whole multiple of the rate frames are drawn at (for
+    /// example 144 Hz, and a 24 fps movie drawn 6 times per frame), each frame is shown at a
+    /// time taken from the movie's clock (see `present_time`). That's two frame intervals,
+    /// to draw it (the first frames after a movie frame also wait for the movie frame to
+    /// run), with three surface textures as many as there can be waiting to be shown
+    /// without drawing another waiting for one of them to be shown; but at most four
+    /// refreshes.
+    fn pacing_delay(&self, frame_duration: f64) -> Option<Duration> {
+        if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::PacedPresent) {
+            return None;
+        }
+        let refresh = self.refresh_interval?;
         let interval = frame_duration / self.interpolate.max(1) as f64;
-        let min_duration = refresh.and_then(|refresh| {
-            let refreshes = interval / refresh;
-            let whole = refreshes.round();
-            (whole >= 1.0 && (refreshes - whole).abs() < 0.05).then_some((whole - 0.5) * refresh)
-        });
-        ruffle_render_wgpu::backend::set_present_min_duration(min_duration.filter(|_| {
-            ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::PacedPresent)
-        }));
+        let refreshes = interval / refresh;
+        let whole = refreshes.round();
+        if whole < 1.0 || (refreshes - whole).abs() >= 0.05 {
+            return None;
+        }
+        Some(Duration::from_secs_f64((refresh * 4.0).min(interval * 2.0)))
+    }
+
+    /// When the frame drawn now should be shown (`None`: as soon as possible). With paced
+    /// presentation, each frame is shown at a fixed delay after it was due, so frames are
+    /// shown for the same number of refreshes each (instead of whenever they happen to be
+    /// ready, which made animations look uneven), and one that's shown late doesn't delay
+    /// the ones after it.
+    fn present_time(&self, frame_duration: f64) -> Option<Instant> {
+        let delay = self.pacing_delay(frame_duration)?;
+        let step = frame_duration / self.interpolate.max(1) as f64;
+        let due = self.frame_start? + Duration::from_secs_f64(step * self.drawn_subframe as f64);
+        Some(due + delay)
     }
 
     /// Tells the player that the held keys for which `released` is true were released.
@@ -755,7 +792,15 @@ impl MainWindow {
 
     fn check_redraw(&self) {
         let player = self.player.get();
-        if player.map(|p| p.needs_render()).unwrap_or_default() || self.gui.needs_render() {
+        // While frames are drawn between movie frames, changes (such as from input) are
+        // drawn with the next one: drawing them at once would present an extra frame,
+        // which can delay the paced frames after it (see `present_time`).
+        let scheduled = self.max_interpolate > 1
+            && self.frame_start.is_some()
+            && player.as_ref().is_some_and(|p| p.is_playing());
+        if (!scheduled && player.map(|p| p.needs_render()).unwrap_or_default())
+            || self.gui.needs_render()
+        {
             self.gui.window().request_redraw();
         }
     }
@@ -925,6 +970,8 @@ impl ApplicationHandler<RuffleEvent> for App {
                 frame_start: None,
                 next_subframe: 0,
                 movie_dirty: true,
+                drawn_subframe: 0,
+                refresh_interval: None,
                 event_loop_proxy,
             });
         }

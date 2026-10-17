@@ -1588,15 +1588,14 @@ impl RenderTargetMode {
     }
 }
 
-/// Passes Ruffle's perf flags on to the switches of the vendored wgpu-core's patches.
-/// Presents frames so that each stays on screen for at least `seconds` (on Metal, see the
-/// vendored wgpu-core's `ruffle_patch::set_present_min_duration`), which paces them evenly
-/// on the display's refresh grid.
-pub fn set_present_min_duration(seconds: Option<f64>) {
+/// Shows the next frame presented on this thread at the given time (on Metal, see the
+/// vendored wgpu-core's `ruffle_patch::set_present_time`), which paces frames evenly on the
+/// display's refresh grid.
+pub fn set_present_time(time: Option<std::time::Instant>) {
     #[cfg(not(target_family = "wasm"))]
-    wgpu_core::ruffle_patch::set_present_min_duration(seconds);
+    wgpu_core::ruffle_patch::set_present_time(time);
     #[cfg(target_family = "wasm")]
-    let _ = seconds;
+    let _ = time;
 }
 
 /// Measures how busy the GPU is, for `gpu_busy_fraction` (on Metal; it adds a completion
@@ -1617,6 +1616,7 @@ pub fn gpu_busy_fraction() -> Option<f64> {
     None
 }
 
+/// Passes Ruffle's perf flags on to the switches of the vendored wgpu-core's patches.
 fn apply_wgpu_core_switches() {
     #[cfg(not(target_family = "wasm"))]
     wgpu_core::ruffle_patch::set_share_command_buffers(ruffle_render::perf_flags::enabled(

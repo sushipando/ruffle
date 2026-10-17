@@ -355,60 +355,20 @@ impl GuiController {
         PhysicalPosition::new(x, y)
     }
 
-    pub fn render(&mut self, mut player: Option<MutexGuard<Player>>) {
-        self.pending_presents.wait();
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
-            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
-                // The acquired texture is still usable - no reason to waste
-                // this frame. The surface should ideally be reconfigured
-                // before the next acquire; usually a resize event arrives and
-                // does that, but not always (e.g. on a display transform
-                // change) - we accept staying suboptimal in that case for now.
-                surface_texture
-            }
-            state @ (wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated) => {
-                // Reconfigure the surface if lost or outdated.
-                // Some sources suggest ignoring `Outdated` and waiting for the next frame,
-                // but I suspect this advice is related explicitly to resizing,
-                // because the future resize event will reconfigure the surface.
-                // However, resizing is not the only possible reason for the surface
-                // to become outdated (resolution / refresh rate change, some internal
-                // platform-specific reasons, wgpu bugs?).
-                // Testing on Vulkan shows that reconfiguring the surface works in that case.
-                tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
-                self.reconfigure_surface();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                // Acquiring the frame took too long (a full second, as of wgpu 29).
-                // The best thing we can do is skip a frame and wait.
-                tracing::warn!("Surface acquisition timed out, skipping a frame");
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                // The window is occluded (e.g. minimized or fully covered by
-                // another window), so there is no point in drawing anything.
-                // We normally don't even get here, as `WindowEvent::Occluded`
-                // makes us skip rendering entirely - but the two can race, and
-                // not every platform reports occlusion through winit.
-                // Unlike `Timeout`, this returns immediately, so it would repeat
-                // at the movie's frame rate: keep it quiet, it's not an error.
-                tracing::trace!("Surface is occluded, skipping a frame");
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                // Generic error, not much we can do.
-                panic!("wgpu: Acquiring a texture failed with a validation error");
-            }
-        };
-
-        #[cfg(feature = "tracy_images")]
-        if player.is_none() {
-            self.tracy_frame_captures
-                .set_target(&self.descriptors.device, None);
-        }
-
+    /// Runs the GUI, and presents a frame showing it over the movie (`movie_drawn` says
+    /// whether the movie was just drawn again). Returns how long it waited for a surface
+    /// texture to draw into, which is how long the frames presented before were still
+    /// waiting to be shown.
+    ///
+    /// When neither the movie nor the GUI has anything new to show, nothing is presented.
+    /// The frame is shown at `present_time` if given (see `MainWindow::present_time`),
+    /// otherwise as soon as possible.
+    pub fn render(
+        &mut self,
+        mut player: Option<MutexGuard<Player>>,
+        movie_drawn: bool,
+        present_time: Option<Instant>,
+    ) -> Duration {
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let show_menu = self.window.fullscreen().is_none() && !self.no_gui;
         let mut full_output = self.egui_winit.egui_ctx().run_ui(raw_input, |ui| {
@@ -446,7 +406,80 @@ impl GuiController {
             .egui_winit
             .egui_ctx()
             .tessellate(full_output.shapes, full_output.pixels_per_point);
-        self.shows_ui = !clipped_primitives.is_empty();
+        let showed_ui = std::mem::replace(&mut self.shows_ui, !clipped_primitives.is_empty());
+        // Texture updates don't need a frame to be presented (nor do they wait for one).
+        for (id, image_deltas) in full_output.textures_delta.set.drain() {
+            for image_delta in &image_deltas {
+                self.egui_renderer.update_texture(
+                    &self.descriptors.device,
+                    &self.descriptors.queue,
+                    id,
+                    image_delta,
+                );
+            }
+        }
+        if !movie_drawn && !showed_ui && !self.shows_ui {
+            self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+            return Duration::ZERO;
+        }
+
+        self.pending_presents.wait();
+        let acquire_start = Instant::now();
+        let surface_texture = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
+                // The acquired texture is still usable - no reason to waste
+                // this frame. The surface should ideally be reconfigured
+                // before the next acquire; usually a resize event arrives and
+                // does that, but not always (e.g. on a display transform
+                // change) - we accept staying suboptimal in that case for now.
+                surface_texture
+            }
+            state @ (wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated) => {
+                // Reconfigure the surface if lost or outdated.
+                // Some sources suggest ignoring `Outdated` and waiting for the next frame,
+                // but I suspect this advice is related explicitly to resizing,
+                // because the future resize event will reconfigure the surface.
+                // However, resizing is not the only possible reason for the surface
+                // to become outdated (resolution / refresh rate change, some internal
+                // platform-specific reasons, wgpu bugs?).
+                // Testing on Vulkan shows that reconfiguring the surface works in that case.
+                tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
+                self.reconfigure_surface();
+                self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                return acquire_start.elapsed();
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                // Acquiring the frame took too long (a full second, as of wgpu 29).
+                // The best thing we can do is skip a frame and wait.
+                tracing::warn!("Surface acquisition timed out, skipping a frame");
+                self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                return acquire_start.elapsed();
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                // The window is occluded (e.g. minimized or fully covered by
+                // another window), so there is no point in drawing anything.
+                // We normally don't even get here, as `WindowEvent::Occluded`
+                // makes us skip rendering entirely - but the two can race, and
+                // not every platform reports occlusion through winit.
+                // Unlike `Timeout`, this returns immediately, so it would repeat
+                // at the movie's frame rate: keep it quiet, it's not an error.
+                tracing::trace!("Surface is occluded, skipping a frame");
+                self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                return acquire_start.elapsed();
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                // Generic error, not much we can do.
+                panic!("wgpu: Acquiring a texture failed with a validation error");
+            }
+        };
+        let acquire_wait = acquire_start.elapsed();
+
+        #[cfg(feature = "tracy_images")]
+        if player.is_none() {
+            self.tracy_frame_captures
+                .set_target(&self.descriptors.device, None);
+        }
 
         let scale_factor = self.window.scale_factor() as f32;
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -460,17 +493,6 @@ impl GuiController {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("egui encoder"),
                 });
-
-        for (id, image_deltas) in full_output.textures_delta.set.drain() {
-            for image_delta in &image_deltas {
-                self.egui_renderer.update_texture(
-                    &self.descriptors.device,
-                    &self.descriptors.queue,
-                    id,
-                    image_delta,
-                );
-            }
-        }
 
         let mut command_buffers = self.egui_renderer.update_buffers(
             &self.descriptors.device,
@@ -528,6 +550,7 @@ impl GuiController {
         let queue = self.descriptors.queue.clone();
         let present = move || {
             queue.submit(command_buffers);
+            ruffle_render_wgpu::backend::set_present_time(present_time);
             queue.present(surface_texture);
         };
         // The movie's frame may still be being submitted on the renderer's submit
@@ -551,15 +574,7 @@ impl GuiController {
             _ => present(),
         }
 
-        // Free textures only after submitting the command buffer that may still
-        // reference them.  Destroying a texture before its usage is submitted
-        // causes a wgpu validation panic.
-        if !full_output.textures_delta.free.is_empty() {
-            self.pending_presents.wait();
-        }
-        for id in full_output.textures_delta.free.drain() {
-            self.egui_renderer.free_texture(&id);
-        }
+        self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
 
         #[cfg(feature = "tracy")]
         tracing_tracy::client::frame_mark();
@@ -567,6 +582,21 @@ impl GuiController {
         {
             self.pending_presents.wait();
             self.tracy_frame_captures.finish_frame();
+        }
+
+        acquire_wait
+    }
+
+    /// Frees textures the GUI no longer uses: only after submitting the command buffers
+    /// that may still reference them (destroying a texture before its usage is submitted
+    /// causes a wgpu validation panic).
+    fn free_textures(&mut self, textures: impl IntoIterator<Item = egui::TextureId>) {
+        let mut textures = textures.into_iter().peekable();
+        if textures.peek().is_some() {
+            self.pending_presents.wait();
+        }
+        for id in textures {
+            self.egui_renderer.free_texture(&id);
         }
     }
 

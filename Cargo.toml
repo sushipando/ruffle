@@ -211,10 +211,10 @@ codegen-units = 64
 # forks of their repositories ("Ruffle patch" comments mark the changes). All
 # wgpu crates come from the fork, so that they share one `wgpu-types` and `naga`.
 [patch.crates-io]
-wgpu = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-4" }
-wgpu-core = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-4" }
-wgpu-hal = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-4" }
-wgpu-types = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-4" }
-naga = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-4" }
+wgpu = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-5" }
+wgpu-core = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-5" }
+wgpu-hal = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-5" }
+wgpu-types = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-5" }
+naga = { git = "https://github.com/sushipando/wgpu", tag = "perf-30.0.1-5" }
 gc-arena = { git = "https://github.com/sushipando/gc-arena", tag = "perf-0.7.0-1" }
 gc-arena-derive = { git = "https://github.com/sushipando/gc-arena", tag = "perf-0.7.0-1" }
