@@ -1163,6 +1163,25 @@ second fires events and defines its class), then loads a third and closes the `L
 (nothing fires or is defined). Without the change, the first and third files' classes were
 defined, and the third file fired `init` and `complete`.
 
+### 56. Keys are released when the window loses focus
+
+*Files: `desktop/src/app.rs` (`held_keys`, `release_keys`).*
+
+The player only learns that a key was released from the window's key events, and a window
+doesn't get them while it isn't focused. A key held while switching to another window (such
+as Shift, in a shortcut that switches windows or takes a screenshot) stayed pressed for the
+player until it was pressed again. Mouse events take their `shiftKey`, `ctrlKey` and
+`altKey` from the keys the player thinks are pressed, so every click was then a shift-click.
+Flash Player takes them from the system with each event.
+
+The desktop player now remembers which keys it told the player are pressed, and releases
+them all when the window loses focus (as SDL does, for example). Modifier keys are also
+released when the window's modifier state says they aren't pressed, which the window reports
+again with the next input once it's focused. A key released while the context menu is open
+is released too (those events used to be dropped). Checked by holding Shift while switching
+to another window, releasing it there, and clicking in the movie after coming back: the
+click had `shiftKey` set before, and not after.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

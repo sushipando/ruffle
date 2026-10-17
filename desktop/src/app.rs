@@ -10,7 +10,9 @@ use anyhow::Error;
 use gilrs::{Event, EventType, Gilrs};
 use ruffle_core::FloatDuration;
 use ruffle_core::PlayerEvent;
-use ruffle_core::events::{ImeEvent, ImeNotification, PlayerNotification};
+use ruffle_core::events::{
+    ImeEvent, ImeNotification, KeyDescriptor, PhysicalKey, PlayerNotification,
+};
 use ruffle_core::swf::HeaderExt;
 use ruffle_frontend_utils::content::ContentDescriptor;
 use ruffle_render::backend::ViewportDimensions;
@@ -33,6 +35,8 @@ struct MainWindow {
     occluded: bool,
     mouse_pos: PhysicalPosition<f64>,
     modifiers: Modifiers,
+    /// The keys the player was told are pressed, and not yet that they were released.
+    held_keys: Vec<KeyDescriptor>,
     min_window_size: LogicalSize<u32>,
     /// The window's size limit: the area covered by all monitors (see `get_screen_size`),
     /// raised when monitors are added or rearranged.
@@ -232,6 +236,7 @@ impl MainWindow {
                 self.player.handle_event(PlayerEvent::FocusGained);
             }
             WindowEvent::Focused(false) => {
+                self.release_keys(|_| true);
                 self.player.handle_event(PlayerEvent::FocusLost);
             }
             WindowEvent::MouseInput { button, state, .. } => {
@@ -309,10 +314,23 @@ impl MainWindow {
                 self.check_redraw();
             }
             WindowEvent::ModifiersChanged(new_modifiers) => {
+                let state = new_modifiers.state();
+                self.release_keys(|held| match held.physical_key {
+                    PhysicalKey::ShiftLeft | PhysicalKey::ShiftRight => !state.shift_key(),
+                    PhysicalKey::ControlLeft | PhysicalKey::ControlRight => !state.control_key(),
+                    PhysicalKey::AltLeft | PhysicalKey::AltRight => !state.alt_key(),
+                    PhysicalKey::SuperLeft | PhysicalKey::SuperRight => !state.super_key(),
+                    _ => false,
+                });
                 self.modifiers = new_modifiers;
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.gui.is_context_menu_visible() {
+                    // A key pressed before the menu opened is still released.
+                    if event.state == ElementState::Released {
+                        let key = winit_input_to_ruffle_key_descriptor(&event);
+                        self.release_keys(|held| same_key(held, &key));
+                    }
                     return;
                 }
 
@@ -331,6 +349,9 @@ impl MainWindow {
                 let key = winit_input_to_ruffle_key_descriptor(&event);
                 match event.state {
                     ElementState::Pressed => {
+                        if !self.held_keys.iter().any(|held| same_key(held, &key)) {
+                            self.held_keys.push(key);
+                        }
                         self.player.handle_event(PlayerEvent::KeyDown { key });
                         if let Some(control_code) =
                             winit_to_ruffle_text_control(&event, self.modifiers)
@@ -345,6 +366,7 @@ impl MainWindow {
                         }
                     }
                     ElementState::Released => {
+                        self.held_keys.retain(|held| !same_key(held, &key));
                         self.player.handle_event(PlayerEvent::KeyUp { key });
                     }
                 };
@@ -715,6 +737,23 @@ impl MainWindow {
         }));
     }
 
+    /// Tells the player that the held keys for which `released` is true were released.
+    /// The player only learns that a key was released from the window's events, and the
+    /// window doesn't get them while it isn't focused: for example, Shift held in a
+    /// shortcut that switches to another window would stay pressed, and every click would
+    /// be a shift-click. So keys are released when the window loses focus, and modifier
+    /// keys when the window's modifiers say they aren't pressed (which it reports again
+    /// with the next input once it's focused).
+    fn release_keys(&mut self, released: impl Fn(&KeyDescriptor) -> bool) {
+        let (keys, held) = std::mem::take(&mut self.held_keys)
+            .into_iter()
+            .partition(|key| released(key));
+        self.held_keys = held;
+        for key in keys {
+            self.player.handle_event(PlayerEvent::KeyUp { key });
+        }
+    }
+
     fn check_redraw(&self) {
         let player = self.player.get();
         if player.map(|p| p.needs_render()).unwrap_or_default() || self.gui.needs_render() {
@@ -877,6 +916,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 occluded: false,
                 mouse_pos: PhysicalPosition::new(0.0, 0.0),
                 modifiers: Modifiers::default(),
+                held_keys: Vec::new(),
                 time: Instant::now(),
                 next_frame_time: None,
                 next_tick_time: None,
@@ -1051,4 +1091,9 @@ enum LoadingState {
     Loading,
     WaitingForResize,
     Loaded,
+}
+
+/// Whether two key events are for the same key (as the player matches presses and releases).
+fn same_key(a: &KeyDescriptor, b: &KeyDescriptor) -> bool {
+    a.physical_key == b.physical_key && a.key_location == b.key_location
 }
