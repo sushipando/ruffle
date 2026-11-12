@@ -5,7 +5,8 @@ package {
     import flash.system.*;
 
     // Starting another load with a Loader cancels the load in progress, and so does
-    // Loader.close(): a cancelled load fires no events and defines no classes.
+    // Loader.close(): a cancelled load fires no events and defines no classes. A load
+    // started from the ioError handler of a failed load replaces it.
     public class Test extends MovieClip {
         private var dom:ApplicationDomain = new ApplicationDomain(ApplicationDomain.currentDomain);
         private var ldr:Loader = new Loader();
@@ -32,6 +33,9 @@ package {
             events.push(e.type);
             if (e.type == Event.COMPLETE) {
                 trace("complete " + ldr.contentLoaderInfo.url.split("/").pop() + " " + definitions());
+            } else if (e.type == IOErrorEvent.IO_ERROR) {
+                trace("ioError, loading ItemC.swf from the handler");
+                ldr.load(new URLRequest("ItemC.swf"), new LoaderContext(false, dom));
             }
         }
 
@@ -50,6 +54,11 @@ package {
             } else if (frame == 10) {
                 trace("events: " + events.join(" "));
                 trace(definitions());
+                events = [];
+                trace("load missing.swf");
+                ldr.load(new URLRequest("missing.swf"), new LoaderContext(false, dom));
+            } else if (frame == 16) {
+                trace("events: " + events.join(" "));
                 removeEventListener(Event.ENTER_FRAME, onFrame);
             }
         }

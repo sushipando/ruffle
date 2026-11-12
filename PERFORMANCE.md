@@ -1181,7 +1181,10 @@ load manager: their downloads may still finish, but are then ignored, without lo
 error. The `avm2/loader_cancel` test loads one file and then another right away (only the
 second fires events and defines its class), then loads a third and closes the `Loader`
 (nothing fires or is defined). Without the change, the first and third files' classes were
-defined, and the third file fired `init` and `complete`.
+defined, and the third file fired `init` and `complete`. It then loads a missing file and
+starts another load from the `ioError` handler: that cancels the failed load while its
+error is still being reported, which must not expect the loader to still be there (it
+panicked at first).
 
 ### 56. Keys are released when the window loses focus
 

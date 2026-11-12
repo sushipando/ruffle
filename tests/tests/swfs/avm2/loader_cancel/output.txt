@@ -4,3 +4,7 @@ events: init complete
 load ItemC.swf, then close()
 events: 
 ItemA=false ItemB=true ItemC=false
+load missing.swf
+ioError, loading ItemC.swf from the handler
+complete ItemC.swf ItemA=false ItemB=true ItemC=true
+events: ioError init complete

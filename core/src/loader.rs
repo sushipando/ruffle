@@ -2368,8 +2368,11 @@ impl<'gc> MovieLoader<'gc> {
             }
         }
 
-        let loader = uc.load_manager.get_loader_mut(handle).unwrap();
-        loader.loader_status = LoaderStatus::Failed;
+        // An event handler may have closed the loader already (or started another load
+        // with it, which cancels this one).
+        if let Some(loader) = uc.load_manager.get_loader_mut(handle) {
+            loader.loader_status = LoaderStatus::Failed;
+        }
 
         Ok(())
     }
