@@ -41,11 +41,15 @@ pub struct LeafLayer {
     pub destination: wgpu::Texture,
 }
 
+/// Whether a layer of this size is small enough for the atlas.
+pub fn fits(width: u32, height: u32) -> bool {
+    width <= MAX_LAYER_SIZE && height <= MAX_LAYER_SIZE
+}
+
 /// Whether a layer with these commands can be rendered in the atlas: it must only
 /// contain plain draws (no masks or nested layers), and be reasonably small.
 pub fn is_leaf(commands: &CommandList, width: u32, height: u32) -> bool {
-    width <= MAX_LAYER_SIZE
-        && height <= MAX_LAYER_SIZE
+    fits(width, height)
         && commands.commands.iter().all(|command| {
             matches!(
                 command,

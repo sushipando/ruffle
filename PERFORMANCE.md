@@ -1591,6 +1591,11 @@ that each pass has its own command buffer.
 `RUFFLE_BLEND_DEBUG=1` prints each display object with a `Layer` or `Alpha` blend mode
 once, with its path, class, layer bounds and children's blend modes (`[blend]`).
 
+`[gpu-named]` also counts, per frame, cached bitmaps drawn in the layer atlas
+(`cab-atlas/yes`) and why the others weren't: `clear` (an opaque background), `size`,
+`blend`, `mask` or `commands` (what they contain), or `nested` (they draw another cached
+bitmap from the same frame).
+
 ### Metal System Trace
 
 Instruments' Metal System Trace shows what the GPU actually executes, per encoder,
@@ -1710,10 +1715,24 @@ hasn't been measured at 60 fps. What's left, roughly by expected value:
   could be skipped when nothing but the movie is shown. Each pass on the main target
   beyond the first (blend layers that can't be batched, 27-28) still loads and stores
   58 MB of samples; memoryless samples would need the frame to be a single pass.
+* **Filtered cached bitmaps, in the heaviest scenes.** A Metal System Trace of a scene
+  with ~20 animated objects under glows (2880x1800, 58 frames per second, 9.6 ms of GPU
+  per frame, with 58-60): draws 4.5 ms (the main target plus ~15 passes for layers and
+  cached bitmaps the atlas can't take, see the `cab-atlas` counters), filters 3.3 ms in
+  ~35 small passes (16 `Filter batch`, 18 `Blur filter`: mostly per-pass overhead, as the
+  blurred area is small), texture copies 1.7 ms in ~45 blits (each filtered cached
+  bitmap's pixels are copied three times a frame: out of the layer atlas into its texture,
+  into the filter batch's atlas, and back from the filtered result), the layer atlas
+  passes 0.6 ms, the GUI's pass 0.3 ms. Drawing cached bitmaps straight into the filter
+  batch's atlas would save two of the three copies; fewer, larger filter passes would save
+  overhead.
 
 Measured and ruled out: memoryless MSAA (passes on the main multisampled target are
 expensive, ~0.45 ms each in 28, but 27-28 left one or two per frame; 58 now avoids the
 last pass's store), more aggressive
 blur downscaling (blur cost was per-pass overhead, not
-texture samples, once 25-26 were in), and running CPU work earlier (24: in GPU-bound
-scenes the CPU already waits for drawables).
+texture samples, once 25-26 were in), running CPU work earlier (24: in GPU-bound
+scenes the CPU already waits for drawables), and drawing blend layers from their place in
+the layer atlas instead of copying each into a texture of its own (4): with ~95 such
+layers per frame, GPU time per frame didn't change (7.2 ms either way, three times each in
+one session), so those copies are cheap, and the blits above are the cached bitmaps'.

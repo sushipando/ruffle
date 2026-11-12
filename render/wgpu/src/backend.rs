@@ -648,20 +648,51 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let is_atlased: Vec<bool> = cache_entries
             .iter()
             .map(|entry| {
+                use ruffle_render::commands::Command;
                 let texture = as_texture(&entry.handle);
-                ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LayerAtlas)
-                    && entry.clear.a == 0
-                    && entry.clear.r == 0
-                    && entry.clear.g == 0
-                    && entry.clear.b == 0
-                    && crate::surface::layer_atlas::is_leaf(
-                        &entry.commands,
-                        texture.texture.width(),
-                        texture.texture.height(),
-                    ) && !entry.commands.commands.iter().any(|command| {
-                    matches!(command, ruffle_render::commands::Command::RenderBitmap { bitmap, .. }
+                let (width, height) = (texture.texture.width(), texture.texture.height());
+                // Why an entry isn't atlased, for the `cab-atlas` counters.
+                let reason = if !ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::LayerAtlas,
+                ) {
+                    Some("off")
+                } else if entry.clear.a != 0
+                    || entry.clear.r != 0
+                    || entry.clear.g != 0
+                    || entry.clear.b != 0
+                {
+                    Some("clear")
+                } else if !crate::surface::layer_atlas::fits(width, height) {
+                    Some("size")
+                } else if !crate::surface::layer_atlas::is_leaf(&entry.commands, width, height) {
+                    Some(
+                        if entry.commands.commands.iter().any(|command| {
+                            matches!(command, Command::Blend(..) | Command::BlendBounded(..))
+                        }) {
+                            "blend"
+                        } else if entry.commands.commands.iter().any(|command| {
+                            matches!(command, Command::PushMask | Command::RenderAlphaMask { .. })
+                        }) {
+                            "mask"
+                        } else {
+                            "commands"
+                        },
+                    )
+                } else if entry.commands.commands.iter().any(|command| {
+                    matches!(command, Command::RenderBitmap { bitmap, .. }
                             if cache_handles.contains(bitmap))
-                })
+                }) {
+                    Some("nested")
+                } else {
+                    None
+                };
+                if crate::perf_counters::enabled() {
+                    crate::perf_counters::count_named(format!(
+                        "cab-atlas/{}",
+                        reason.unwrap_or("yes")
+                    ));
+                }
+                reason.is_none()
             })
             .collect();
         let mut cache_entries: Vec<_> = cache_entries.into_iter().map(Some).collect();
