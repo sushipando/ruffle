@@ -10,7 +10,11 @@ pub struct MovieViewRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
+    /// A quad over the whole viewport (the window under the menu, if it's shown).
     vertices: wgpu::Buffer,
+    /// A quad over the whole render pass viewport, for drawing a region of the movie
+    /// into a viewport set to its place (see `MovieView::render`).
+    unit_vertices: wgpu::Buffer,
 }
 
 fn get_vertices(has_menu: bool, height: u32, scale_factor: f64) -> [[f32; 4]; 6] {
@@ -127,12 +131,18 @@ impl MovieViewRenderer {
             contents: bytemuck::cast_slice(&get_vertices(has_menu, height, scale_factor)),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        let unit_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&get_vertices(false, 1, 1.0)),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
         Self {
             bind_group_layout,
             pipeline,
             sampler,
             vertices,
+            unit_vertices,
         }
     }
 
@@ -151,9 +161,16 @@ impl MovieViewRenderer {
     }
 }
 
+/// The texture the movie is drawn into, drawn onto the window by the GUI's render pass.
 #[derive(Debug)]
 pub struct MovieView {
     renderer: Arc<MovieViewRenderer>,
+    /// The viewport's size.
+    width: u32,
+    height: u32,
+    /// The part of the viewport that `texture` holds, if not all of it (the rest is the
+    /// letterbox, see `RenderTarget::set_visible_region`).
+    region: Option<(i32, i32, u32, u32)>,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     #[cfg(feature = "tracy_images")]
@@ -168,18 +185,43 @@ impl MovieView {
         height: u32,
         #[cfg(feature = "tracy_images")] tracy_frame_captures: crate::tracy::FrameCapturesHolder,
     ) -> Self {
+        Self::with_region(
+            renderer,
+            device,
+            width,
+            height,
+            None,
+            #[cfg(feature = "tracy_images")]
+            tracy_frame_captures,
+        )
+    }
+
+    fn with_region(
+        renderer: Arc<MovieViewRenderer>,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        region: Option<(i32, i32, u32, u32)>,
+        #[cfg(feature = "tracy_images")] tracy_frame_captures: crate::tracy::FrameCapturesHolder,
+    ) -> Self {
+        let (texture_width, texture_height) =
+            region.map_or((width, height), |(_, _, width, height)| (width, height));
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: texture_width,
+                height: texture_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // Frames are drawn straight into it (see `RenderTargetFrame::texture`).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
@@ -201,6 +243,9 @@ impl MovieView {
         tracy_frame_captures.set_target(device, Some(&texture));
         Self {
             renderer,
+            width,
+            height,
+            region,
             texture,
             bind_group,
             #[cfg(feature = "tracy_images")]
@@ -208,15 +253,41 @@ impl MovieView {
         }
     }
 
+    /// Draws the movie onto the window, in a pass over the whole window (of
+    /// `window_size`, with the menu's height above the viewport); a region of it in its
+    /// place, the rest being left as cleared.
     pub fn render(
         &self,
         renderer: &MovieViewRenderer,
         render_pass: &mut wgpu::RenderPass<'static>,
+        window_size: (u32, u32),
+        menu_height: f32,
     ) {
         render_pass.set_pipeline(&renderer.pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.set_vertex_buffer(0, renderer.vertices.slice(..));
-        render_pass.draw(0..6, 0..1);
+        if let Some((x, y, width, height)) = self.region {
+            render_pass.set_viewport(
+                x as f32,
+                y as f32 + menu_height,
+                width as f32,
+                height as f32,
+                0.0,
+                1.0,
+            );
+            render_pass.set_vertex_buffer(0, renderer.unit_vertices.slice(..));
+            render_pass.draw(0..6, 0..1);
+            render_pass.set_viewport(
+                0.0,
+                0.0,
+                window_size.0 as f32,
+                window_size.1 as f32,
+                0.0,
+                1.0,
+            );
+        } else {
+            render_pass.set_vertex_buffer(0, renderer.vertices.slice(..));
+            render_pass.draw(0..6, 0..1);
+        }
     }
 }
 
@@ -224,11 +295,13 @@ impl RenderTarget for MovieView {
     type Frame = MovieViewFrame;
 
     fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        *self = MovieView::new(
+        // The region is set again for the new size before the next frame.
+        *self = MovieView::with_region(
             self.renderer.clone(),
             device,
             width,
             height,
+            None,
             #[cfg(feature = "tracy_images")]
             self.tracy_frame_captures.clone(),
         );
@@ -239,17 +312,37 @@ impl RenderTarget for MovieView {
     }
 
     fn width(&self) -> u32 {
-        self.texture.width()
+        self.width
     }
 
     fn height(&self) -> u32 {
-        self.texture.height()
+        self.height
     }
 
     fn get_next_texture(&mut self) -> Option<Self::Frame> {
-        Some(MovieViewFrame(
-            self.texture.create_view(&Default::default()),
-        ))
+        Some(MovieViewFrame {
+            view: self.texture.create_view(&Default::default()),
+            texture: self.texture.clone(),
+        })
+    }
+
+    fn set_visible_region(
+        &mut self,
+        device: &wgpu::Device,
+        region: Option<(i32, i32, u32, u32)>,
+    ) -> bool {
+        if region != self.region {
+            *self = MovieView::with_region(
+                self.renderer.clone(),
+                device,
+                self.width,
+                self.height,
+                region,
+                #[cfg(feature = "tracy_images")]
+                self.tracy_frame_captures.clone(),
+            );
+        }
+        true
     }
 
     fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
@@ -268,14 +361,21 @@ impl RenderTarget for MovieView {
 }
 
 #[derive(Debug)]
-pub struct MovieViewFrame(wgpu::TextureView);
+pub struct MovieViewFrame {
+    view: wgpu::TextureView,
+    texture: wgpu::Texture,
+}
 
 impl RenderTargetFrame for MovieViewFrame {
     fn into_view(self) -> wgpu::TextureView {
-        self.0
+        self.view
     }
 
     fn view(&self) -> &wgpu::TextureView {
-        &self.0
+        &self.view
+    }
+
+    fn texture(&self) -> Option<&wgpu::Texture> {
+        Some(&self.texture)
     }
 }

@@ -531,7 +531,12 @@ impl GuiController {
                 .forget_lifetime();
 
             if let Some(movie_view) = movie_view {
-                movie_view.render(&self.movie_view_renderer, &mut render_pass);
+                movie_view.render(
+                    &self.movie_view_renderer,
+                    &mut render_pass,
+                    (self.size.width, self.size.height),
+                    self.height_offset() as f32,
+                );
             }
 
             self.egui_renderer

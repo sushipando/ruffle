@@ -377,7 +377,10 @@ impl CommandTarget {
     }
 
     /// Like `color_attachments`, but if `is_last` is set, the pass also resolves the
-    /// target (so that no separate resolve is needed afterwards).
+    /// target (so that no separate resolve is needed afterwards), and doesn't store the
+    /// samples: nothing reads them after the last pass, only the resolved texture, and
+    /// storing them costs a write of the whole multisampled target (four times the
+    /// resolved one).
     pub fn color_attachments_for_pass(
         &self,
         is_last: bool,
@@ -388,9 +391,16 @@ impl CommandTarget {
                 (&mut attachment, &self.resolve_buffer)
         {
             attachment.resolve_target = Some(resolve_buffer.view());
+            if Self::discard_samples() {
+                attachment.ops.store = wgpu::StoreOp::Discard;
+            }
             self.needs_resolve.set(false);
         }
         attachment
+    }
+
+    fn discard_samples() -> bool {
+        ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::DiscardSamples)
     }
 
     pub fn color_attachments(&self) -> Option<wgpu::RenderPassColorAttachment<'_>> {
@@ -424,10 +434,13 @@ impl CommandTarget {
         self.sample_count
     }
 
+    /// The stencil buffer, for a pass that uses masks. The last pass on the target doesn't
+    /// store it (like the samples, see `color_attachments_for_pass`).
     pub fn stencil_attachment(
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
+        is_last: bool,
     ) -> Option<wgpu::RenderPassDepthStencilAttachment<'_>> {
         let new_buffer = self.depth.get().is_none();
         let stencil = self
@@ -442,7 +455,11 @@ impl CommandTarget {
                 } else {
                     wgpu::LoadOp::Load
                 },
-                store: wgpu::StoreOp::Store,
+                store: if is_last && Self::discard_samples() {
+                    wgpu::StoreOp::Discard
+                } else {
+                    wgpu::StoreOp::Store
+                },
             }),
         })
     }

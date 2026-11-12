@@ -10,6 +10,15 @@ pub trait RenderTargetFrame: Debug {
     fn into_view(self) -> wgpu::TextureView;
 
     fn view(&self) -> &wgpu::TextureView;
+
+    /// The frame's texture, if frames may be drawn straight into it (as the resolve target
+    /// of multisampled drawing, or as the frame buffer without multisampling), instead of
+    /// into a texture that's then copied into it. It must be usable as a render attachment,
+    /// a texture binding and a copy source (blends read it back). `None` for frames that
+    /// must be copied into, such as a swap chain's.
+    fn texture(&self) -> Option<&wgpu::Texture> {
+        None
+    }
 }
 
 pub trait RenderTarget: Debug + 'static {
@@ -40,6 +49,20 @@ pub trait RenderTarget: Debug + 'static {
     /// so that rendered frames may instead be finished and submitted on another
     /// thread (overlapping with whatever the caller does next).
     fn can_submit_asynchronously(&self) -> bool {
+        false
+    }
+
+    /// Asks the target to hold only `region` (`(x, y, width, height)`) of the viewport, at
+    /// the region's size, and to show the rest blank: nothing is drawn outside it (the
+    /// letterbox, see `RenderBackend::set_visible_region`), so frames of the region's size
+    /// can then be drawn straight into the target's frames (see `RenderTargetFrame::texture`)
+    /// instead of being copied into the middle of viewport-sized ones. Returns whether the
+    /// target does so; the default can't. `None` asks for the whole viewport again.
+    fn set_visible_region(
+        &mut self,
+        _device: &wgpu::Device,
+        _region: Option<(i32, i32, u32, u32)>,
+    ) -> bool {
         false
     }
 }
@@ -204,15 +227,22 @@ pub struct TextureTarget {
 }
 
 #[derive(Debug)]
-pub struct TextureTargetFrame(wgpu::TextureView);
+pub struct TextureTargetFrame {
+    view: wgpu::TextureView,
+    texture: wgpu::Texture,
+}
 
 impl RenderTargetFrame for TextureTargetFrame {
     fn view(&self) -> &wgpu::TextureView {
-        &self.0
+        &self.view
     }
 
     fn into_view(self) -> wgpu::TextureView {
-        self.0
+        self.view
+    }
+
+    fn texture(&self) -> Option<&wgpu::Texture> {
+        Some(&self.texture)
     }
 }
 
@@ -299,9 +329,10 @@ impl RenderTarget for TextureTarget {
     }
 
     fn get_next_texture(&mut self) -> Option<Self::Frame> {
-        Some(TextureTargetFrame(
-            self.texture.create_view(&Default::default()),
-        ))
+        Some(TextureTargetFrame {
+            view: self.texture.create_view(&Default::default()),
+            texture: self.texture.clone(),
+        })
     }
 
     #[instrument(level = "debug", skip_all)]

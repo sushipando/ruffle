@@ -74,6 +74,9 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     surface: Surface,
     /// See `RenderBackend::set_visible_region`.
     visible_region: Option<(i32, i32, u32, u32)>,
+    /// Whether the target's frames hold just `visible_region` (see
+    /// `RenderTarget::set_visible_region`).
+    frame_is_region: bool,
     /// A surface covering just `visible_region`, used instead of `surface` when set.
     region_surface: Option<((i32, i32, u32, u32), Surface)>,
     meshes: Vec<Mesh>,
@@ -276,6 +279,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target,
             surface,
             visible_region: None,
+            frame_is_region: false,
             region_surface: None,
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
@@ -463,6 +467,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 // Only worth it if it saves a meaningful amount.
                 && (w as u64 * h as u64) * 10 < (width as u64 * height as u64) * 9
         });
+        self.frame_is_region = self
+            .target
+            .set_visible_region(&self.descriptors.device, self.visible_region);
     }
 
     fn create_context3d(
@@ -951,26 +958,55 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             }
             None => &self.surface,
         };
-        surface.draw_commands_and_copy_to(
-            frame_output.view(),
-            RenderTargetMode::FreshWithColor(wgpu::Color {
-                r: f64::from(clear.r) / 255.0,
-                g: f64::from(clear.g) / 255.0,
-                b: f64::from(clear.b) / 255.0,
-                a: f64::from(clear.a) / 255.0,
-            }),
-            &self.descriptors,
-            &mut self.active_frame.staging_belt,
-            &self.active_frame.dynamic_transforms,
-            &mut self
-                .profiler
-                .scope("Frame commands", &mut self.active_frame.command_encoder),
-            &self.meshes,
-            commands,
-            LayerRef::None,
-            &mut self.texture_pool,
-            self.visible_region,
-        );
+        let clear = wgpu::Color {
+            r: f64::from(clear.r) / 255.0,
+            g: f64::from(clear.g) / 255.0,
+            b: f64::from(clear.b) / 255.0,
+            a: f64::from(clear.a) / 255.0,
+        };
+        // Drawn straight into the frame's texture when it's the size drawn (resolved into
+        // it, when multisampled): a copy of the whole frame fewer.
+        let direct = frame_output.texture().filter(|texture| {
+            ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::DirectFrame)
+                && texture.width() == surface.size().width
+                && texture.height() == surface.size().height
+        });
+        let mut scope = self
+            .profiler
+            .scope("Frame commands", &mut self.active_frame.command_encoder);
+        if let Some(texture) = direct {
+            surface.draw_commands(
+                RenderTargetMode::ExistingWithColor(texture.clone(), clear),
+                &self.descriptors,
+                &self.meshes,
+                commands,
+                &mut self.active_frame.staging_belt,
+                &self.active_frame.dynamic_transforms,
+                &mut scope,
+                LayerRef::None,
+                &mut self.texture_pool,
+            );
+        } else {
+            surface.draw_commands_and_copy_to(
+                frame_output.view(),
+                RenderTargetMode::FreshWithColor(clear),
+                &self.descriptors,
+                &mut self.active_frame.staging_belt,
+                &self.active_frame.dynamic_transforms,
+                &mut scope,
+                &self.meshes,
+                commands,
+                LayerRef::None,
+                &mut self.texture_pool,
+                // A frame that holds just the region is copied into whole.
+                if self.frame_is_region {
+                    None
+                } else {
+                    self.visible_region
+                },
+            );
+        }
+        drop(scope);
         self.profiler
             .resolve_queries(&mut self.active_frame.command_encoder);
         self.active_frame.staging_belt.finish();

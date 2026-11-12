@@ -163,7 +163,7 @@ impl Surface {
         } else {
             commands
         };
-        let (chunks, leaf_layers) = chunk_blends(
+        let (mut chunks, leaf_layers) = chunk_blends(
             commands,
             descriptors,
             staging_belt,
@@ -193,6 +193,34 @@ impl Surface {
                 texture_pool,
                 self.quality,
             );
+        }
+
+        // Chunks are drawn with the stencil buffer attached only when they use masks. But
+        // passes with and without it can't be merged, and each pass on a multisampled
+        // target loads and stores all of its samples; so when any chunk needs it, all of
+        // them get it (draws that aren't masked then pass the stencil test trivially).
+        // Shader blends keep their own, as they don't support masks.
+        if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::StencilPerTarget)
+            && chunks.iter().any(|chunk| match chunk {
+                Chunk::Draw { needs_stencil, .. } | Chunk::Blend { needs_stencil, .. } => {
+                    *needs_stencil
+                }
+            })
+        {
+            for chunk in &mut chunks {
+                match chunk {
+                    Chunk::Draw { needs_stencil, .. }
+                    | Chunk::Blend {
+                        needs_stencil,
+                        blend_mode: ChunkBlendMode::Complex(_),
+                        ..
+                    } => *needs_stencil = true,
+                    Chunk::Blend {
+                        blend_mode: ChunkBlendMode::Shader(_),
+                        ..
+                    } => {}
+                }
+            }
         }
 
         // Complex blends whose composites haven't been drawn yet. They're drawn at the
@@ -269,7 +297,7 @@ impl Surface {
                         wgpu::RenderPassDescriptor {
                             color_attachments: &[target.color_attachments_for_pass(is_last)],
                             depth_stencil_attachment: if needs_stencil {
-                                target.stencil_attachment(descriptors, texture_pool)
+                                target.stencil_attachment(descriptors, texture_pool, is_last)
                             } else {
                                 None
                             },
@@ -619,13 +647,12 @@ impl Surface {
             .enumerate()
         {
             crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
+            let is_last = is_last && index + 1 == num_groups;
             let mut render_pass = draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: create_debug_label!("Complex blends").as_deref(),
-                color_attachments: &[
-                    target.color_attachments_for_pass(is_last && index + 1 == num_groups)
-                ],
+                color_attachments: &[target.color_attachments_for_pass(is_last)],
                 depth_stencil_attachment: if needs_stencil {
-                    target.stencil_attachment(descriptors, texture_pool)
+                    target.stencil_attachment(descriptors, texture_pool, is_last)
                 } else {
                     None
                 },

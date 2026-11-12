@@ -78,9 +78,18 @@ pub enum PerfFlag {
     /// Skip movie clips with nothing to do when a goto runs frame construction and frame
     /// scripts for the whole stage (see `MovieClip::settle` in core).
     SkipSettled,
+    /// Don't store the samples of a multisampled target (nor its stencil) after the last
+    /// pass on it, which only needs to resolve them (see `CommandTarget`).
+    DiscardSamples,
+    /// When any draw on a target uses the stencil buffer, attach it to every pass on the
+    /// target, so that chunks with and without masks are drawn in the same pass.
+    StencilPerTarget,
+    /// Draw frames straight into the render target's texture (resolving into it), where
+    /// it allows that, instead of into a pooled texture that's then copied into it.
+    DirectFrame,
 }
 
-const NAMES: [&str; 28] = [
+const NAMES: [&str; 31] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -109,9 +118,12 @@ const NAMES: [&str; 28] = [
     "paced-present",
     "parallel-tessellation",
     "skip-settled",
+    "discard-samples",
+    "stencil-per-target",
+    "direct-frame",
 ];
 
-static FLAGS: [AtomicBool; 28] = [
+static FLAGS: [AtomicBool; 31] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -140,6 +152,9 @@ static FLAGS: [AtomicBool; 28] = [
     AtomicBool::new(true),  // paced-present
     AtomicBool::new(true),  // parallel-tessellation
     AtomicBool::new(true),  // skip-settled
+    AtomicBool::new(true),  // discard-samples
+    AtomicBool::new(true),  // stencil-per-target
+    AtomicBool::new(true),  // direct-frame
 ];
 
 #[inline]

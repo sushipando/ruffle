@@ -1222,6 +1222,66 @@ alone. Effect (24 fps with timers, `--interpolate 6`, a Metal System Trace while
 around): before, it stayed at 1 frame per movie frame (25 presented per second, each on
 screen for anywhere from 1 to 8 refreshes); after, it kept 3 (71 per second).
 
+### 58. The last pass on a target doesn't store its samples
+
+*Files: `render/wgpu/src/surface/target.rs` (`color_attachments_for_pass`,
+`stencil_attachment`), `render/wgpu/src/surface.rs`.*
+
+Every render pass on a multisampled target stored all of its samples at the end (four per
+pixel at `StageQuality::HIGH`), and the stencil buffer when it had one, so that the next
+pass could load them. The last pass did too, although nothing reads them afterwards: what's
+used is the resolved texture, which the last pass also writes (2). On a GPU that renders
+in tiles (Apple's), a pass's load and store are the only traffic its attachments cause,
+and a frame's main target is large (2514x1440 on a 5120x1440 display, letterboxed: 58 MB of
+samples and 14 MB of stencil), so with about 68 GB/s that store cost a sizeable part of
+every frame. The last pass on a target now resolves without storing (`StoreOp::Discard`,
+Metal's `MultisampleResolve` instead of `StoreAndMultisampleResolve`), and doesn't store
+the stencil either. Flag: `discard-samples`.
+
+Effect (M1, 5120x1440, 144 frames per second, GPU time per frame by command buffer label):
+a light scene's main pass went from 2.2-2.6 ms to 1.6-1.9 ms.
+
+### 59. The stencil buffer is attached for the whole target
+
+*Files: `render/wgpu/src/surface.rs` (`draw_commands`).*
+
+Draws are recorded in chunks (28), and each chunk had the stencil buffer attached only if it
+used masks. Chunks with and without it couldn't share a render pass, so a frame with masks
+anywhere in it (most content has a few) split into two or three passes on its main
+target, each loading and storing all of its samples (see 58). Now, when any chunk of a
+target needs the stencil buffer, every chunk gets it, and the whole frame is one pass:
+draws that aren't masked pass the stencil test trivially, which costs nothing
+noticeable. Shader blends keep their own setting, as they don't support masks. Flag:
+`stencil-per-target`.
+
+Effect (as in 58): the light scene's two passes, 1.2-1.4 ms and 1.1-1.3 ms, became one of
+1.6-1.9 ms; a frame has 2.5 passes instead of 3.5 (counting its blend layers).
+
+### 60. Frames are drawn straight into the window's texture
+
+*Files: `render/wgpu/src/target.rs` (`RenderTargetFrame::texture`,
+`RenderTarget::set_visible_region`), `render/wgpu/src/backend.rs` (`submit_frame`),
+`desktop/src/gui/movie.rs`, `desktop/src/gui/controller.rs`.*
+
+A frame was resolved into a pooled texture, which a pass then copied into the window's
+texture (the desktop player's `MovieView`, which the GUI's pass draws onto the window with
+the menu and any egui windows), clearing the letterbox around it black: a read and a write
+of the whole window every frame (43 MB on a 5120x1440 display), on top of the GUI's pass
+reading it again. Now a render target can say that its frames may be drawn into directly
+(`RenderTargetFrame::texture`: the frame's texture becomes the resolve target, or the
+frame buffer without multisampling, as cached bitmaps' textures already were), and can be
+asked to hold just the visible region (9) at the region's size
+(`RenderTarget::set_visible_region`): the `MovieView` does both, and draws its region in
+place with a viewport, over the black the GUI's pass clears to. The exporter's texture
+target allows direct drawing too (so the tests cover it); a swap chain's frames don't.
+Flag: `direct-frame`.
+
+Effect: the copy pass (0.3-0.65 ms per frame) is gone, and the GUI's pass reads a
+2514x1440 texture instead of 5120x1440. With 58 and 59 (same scenes, flags toggled in one
+session): the light scene's GPU time per frame went from 4.0 to 2.9-3.1 ms with each pass
+in its own command buffer (4.4 to 3.1 ms with shared command buffers, 20); a heavier scene
+(more animated objects) from 3.5 to 2.9-3.0 ms (3.4 to 3.1 ms). The test suite's images are unchanged.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
@@ -1586,7 +1646,9 @@ player): `bounded-blends`, `lazy-resolve`, `layer-atlas`, `visible-region`,
 library, see 21), `async-present`, `overlap-record`, `blur-merge` (off by default in the
 library, see 25), `fetch-blends`, `merge-chunks`, `cache-slack`, `batch-large-filters`,
 `cache-bind-groups`, `filter-together`, `direct-blends`, `release-shapes`, `evict-meshes`,
-`paced-present`. Measurement only (off): `skip-cache-filters`, `complex-as-normal`.
+`paced-present`, `parallel-tessellation`, `skip-settled`, `discard-samples`,
+`stencil-per-target`, `direct-frame`. Measurement only (off): `skip-cache-filters`,
+`complex-as-normal`.
 
 ### Measurement procedure
 
@@ -1641,8 +1703,17 @@ hasn't been measured at 60 fps. What's left, roughly by expected value:
   `MovieClipShared` smaller (box its rarely used label, scene and sound tables), and tune
   the GC pacing (see "Memory: long sessions").
 
+* **Memory traffic.** With 58-60, a 5120x1440 frame still writes its samples' resolve
+  (14 MB), and the GUI's pass reads that and writes the whole window (29 MB): about 0.6 ms
+  at the M1's bandwidth. Resolving straight into the window's own texture would need the
+  frame to be the window's size (a letterboxed frame is smaller, 9), and the GUI's pass
+  could be skipped when nothing but the movie is shown. Each pass on the main target
+  beyond the first (blend layers that can't be batched, 27-28) still loads and stores
+  58 MB of samples; memoryless samples would need the frame to be a single pass.
+
 Measured and ruled out: memoryless MSAA (passes on the main multisampled target are
-expensive, ~0.45 ms each in 28, but 27-28 left one or two per frame), more aggressive
+expensive, ~0.45 ms each in 28, but 27-28 left one or two per frame; 58 now avoids the
+last pass's store), more aggressive
 blur downscaling (blur cost was per-pass overhead, not
 texture samples, once 25-26 were in), and running CPU work earlier (24: in GPU-bound
 scenes the CPU already waits for drawables).
