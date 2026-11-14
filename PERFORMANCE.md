@@ -774,9 +774,9 @@ apart instead of every 41.7 ms: frames were presented as soon as they were drawn
 drawing times vary, so each frame stayed on screen for 5, 6 or 7 refreshes, which makes
 smooth motion (such as a rotating part) look uneven.
 
-When the display's refresh rate is a whole multiple of the rate frames are drawn at (for
-example 24 fps on 144 Hz, or 6 frames per movie frame with `--interpolate 6`), each frame
-is now shown at a time taken from the movie's clock: when it was due, plus a fixed delay
+When the display's refresh rate is a whole multiple of the frame rate (for example 24 fps
+on 144 Hz), or frames are drawn between movie frames (they're drawn every whole number of
+refreshes, see 61), each frame is now shown at a time taken from the movie's clock: when it was due, plus a fixed delay
 to draw it (`presentDrawable:atTime:`, patched wgpu-hal). The delay is two frame
 intervals, but at most four refreshes: with three drawables, frames presented further
 ahead would make drawing the next one wait for a drawable. Frames are then shown for the
@@ -804,8 +804,9 @@ with a median delay of 16-19 ms.
 (`schedule_subframes`, `render_fraction`, `adapt_interpolation`), `desktop/src/cli.rs`,
 `render/wgpu/src/filters/batch.rs` (`ScratchBuffers`).*
 
-`--interpolate N` draws N frames per movie frame (for example 6: a 24 fps movie at 144
-fps), blending moving objects between movie frames. Flash animations move, rotate, scale
+`--interpolate N` draws up to N frames per movie frame (for example 6: a 24 fps movie at
+144 fps on a 144 Hz display; 61 says how they're timed), blending moving objects between
+movie frames. Flash animations move, rotate, scale
 and fade objects by changing their transforms every frame, and draw other things by
 replacing objects' contents (frame-by-frame animation). So:
 * While interpolation is on, each display object records its transform (matrix and color
@@ -814,7 +815,7 @@ replacing objects' contents (frame-by-frame animation). So:
   library symbol, so that state resets on clone, and placing a child resets it) aren't
   blended.
 * While drawing frame j of N after a movie frame, the transform getters return the blend
-  at (j + 1) / N: each axis's angle and length are blended (so rotations don't shrink
+  at (j + 1) / N (when N fit in a movie frame; see 61 for when they don't): each axis's angle and length are blended (so rotations don't shrink
   halfway), and the translation and color transform linearly. Changes that are too large
   to be motion (moves over 100 pixels, turns over 90°, scaling by more than 4x, as when an
   animation jumps back to its start) aren't blended. The blend is cached per object and
@@ -834,8 +835,8 @@ movie frame, which waits for the movie frame to run, and still be shown on time)
 otherwise those whose next frame is due. A frame drawn after it was to be shown counts as
 skipped too. When more than a tenth of
 the frames are skipped for two seconds (not counting one-off stalls), it draws fewer:
-the next divisor of N, so that frames stay evenly spaced (6 → 3 → 2 → 1). After 4 seconds
-without skipped frames, it tries the next higher number. If frames are skipped again
+one every one more display refresh (61), so that frames stay evenly spaced. After 4
+seconds without skipped frames, it tries one refresh fewer again. If frames are skipped again
 within 10 seconds of that, it goes back down after one such second and waits twice as
 long before the next try (up to 64 seconds), so a heavy scene costs one uneven second
 about once a minute. It tries again sooner when the load (the busier of the GPU, measured
@@ -847,8 +848,8 @@ stayed at most 80%, which rarely held: the GPU's clock follows its load, so it l
 about as busy with less work (a scene at 55% GPU busy with 3 frames per movie frame was
 71% busy with 6, not 110%), and at 5120x1440 it stayed at 3 after any drop. It also never
 raised from 1, where frames weren't scheduled or counted. Each change is logged (at
-`info` level, shown by default), such as `[interpolate] 3 frames per movie frame
-(couldn't keep up)`. `RUFFLE_FIXED_INTERPOLATION` turns the adapting off (for measuring).
+`info` level, shown by default), such as `[interpolate] 3.00 frames per movie frame, one
+every 2 refreshes (couldn't keep up)`. `RUFFLE_FIXED_INTERPOLATION` turns the adapting off (for measuring).
 
 The batched filters (34) used to create their uniform and vertex buffers every pass, which
 was ~13% of render time at 144 fps. They now reuse buffers (`ScratchBuffers`), written
@@ -1281,6 +1282,50 @@ Effect: the copy pass (0.3-0.65 ms per frame) is gone, and the GUI's pass reads 
 session): the light scene's GPU time per frame went from 4.0 to 2.9-3.1 ms with each pass
 in its own command buffer (4.4 to 3.1 ms with shared command buffers, 20); a heavier scene
 (more animated objects) from 3.5 to 2.9-3.0 ms (3.4 to 3.1 ms). The test suite's images are unchanged.
+
+### 61. Frames between movie frames are drawn once every so many refreshes
+
+*Files: `desktop/src/app.rs` (`Subframes`, `subframes`, `every_range`,
+`schedule_subframes`, `render_fraction`, `adapt_interpolation`), `desktop/src/cli.rs`.*
+
+`--interpolate N` drew N frames per movie frame, and a divisor of N while they couldn't be
+drawn in time (41). That fits a display whose refresh rate is N times the frame rate (24
+fps and 6 on 144 Hz) and no other: on a 60 Hz display, 6 per movie frame are 144 frames a
+second, of which the display shows 60 at uneven intervals, and the next level, 3 (72 a
+second), fits no better, so motion was uneven at every level, and the paced presents (40)
+were off, since they need a whole number of refreshes per frame.
+
+Frames between movie frames are now drawn once every whole number of display refreshes
+(`every`, 1 to start with), up to N per movie frame: on 60 Hz, one per refresh is 2.5 per
+movie frame. When a whole number of them fit in a movie frame, they're timed from each
+movie frame as before, the last one showing the movie frame itself. Otherwise they follow
+one grid of times across movie frames, so that each is shown for the same number of
+refreshes, and each shows the blend at the time it's due (one step ahead, as before, would
+be past the movie frame for some of them, which would make the motion uneven). When
+frames can't be drawn in time, the adapting (41) draws one every one more refresh instead
+of the next divisor (on 60 Hz: 2.5, 1.25, then 0.83 per movie frame; on 144 Hz: 6, 3, 2,
+1.5, 1.2, 1), and comes back the same way. Without a known refresh interval, the step is
+the movie frame's duration over N, as before. The log says what's drawn: `[interpolate]
+2.50 frames per movie frame, one per refresh`.
+
+Two kinds of frames counted as skipped (for the adapting) that weren't. A frame that
+waited for a surface texture and was then presented after its time: with three surface
+textures and a pacing delay of two steps (40), the texture of the frame drawn three steps
+earlier is released only once that frame leaves the screen, so on a composited display
+every draw waits for most of a refresh and presents a little after its nominal time, and
+after one hitch the whole pipeline sits some milliseconds later for many frames; the
+frames are still shown one per refresh. In a light scene at 15% load, that made the level
+drop and climb back every 10-20 seconds. And a slot of the grid that fell due during such
+a wait: it's drawn (or skipped and counted) afterward, and was counted again.
+
+Effect (2560x1600 at 60 Hz, 24 fps content, `--interpolate 6`, 60-90 second runs): a light
+scene (GPU 3.5 ms per frame) draws 60.0 frames a second with none skipped, where before
+the two fixes above it alternated between 60 and 30 every 10-20 seconds (50 a second on
+average). A heavy scene (GPU 10 ms per frame, main thread 44% busy) kept one frame per
+refresh for the whole run (58 a second, 2 skipped a second, all of them slots whose time
+had passed after a long movie frame), where before the fixes it spent half the time at one
+every 2 refreshes. On 144 Hz, one per refresh is the 6 per movie frame drawn before, timed
+the same way.
 
 ## Memory: long sessions
 

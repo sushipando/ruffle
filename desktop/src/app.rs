@@ -16,6 +16,7 @@ use ruffle_core::events::{
 use ruffle_core::swf::HeaderExt;
 use ruffle_frontend_utils::content::ContentDescriptor;
 use ruffle_render::backend::ViewportDimensions;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -55,25 +56,39 @@ struct MainWindow {
     next_tick_time: Option<Instant>,
     /// How many frames are drawn per movie frame (see `--interpolate`), at most.
     max_interpolate: u32,
-    /// How many frames are drawn per movie frame now: lowered (to a divisor of
-    /// `max_interpolate`, so that frames stay evenly spaced) while frames can't be drawn
-    /// in time, and raised again later (see `adapt_interpolation`).
-    interpolate: u32,
+    /// How often frames are drawn between movie frames: one every this many display
+    /// refreshes (or, when the display's refresh interval isn't known, this many times
+    /// `frame_duration / max_interpolate`). Raised while frames can't be drawn in time,
+    /// and lowered again later (see `adapt_interpolation`); 0 draws none.
+    every: u32,
     adaptation: InterpolationAdaptation,
     /// The ideal time of the last movie frame, from which frames drawn between movie
     /// frames are timed.
     frame_start: Option<Instant>,
-    /// The next frame to draw (counted from `frame_start`).
-    next_subframe: u32,
+    /// When the next frame between movie frames is due (see `schedule_subframes`).
+    next_due: Option<Instant>,
     /// Whether the movie must be drawn again for the next redraw, apart from when the player
     /// says so (`Player::needs_render`). Other redraws (asked for by the GUI) only draw the
     /// GUI over the movie's last frame.
     movie_dirty: bool,
-    /// The frame (counted from `frame_start`) that the next redraw draws.
-    drawn_subframe: u32,
+    /// When the frame that the next redraw draws was due.
+    drawn_due: Option<Instant>,
     /// The display's refresh interval in seconds, if known (see `update_monitor`).
     refresh_interval: Option<f64>,
     event_loop_proxy: EventLoopProxy<RuffleEvent>,
+}
+
+/// How the frames between movie frames are timed (see `MainWindow::subframes`).
+struct Subframes {
+    /// The time between them, in seconds.
+    step: f64,
+    frame_duration: f64,
+    /// Whether a whole number of them fit in a movie frame: then they're timed from each
+    /// movie frame, the last one showing it; otherwise they follow one grid of times
+    /// across movie frames (see `MainWindow::render_fraction`).
+    aligned: bool,
+    /// Whether there's just one per movie frame (which shows it as is, without blending).
+    single: bool,
 }
 
 /// Counts for `MainWindow::adapt_interpolation`.
@@ -158,8 +173,9 @@ impl MainWindow {
                     && (self.movie_dirty || player.needs_render() || !player.is_playing())
                 {
                     self.movie_dirty = false;
-                    player.set_render_fraction(self.render_fraction());
-                    present_time = self.present_time(player.frame_duration_seconds());
+                    let frame_duration = player.frame_duration_seconds();
+                    player.set_render_fraction(self.render_fraction(frame_duration));
+                    present_time = self.present_time(frame_duration);
                     player.render();
                     movie_drawn = true;
                 }
@@ -167,7 +183,13 @@ impl MainWindow {
                 let waited = self.gui.render(player, movie_drawn, present_time);
                 // A frame drawn after it was to be shown is shown late (and the ones around
                 // it for longer): for `adapt_interpolation`, that's as bad as skipping it.
-                if present_time.is_some_and(|time| Instant::now() > time) {
+                // Not one that waited for a surface texture: the frames before it were
+                // still to be shown, so it's shown right after them however fast it was
+                // drawn (and when they're shown late, frames that are too late to draw are
+                // skipped instead).
+                if waited < Duration::from_millis(1)
+                    && present_time.is_some_and(|time| Instant::now() > time)
+                {
                     self.adaptation.skipped += 1;
                 }
                 // Waiting for a surface texture (for the frames before to be shown) isn't
@@ -529,15 +551,20 @@ impl MainWindow {
             let dt = FloatDuration::from_std(new_time.duration_since(self.time));
             // Waking up only to draw a frame between movie frames doesn't tick the player
             // (ticking also runs timers and mouse picking, which can take milliseconds).
-            let tick_due =
-                self.interpolate <= 1 || self.next_tick_time.is_none_or(|time| new_time >= time);
+            let tick_due = self.max_interpolate <= 1
+                || self.next_tick_time.is_none_or(|time| new_time >= time);
             if dt.as_millis() > 0.0 && tick_due {
                 self.time = new_time;
-                let interpolate = self.interpolate;
                 let mut new_frame_start = None;
+                let mut frame_duration = 0.0;
                 let tick_start = Instant::now();
                 self.next_frame_time = self.player.get().map(|mut player| {
-                    player.set_frame_interpolation(interpolate > 1);
+                    frame_duration = player.frame_duration_seconds();
+                    // Blending transforms costs a little; not when each frame is shown as is.
+                    player.set_frame_interpolation(
+                        self.subframes(frame_duration)
+                            .is_some_and(|subframes| !subframes.single),
+                    );
                     let frames_before = player.frames_run();
                     player.tick(dt);
                     let next = new_time + player.time_til_next_frame();
@@ -551,13 +578,29 @@ impl MainWindow {
                 self.adaptation.add_busy(tick_start.elapsed());
                 self.next_tick_time = self.next_frame_time;
                 if let Some(start) = new_frame_start {
-                    let missed = self.interpolate.saturating_sub(self.next_subframe);
-                    if self.frame_start.is_some() && missed <= 2 {
-                        // Frames of the previous movie frame that weren't drawn.
-                        self.adaptation.skipped += missed;
+                    let start = start.unwrap_or(new_time);
+                    if let (Some(subframes), Some(next_due)) =
+                        (self.subframes(frame_duration), self.next_due)
+                    {
+                        if subframes.aligned {
+                            // Frames of the previous movie frame that weren't drawn are
+                            // dropped. (Others, on one grid across movie frames, are still
+                            // drawn or skipped by `schedule_subframes`.)
+                            let missed = (start.saturating_duration_since(next_due).as_secs_f64()
+                                / subframes.step
+                                + 1e-6)
+                                .floor() as u32;
+                            if self.frame_start.is_some() && missed <= 2 {
+                                self.adaptation.skipped += missed;
+                            }
+                            self.next_due = Some(start);
+                        }
+                    } else {
+                        self.next_due = Some(start);
+                        // Without frames in between, the movie frame is what's drawn.
+                        self.drawn_due = Some(start);
                     }
-                    self.frame_start = start.or(Some(new_time));
-                    self.next_subframe = 0;
+                    self.frame_start = Some(start);
                 }
                 self.check_redraw();
             }
@@ -565,53 +608,108 @@ impl MainWindow {
         }
     }
 
-    /// The time between frames drawn between movie frames, if they are (with
-    /// `--interpolate`, also while only one is drawn per movie frame because more didn't
-    /// keep up: they're counted then, to tell when to draw more again).
-    fn subframe_duration(&self) -> Option<Duration> {
-        let player = self.player.get()?;
-        (self.max_interpolate > 1 && player.is_playing()).then(|| {
-            Duration::from_secs_f64(player.frame_duration_seconds() / self.interpolate as f64)
+    /// The time between frames drawn between movie frames when `every` is 1: the
+    /// display's refresh interval, so that each is shown for `every` refreshes, or, when
+    /// that isn't known, the movie frame's duration over `max_interpolate`.
+    fn base_step(&self, frame_duration: f64) -> f64 {
+        self.refresh_interval
+            .unwrap_or(frame_duration / self.max_interpolate.max(1) as f64)
+    }
+
+    /// The values of `every` that draw at most `max_interpolate` frames per movie frame,
+    /// and at least about one (the most refreshes that don't go past a movie frame, or
+    /// just do: the last resort when a frame per movie frame doesn't fit a whole number
+    /// of refreshes).
+    fn every_range(&self, frame_duration: f64) -> RangeInclusive<u32> {
+        let base = self.base_step(frame_duration);
+        let min = (frame_duration / (self.max_interpolate.max(1) as f64 * base) - 1e-6)
+            .ceil()
+            .max(1.0) as u32;
+        let max = ((frame_duration / base - 1e-6).ceil().max(1.0) as u32).max(min);
+        min..=max
+    }
+
+    /// How the frames between movie frames are timed, if any are drawn (with
+    /// `--interpolate`; see `Subframes`). The caller checks that the movie plays.
+    fn subframes(&self, frame_duration: f64) -> Option<Subframes> {
+        if self.max_interpolate <= 1 || self.every == 0 || frame_duration <= 0.0 {
+            return None;
+        }
+        let step = self.base_step(frame_duration) * self.every as f64;
+        let per_frame = frame_duration / step;
+        let aligned = (per_frame - per_frame.round()).abs() < 0.01;
+        Some(Subframes {
+            step: if aligned {
+                frame_duration / per_frame.round()
+            } else {
+                step
+            },
+            frame_duration,
+            aligned,
+            single: aligned && per_frame.round() <= 1.0,
         })
     }
 
     /// Requests drawing frames between movie frames when they're due, and makes the event
-    /// loop wake up for the next one (see `--interpolate`).
+    /// loop wake up for the next one (see `--interpolate`). They're due every `step`
+    /// (see `subframes`): from the movie frame on when they're aligned with movie frames,
+    /// otherwise on one grid of times (so that each is shown for the same number of
+    /// refreshes), and only until the next movie frame is due.
     fn schedule_subframes(&mut self) {
-        let (Some(step), Some(start)) = (self.subframe_duration(), self.frame_start) else {
+        let frame_duration = match self.player.get() {
+            Some(player) if player.is_playing() => player.frame_duration_seconds(),
+            _ => return,
+        };
+        let (Some(subframes), Some(start)) = (self.subframes(frame_duration), self.frame_start)
+        else {
             return;
         };
+        let range = self.every_range(subframes.frame_duration);
+        if !range.contains(&self.every) {
+            // The display (or its refresh rate) changed.
+            self.every = self.every.clamp(*range.start(), *range.end());
+            return;
+        }
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(start).as_secs_f64();
-        let due = (elapsed / step.as_secs_f64()) as u32;
-        if due >= self.next_subframe && self.next_subframe < self.interpolate {
+        let step = Duration::from_secs_f64(subframes.step);
+        let end = start + Duration::from_secs_f64(subframes.frame_duration);
+        let due = self.next_due.unwrap_or(start);
+        if now >= due && due < end {
             // Skip frames that are already late: whose time to be shown has passed, when
             // presentation is paced (a frame may start late, for example the first after a
             // movie frame, which waits for the movie frame to run, and still be shown on
-            // time), or otherwise, when the next one is due.
-            let frame_duration = step.as_secs_f64() * self.interpolate as f64;
+            // time), or otherwise, when the next one is due. But draw the last one before
+            // the next movie frame in any case.
             let late = self
-                .pacing_delay(frame_duration)
-                .map_or(step.as_secs_f64(), |delay| delay.as_secs_f64());
-            let on_time = ((elapsed - late) / step.as_secs_f64()).floor() + 1.0;
-            let index = (on_time.max(0.0) as u32)
-                .max(self.next_subframe)
-                .min(self.interpolate - 1);
-            self.drawn_subframe = index;
+                .pacing_delay(subframes.frame_duration)
+                .map_or(subframes.step, |delay| delay.as_secs_f64());
+            let behind = now.saturating_duration_since(due).as_secs_f64() - late;
+            let skip = if behind >= 0.0 {
+                (behind / subframes.step).floor() as u32 + 1
+            } else {
+                0
+            };
+            let available = ((end - due).as_secs_f64() / subframes.step - 1e-6)
+                .ceil()
+                .max(1.0) as u32;
+            let skip = skip.min(available - 1);
+            let drawn = due + step * skip;
+            self.drawn_due = Some(drawn);
             self.adaptation.drawn += 1;
             // A stall (such as loading) skips many frames at once; that's not a sign that
             // drawing fewer frames would help.
-            if index - self.next_subframe <= 2 {
-                self.adaptation.skipped += index - self.next_subframe;
+            if skip <= 2 {
+                self.adaptation.skipped += skip;
             }
-            self.next_subframe = index + 1;
+            self.next_due = Some(drawn + step);
             self.movie_dirty = true;
             self.gui.window().request_redraw();
         }
-        self.adapt_interpolation(now);
+        self.adapt_interpolation(now, subframes.frame_duration);
         self.next_frame_time = self.next_tick_time;
-        if self.next_subframe < self.interpolate {
-            let next = start + step * self.next_subframe;
+        if let Some(next) = self.next_due
+            && next < end
+        {
             self.next_frame_time = Some(match self.next_tick_time {
                 Some(tick_time) => tick_time.min(next),
                 None => next,
@@ -619,16 +717,29 @@ impl MainWindow {
         }
     }
 
-    /// Lowers the number of frames drawn per movie frame while more than a tenth of them
-    /// are skipped (they couldn't be drawn in time), to the next divisor of
-    /// `max_interpolate`: evenly spaced frames look smoother than more frames at uneven
-    /// times. Tries the next higher number after a few seconds without skipped frames.
-    /// How busy the GPU is doesn't tell whether that will fit: GPUs whose clock follows
-    /// their load (such as Apple's) look about as busy with less work. So when frames are
-    /// skipped soon after raising, it goes back down and waits twice as long before trying
-    /// again, unless the load gets clearly lower than it was before that raise, or a stall
-    /// (such as loading new content) suggests that what's shown changed.
-    fn adapt_interpolation(&mut self, now: Instant) {
+    /// Describes how often frames are drawn between movie frames, for the log.
+    fn describe_every(&self, every: u32, frame_duration: f64) -> String {
+        let per_frame = frame_duration / (self.base_step(frame_duration) * every as f64);
+        let refreshes = match (self.refresh_interval, every) {
+            (None, _) => String::new(),
+            (Some(_), 1) => ", one per refresh".to_string(),
+            (Some(_), every) => format!(", one every {every} refreshes"),
+        };
+        format!("{per_frame:.2} frames per movie frame{refreshes}")
+    }
+
+    /// Draws frames between movie frames less often while more than a tenth of them are
+    /// skipped (they couldn't be drawn in time): one every one more refresh, so that
+    /// frames stay evenly spaced (which looks smoother than more frames at uneven times),
+    /// down to about one per movie frame (see `every_range`). Tries drawing them more
+    /// often again after a few seconds without skipped frames. How busy the GPU is doesn't
+    /// tell whether that will fit: GPUs whose clock follows their load (such as Apple's)
+    /// look about as busy with less work. So when frames are skipped soon after the
+    /// change, it goes back and waits twice as long before trying again, unless the load
+    /// gets clearly lower than it was before that try, or a stall (such as loading new
+    /// content) suggests that what's shown changed.
+    fn adapt_interpolation(&mut self, now: Instant, frame_duration: f64) {
+        let range = self.every_range(frame_duration);
         let adaptation = &mut self.adaptation;
         let window = now.duration_since(adaptation.window_start);
         if window < Duration::from_secs(1) || adaptation.fixed {
@@ -648,15 +759,14 @@ impl MainWindow {
             adaptation.retry_after = InterpolationAdaptation::MIN_WAIT;
             adaptation.failed_load = None;
         }
-        let divisors: Vec<u32> = (1..=self.max_interpolate)
-            .filter(|n| self.max_interpolate.is_multiple_of(*n))
-            .collect();
         let total = drawn + skipped;
         let behind = total > 0 && skipped * 10 > total;
         let was_behind = std::mem::replace(&mut adaptation.behind, behind);
         let on_trial = adaptation.since_raise.is_some();
         if behind && (was_behind || on_trial) {
-            if let Some(&lower) = divisors.iter().rev().find(|&&n| n < self.interpolate) {
+            // Less often: every one more refresh.
+            let fewer = (self.every < *range.end()).then(|| self.every + 1);
+            if let Some(fewer) = fewer {
                 if on_trial {
                     adaptation.retry_after =
                         (adaptation.retry_after * 2).min(InterpolationAdaptation::MAX_WAIT);
@@ -664,8 +774,11 @@ impl MainWindow {
                 }
                 adaptation.since_raise = None;
                 adaptation.clean_windows = 0;
-                self.interpolate = lower;
-                tracing::info!("[interpolate] {lower} frames per movie frame (couldn't keep up)");
+                self.every = fewer;
+                tracing::info!(
+                    "[interpolate] {} (couldn't keep up)",
+                    self.describe_every(fewer, frame_duration)
+                );
             }
             return;
         }
@@ -683,32 +796,49 @@ impl MainWindow {
             let lighter = adaptation
                 .failed_load
                 .is_some_and(|failed| load <= failed * 0.85);
+            // More often: every one refresh fewer.
+            let more = (self.every > *range.start()).then(|| self.every - 1);
             if (adaptation.clean_windows >= adaptation.retry_after
                 || (adaptation.clean_windows >= InterpolationAdaptation::MIN_WAIT && lighter))
-                && let Some(&higher) = divisors.iter().find(|&&n| n > self.interpolate)
+                && let Some(more) = more
             {
                 adaptation.since_raise = Some(0);
                 adaptation.load_before_raise = load;
                 adaptation.clean_windows = 0;
+                let before = self.describe_every(self.every, frame_duration);
+                self.every = more;
                 tracing::info!(
-                    "[interpolate] {higher} frames per movie frame (load {:.0}% at {})",
+                    "[interpolate] {} (load {:.0}% at {before})",
+                    self.describe_every(more, frame_duration),
                     load * 100.0,
-                    self.interpolate
                 );
-                self.interpolate = higher;
             }
         }
     }
 
-    /// How far between the previous movie frame and the current one a frame drawn now
-    /// should be (`None` without interpolation): the frames between movie frames are
-    /// spread evenly, the last one showing the current movie frame.
-    fn render_fraction(&self) -> Option<f32> {
-        if self.interpolate <= 1 || self.frame_start.is_none() {
+    /// How far between the previous movie frame and the current one the frame drawn now
+    /// should be (`None` without interpolation). Frames aligned with movie frames show
+    /// the blend one step ahead of when they're due (so the last shows the current movie
+    /// frame, and they're shown with the least delay). Others, on a grid across movie
+    /// frames, show the blend at the time they're due: ahead would sometimes be past the
+    /// movie frame they blend toward, which would make the motion uneven.
+    fn render_fraction(&self, frame_duration: f64) -> Option<f32> {
+        let (subframes, start, due) = (
+            self.subframes(frame_duration)?,
+            self.frame_start?,
+            self.drawn_due?,
+        );
+        if subframes.single {
             return None;
         }
-        let index = self.drawn_subframe.min(self.interpolate - 1);
-        Some((index + 1) as f32 / self.interpolate as f32)
+        let lead = if subframes.aligned {
+            subframes.step
+        } else {
+            0.0
+        };
+        let fraction =
+            (due.saturating_duration_since(start).as_secs_f64() + lead) / subframes.frame_duration;
+        Some(fraction.clamp(0.0, 1.0) as f32)
     }
 
     /// Once a second: re-reads the display's refresh rate, and raises the window's size
@@ -740,25 +870,30 @@ impl MainWindow {
     }
 
     /// How long after it's due a frame is shown, when presentation is paced: when the
-    /// display's refresh rate is a whole multiple of the rate frames are drawn at (for
-    /// example 144 Hz, and a 24 fps movie drawn 6 times per frame), each frame is shown at a
-    /// time taken from the movie's clock (see `present_time`). That's two frame intervals,
-    /// to draw it (the first frames after a movie frame also wait for the movie frame to
-    /// run), with three surface textures as many as there can be waiting to be shown
-    /// without drawing another waiting for one of them to be shown; but at most four
-    /// refreshes.
+    /// display's refresh interval is known, frames between movie frames are drawn every
+    /// whole number of refreshes (see `subframes`), and each is shown at a time taken
+    /// from the movie's clock (see `present_time`); movie frames alone are when the
+    /// display's refresh rate is a whole multiple of the frame rate (for example 24 fps on
+    /// 144 Hz). That's two frame intervals, to draw it (the first frames after a movie
+    /// frame also wait for the movie frame to run), with three surface textures as many
+    /// as there can be waiting to be shown without drawing another waiting for one of them
+    /// to be shown; but at most four refreshes.
     fn pacing_delay(&self, frame_duration: f64) -> Option<Duration> {
         if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::PacedPresent) {
             return None;
         }
         let refresh = self.refresh_interval?;
-        let interval = frame_duration / self.interpolate.max(1) as f64;
-        let refreshes = interval / refresh;
-        let whole = refreshes.round();
-        if whole < 1.0 || (refreshes - whole).abs() >= 0.05 {
-            return None;
-        }
-        Some(Duration::from_secs_f64((refresh * 4.0).min(interval * 2.0)))
+        let step = match self.subframes(frame_duration) {
+            Some(subframes) => subframes.step,
+            None => {
+                let refreshes = frame_duration / refresh;
+                if refreshes.round() < 1.0 || (refreshes - refreshes.round()).abs() >= 0.05 {
+                    return None;
+                }
+                frame_duration
+            }
+        };
+        Some(Duration::from_secs_f64((refresh * 4.0).min(step * 2.0)))
     }
 
     /// When the frame drawn now should be shown (`None`: as soon as possible). With paced
@@ -768,9 +903,7 @@ impl MainWindow {
     /// the ones after it.
     fn present_time(&self, frame_duration: f64) -> Option<Instant> {
         let delay = self.pacing_delay(frame_duration)?;
-        let step = frame_duration / self.interpolate.max(1) as f64;
-        let due = self.frame_start? + Duration::from_secs_f64(step * self.drawn_subframe as f64);
-        Some(due + delay)
+        Some(self.drawn_due? + delay)
     }
 
     /// Tells the player that the held keys for which `released` is true were released.
@@ -965,12 +1098,12 @@ impl ApplicationHandler<RuffleEvent> for App {
                 next_frame_time: None,
                 next_tick_time: None,
                 max_interpolate: self.preferences.cli.interpolate.max(1),
-                interpolate: self.preferences.cli.interpolate.max(1),
+                every: 1,
                 adaptation: InterpolationAdaptation::new(),
                 frame_start: None,
-                next_subframe: 0,
+                next_due: None,
                 movie_dirty: true,
-                drawn_subframe: 0,
+                drawn_due: None,
                 refresh_interval: None,
                 event_loop_proxy,
             });
