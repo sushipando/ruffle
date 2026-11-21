@@ -1327,6 +1327,113 @@ had passed after a long movie frame), where before the fixes it spent half the t
 every 2 refreshes. On 144 Hz, one per refresh is the 6 per movie frame drawn before, timed
 the same way.
 
+### 62. Restore command-buffer sharing with `StoreOp::Discard` (`wgpu-core`)
+
+*Files: `wgpu/wgpu-core/src/command/{memory_init.rs,render.rs}`, `Cargo.toml`.*
+
+Optimization 58 (`StoreOp::Discard` on the last pass of a multisampled target) inadvertently
+disabled optimization 20 (`share-cmdbufs`), because `wgpu-core`'s `can_share_command_buffer`
+rejected any pass with `StoreOp::Discard` and every subsequent pass once `has_discards` was
+set. Since the first pass of every frame discarded MSAA samples, every pass and blit went into
+its own Metal command buffer (~66–125 cmdbufs/frame, saturating `ruffle-wgpu-submit` at 59%
+of a core and `CommandQueueDispatch` at 30%). `can_share_command_buffer` now checks via
+`would_require_discard_fixup` whether the new pass actually loads or samples a texture that
+was previously discarded, allowing unrelated passes to share a command buffer again (~3
+cmdbufs/frame, a 22–40x reduction).
+
+### 63. Unified filter batching, direct-to-filter-atlas drawing, and dynamic filter uniforms
+
+*Files: `render/wgpu/src/filters/{batch.rs,glow.rs,color_matrix.rs}`,
+`render/wgpu/src/surface/layer_atlas.rs`, `render/wgpu/src/backend.rs`.*
+
+* Level-0 leaf cached bitmaps that go through `apply_together` now draw directly into the
+  filter atlas via `layer_atlas::render_into_atlas`, eliminating the separate CAB atlas pass,
+  the filter-atlas clear pass, and two of the three texture copies per filtered CAB.
+* `apply_together` shares one downscale pyramid across all blur downscale factors (routing
+  asymmetric factors through the `(2,2)/(4,4)/(8,8)` spine), packs all blurred items across
+  factors into a single tightly-packed horizontal/vertical blur atlas (1 H-pass + 1 V-pass
+  per step instead of 2 full-atlas passes per factor group), and uses dynamic uniform offsets
+  on `GlowFilter` and `ColorMatrixFilter` (1 bind group per pass instead of 30–50/frame).
+* Raised `MAX_LAYER_SIZE` and `max_batched_filter_size()` from 1024 to 2048 so large (>1024px)
+  glows batch into `apply_together`.
+* Avoided calling `maybe_flush()` for batched CAB entries that share an atlas pass,
+  eliminating spurious mid-frame command encoder flushes (`flushes 1.0 → 0.0`).
+
+### 64. Direct framebuffer-fetch blends for gradients and bitmaps
+
+*Files: `render/wgpu/shaders/blend/fetch.metal`, `render/wgpu/src/{shaders,pipelines}.rs`,
+`render/wgpu/src/surface/{commands,layer_atlas}.rs`.*
+
+Extended Metal framebuffer-fetch direct blends (35) from solid fills (`VERTEX_COLOR`) to
+single-fill gradients (`FETCH_GRADIENT`) and bitmaps (`FETCH_BITMAP`), and allowed
+direct-blendable commands inside `layer_atlas::is_leaf`.
+
+### 65. Zero-copy direct sampling from the layer atlas
+
+*Files: `render/wgpu/src/buffer_builder.rs`,
+`render/wgpu/src/surface/{layer_atlas,commands}.rs`, `render/wgpu/src/surface.rs`.*
+
+Leaf blend layers composited via trivial or framebuffer-fetch blends now sample directly from
+their UV sub-rect in the shared layer atlas (`DrawCommand::RenderAtlasLayer`) using a single
+shared bind group per atlas, eliminating 150–200 per-layer `TexturePool` allocations,
+`copy_texture_to_texture` copy-out blits (~0.5 ms GPU), and `create_bind_group` calls per
+frame.
+
+### 66. Persistent `IDLE_EPOCH` for stopped MovieClip subtrees and fast render culling
+
+*Files: `core/src/display_object/{movie_clip,stage,graphic,bitmap,edit_text,interpolation}.rs`,
+`core/src/frame_lifecycle.rs`.*
+
+* Extended `MovieClip::settled_epoch` with `IDLE_EPOCH = u32::MAX` for stopped, preloaded
+  subtrees with no queued tags/scripts/skip-frame so `enter_frame`, `construct_frame`, and
+  `run_frame_scripts` skip them across frames until mutated (`unsettle`), cutting CPU logic
+  time in busy scenes from 5–7 ms to 0.7–2.5 ms/frame.
+* Precomputed `Stage::viewport_view_bounds` so `Graphic`, `Bitmap`, and `EditText` cull
+  against `transform.matrix` directly instead of walking the parent chain via `world_bounds()`.
+* Reordered `InterpolationData::blended()` to check `previous` before TLS and clear stale
+  previous transforms.
+
+### 67. Exact `blends_in_tick` tracking and inter-frame `cacheAsBitmap` reuse
+
+*Files: `core/src/display_object/{interpolation.rs,display_object.rs}`.*
+
+* Tracked via `interpolation::track_blended` whether any descendant inside a `BitmapCache`
+  actually read a blended transform during `render_self`. Frame-by-frame animated CABs whose
+  descendants don't blend no longer re-rasterize and re-filter identical pixels on interpolated
+  sub-frames (`f = 2/k..1.0`).
+* On interpolated sub-frames (`0 < f < 1`), clean `BitmapCache`s whose own linear matrix
+  rotated/scaled smoothly reuse the previous movie frame's filtered bitmap drawn with the
+  exact delta matrix `cur_linear * cached_linear^-1` and bilinear filtering, rebuilding crisp
+  once per movie frame. Together these cut filtered CAB rebuilds by 65–80% at 72–144 fps.
+
+### 68. Interpolation adaptation stability fixes
+
+*Files: `desktop/src/app.rs`.*
+
+* Reset `adaptation.behind = false` when changing `self.every` to prevent multi-level cascade
+  drops (`3x → 2x → 1.5x → 1x`) after a single busy window.
+* Skip dropping or failing a trial on `stalled` (room load / player join) windows.
+* Fixed `pacing_delay` at `every >= 4` so `(step * 2.0).min(frame_duration.max(refresh * 4.0))`
+  never becomes shorter than `step`.
+
+### Measured impact (5120x1440 144 Hz, Apple M1, `--fullscreen --interpolate 6`)
+
+All 4,586 regression tests (including all 151 Metal `visual/` image tests) pass. Live
+measurements in busy Artix rooms:
+
+| Room | Metric | Before (61) | After (62–68) |
+|---|---|---|---|
+| `battleon` (9–10 players) | Shown FPS | 24–36 fps (cascading) | **72 fps** steady (tries 144) |
+| `battleon` | `frame` / `render` CPU | 5.4 ms / 3.6 ms | **1.5 ms / 2.0 ms** |
+| `battleon` | Passes / cmdbufs per frame | 65.4 / ~125 | **10–12 / ~4.0** |
+| `battleon` | GPU ms/frame | 13.5 ms | **6.4 ms** |
+| `yulgar` (16–20 players) | Shown FPS | 24–36 fps | **72 fps** steady |
+| `yulgar` | `frame` / `render` CPU | 5.0–6.9 ms / 5.7–10.5 ms | **0.7–1.9 ms / 1.8–3.8 ms** |
+| `yulgar` | Passes / cmdbufs per frame | 48–68 / ~98 | **15–20 / 3.0** |
+| `yulgar` | GPU ms/frame | 15–17 ms | **8.0–12 ms** |
+| `icestormunder` room 2 (6–7 players) | Shown FPS | 48–72 fps | **72 fps** steady (tries 144) |
+| `icestormunder` room 2 | Passes / cmdbufs per frame | 31–44 / ~66 | **10–13 / 3.0** |
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
