@@ -754,10 +754,13 @@ impl MainWindow {
         adaptation.skipped = 0;
         adaptation.busy = Duration::ZERO;
         if stalled {
-            // What was learned about the content may no longer hold.
+            // What was learned about the content may no longer hold (e.g. a load spike);
+            // don't drop the level or fail a trial from this second.
             adaptation.clean_windows = 0;
             adaptation.retry_after = InterpolationAdaptation::MIN_WAIT;
             adaptation.failed_load = None;
+            adaptation.behind = false;
+            return;
         }
         let total = drawn + skipped;
         let behind = total > 0 && skipped * 10 > total;
@@ -774,6 +777,7 @@ impl MainWindow {
                 }
                 adaptation.since_raise = None;
                 adaptation.clean_windows = 0;
+                adaptation.behind = false;
                 self.every = fewer;
                 tracing::info!(
                     "[interpolate] {} (couldn't keep up)",
@@ -805,6 +809,7 @@ impl MainWindow {
                 adaptation.since_raise = Some(0);
                 adaptation.load_before_raise = load;
                 adaptation.clean_windows = 0;
+                adaptation.behind = false;
                 let before = self.describe_every(self.every, frame_duration);
                 self.every = more;
                 tracing::info!(
@@ -893,7 +898,9 @@ impl MainWindow {
                 frame_duration
             }
         };
-        Some(Duration::from_secs_f64((refresh * 4.0).min(step * 2.0)))
+        Some(Duration::from_secs_f64(
+            (step * 2.0).min(frame_duration.max(refresh * 4.0)),
+        ))
     }
 
     /// When the frame drawn now should be shown (`None`: as soon as possible). With paced
