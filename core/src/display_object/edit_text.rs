@@ -2727,13 +2727,15 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
         self.apply_autosize_bounds();
 
-        if !context.is_offscreen
-            && !self
-                .world_bounds(BoundsMode::Engine)
-                .intersects(&context.stage.view_bounds())
-        {
-            // Off-screen; culled
-            return;
+        if !context.is_offscreen {
+            let transform = context.transform_stack.transform();
+            if !self
+                .bounds_with_transform(&transform.matrix, BoundsMode::Engine)
+                .intersects(&context.stage.viewport_view_bounds())
+            {
+                // Off-screen; culled
+                return;
+            }
         }
 
         fn is_transform_positive_scale_only(context: &mut RenderContext) -> bool {

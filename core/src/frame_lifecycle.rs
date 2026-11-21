@@ -130,6 +130,7 @@ pub fn run_inner_goto_frame<'gc>(
     if initial_clip.swf_version() <= 9 && initial_clip.movie().is_action_script_3() {
         // We skip the next `enter_frame` call, so that we will still run the framescripts
         // queued for our target frame.
+        initial_clip.unsettle();
         initial_clip.base().set_skip_next_enter_frame(true);
 
         return;

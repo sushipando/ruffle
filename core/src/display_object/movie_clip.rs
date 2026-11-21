@@ -381,6 +381,7 @@ impl<'gc> MovieClip<'gc> {
         is_root: bool,
         loader_info: Option<LoaderInfoObject<'gc>>,
     ) {
+        self.unsettle();
         let write = Gc::write(context.gc(), self.0);
 
         let movie = movie.unwrap_or_else(|| {
@@ -852,10 +853,22 @@ impl<'gc> MovieClip<'gc> {
         self.0.last_queued_script_frame.set(frame);
     }
 
+    /// `settled_epoch` value meaning this clip and everything below it are idle across
+    /// frames: `enter_frame`, `construct_frame`, and `run_frame_scripts` all have nothing
+    /// to do until something mutates this subtree (`unsettle`).
+    const IDLE_EPOCH: u32 = u32::MAX;
+
+    /// Whether this clip and its subtree are persistently idle across frames.
+    fn is_idle(self) -> bool {
+        self.0.settled_epoch.get() == Self::IDLE_EPOCH
+            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipSettled)
+    }
+
     /// Whether this clip is settled in the current frame: frame construction and frame
     /// scripts have nothing to do for it and everything below it, so they skip it.
     fn is_settled(self, context: &UpdateContext<'gc>) -> bool {
-        self.0.settled_epoch.get() == context.stage.frame_epoch()
+        let settled = self.0.settled_epoch.get();
+        (settled == Self::IDLE_EPOCH || settled == context.stage.frame_epoch())
             && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipSettled)
     }
 
@@ -874,13 +887,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     /// Marks this clip as settled in the current frame (see `is_settled`) if frame
-    /// construction and frame scripts would now do nothing for it and its children.
-    ///
-    /// Every goto (in SWF10+) runs frame construction and frame scripts for the whole
-    /// stage, and some content does that many times per frame. After the first time in a
-    /// frame, almost every clip has been constructed and has run its frame script, so most
-    /// of the walk does nothing. Settled marks only last for the current frame, and
-    /// `unsettle` removes them whenever that may change.
+    /// construction and frame scripts would now do nothing for it and its children, or
+    /// persistently idle (`IDLE_EPOCH`) if `enter_frame` will also do nothing on future
+    /// frames until something mutates the subtree.
     fn settle(self, context: &UpdateContext<'gc>) {
         if !self.movie().is_action_script_3()
             || self.0.object2.get().is_none()
@@ -902,12 +911,29 @@ impl<'gc> MovieClip<'gc> {
         {
             return;
         }
+        let mut idle = !self.playing()
+            && !self.base().should_skip_next_enter_frame()
+            && self.0.queued_tags.borrow().is_empty()
+            && self
+                .0
+                .shared
+                .get()
+                .preload_progress
+                .next_preload_chunk
+                .get()
+                == u64::MAX;
         let epoch = context.stage.frame_epoch();
         for child in self.iter_render_list() {
             let settled = match child {
-                DisplayObject::MovieClip(mc) => mc.0.settled_epoch.get() == epoch,
+                DisplayObject::MovieClip(mc) => {
+                    let child_epoch = mc.0.settled_epoch.get();
+                    if child_epoch != Self::IDLE_EPOCH {
+                        idle = false;
+                    }
+                    child_epoch == Self::IDLE_EPOCH || child_epoch == epoch
+                }
                 // Their frame construction only constructs their AVM2 object, and they
-                // have no frame scripts or children.
+                // have no `enter_frame`, frame scripts or children.
                 DisplayObject::Graphic(_)
                 | DisplayObject::MorphShape(_)
                 | DisplayObject::Text(_)
@@ -924,7 +950,9 @@ impl<'gc> MovieClip<'gc> {
                 return;
             }
         }
-        self.0.settled_epoch.set(epoch);
+        self.0
+            .settled_epoch
+            .set(if idle { Self::IDLE_EPOCH } else { epoch });
     }
 
     pub fn set_programmatically_played(self) {
@@ -945,6 +973,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn play(self) {
+        self.unsettle();
         self.0.play()
     }
 
@@ -2634,6 +2663,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
         let skip_frame = self.base().should_skip_next_enter_frame();
+        if !skip_frame && self.is_idle() {
+            return;
+        }
         //Child removals from looping gotos appear to resolve in reverse order.
         for child in self.iter_render_list().rev() {
             if skip_frame {

@@ -95,8 +95,12 @@ pub struct StageData<'gc> {
     /// it doesn't include any additional transformations of the content.
     letterbox_matrix: Cell<Matrix>,
 
-    /// The bounds of the current viewport in twips, used for culling.
+    /// The bounds of the current viewport in stage twips, used for culling.
     view_bounds: Cell<Rectangle<Twips>>,
+
+    /// The bounds of the current viewport in viewport twips (`viewport_matrix * view_bounds`),
+    /// so `render_self` can cull using the transform already on `context.transform_stack`.
+    viewport_view_bounds: Cell<Rectangle<Twips>>,
 
     /// The stage background.
     ///
@@ -183,6 +187,7 @@ impl<'gc> Stage<'gc> {
                 allow_fullscreen: Cell::new(true),
                 use_bitmap_downsampling: Cell::new(false),
                 view_bounds: Default::default(),
+                viewport_view_bounds: Default::default(),
                 window_mode: Default::default(),
                 show_menu: Cell::new(true),
                 stage_focus_rect: Cell::new(true),
@@ -318,8 +323,12 @@ impl<'gc> Stage<'gc> {
     }
 
     /// Starts a new frame for `MovieClip::settle`: no clip is settled in it yet.
+    /// Avoids 0 (unsettled) and `u32::MAX` (persistently idle across frames).
     pub fn next_frame_epoch(self) {
-        let next = self.0.frame_epoch.get().wrapping_add(1).max(1);
+        let mut next = self.0.frame_epoch.get().wrapping_add(1);
+        if next == 0 || next == u32::MAX {
+            next = 1;
+        }
         self.0.frame_epoch.set(next);
     }
 
@@ -473,6 +482,10 @@ impl<'gc> Stage<'gc> {
         self.0.view_bounds.get()
     }
 
+    pub fn viewport_view_bounds(self) -> Rectangle<Twips> {
+        self.0.viewport_view_bounds.get()
+    }
+
     pub fn show_menu(self) -> bool {
         self.0.show_menu.get()
     }
@@ -614,7 +627,11 @@ impl<'gc> Stage<'gc> {
             }
         };
 
-        self.0.view_bounds.set(stage_tx * view_bounds);
+        let stage_view_bounds = stage_tx * view_bounds;
+        self.0.view_bounds.set(stage_view_bounds);
+        self.0
+            .viewport_view_bounds
+            .set(self.0.viewport_matrix.get() * stage_view_bounds);
 
         // Fire resize handler if stage size has changed.
         if scale_mode == StageScaleMode::NoScale && stage_size_changed {

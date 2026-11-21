@@ -389,13 +389,15 @@ impl<'gc> TDisplayObject<'gc> for Bitmap<'gc> {
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
-        if !context.is_offscreen
-            && !self
-                .world_bounds(BoundsMode::Engine)
-                .intersects(&context.stage.view_bounds())
-        {
-            // Off-screen; culled
-            return;
+        if !context.is_offscreen {
+            let transform = context.transform_stack.transform();
+            if !self
+                .bounds_with_transform(&transform.matrix, BoundsMode::Engine)
+                .intersects(&context.stage.viewport_view_bounds())
+            {
+                // Off-screen; culled
+                return;
+            }
         }
 
         self.0.bitmap_data.get().render(

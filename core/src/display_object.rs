@@ -130,6 +130,16 @@ pub struct BitmapCache {
     /// The movie frame in which the contents last changed (see `interpolation`): frames
     /// drawn between movie frames redraw the cache then, since its contents are blended.
     changed_tick: u32,
+
+    /// Whether the most recent redraw of this cache read any blended descendant transform.
+    /// If false, frame-by-frame changes don't change across sub-frames of the same tick.
+    blends_in_tick: bool,
+
+    /// The movie frame tick when `bitmap` was last drawn (for inter-frame delta reuse).
+    cached_tick: u32,
+
+    /// The `offset` (origin + filter draw_offset) used when `bitmap` was last drawn.
+    cached_offset: Point<Twips>,
 }
 
 impl BitmapCache {
@@ -139,12 +149,49 @@ impl BitmapCache {
         self.contents_changed = true;
     }
 
-    fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
-        self.contents_changed
-            || self.matrix_a != other.a
+    fn is_matrix_different(&self, other: &Matrix) -> bool {
+        self.matrix_a != other.a
             || self.matrix_b != other.b
             || self.matrix_c != other.c
             || self.matrix_d != other.d
+    }
+
+    /// Computes `cur_linear * cached_linear^-1` when the transform delta between the
+    /// cached bitmap and an interpolated sub-frame is small enough to reuse the bitmap
+    /// smoothly with bilinear filtering instead of re-rasterizing and re-filtering.
+    fn inter_frame_delta(&self, cur: &Matrix) -> Option<Matrix> {
+        let det = self.matrix_a * self.matrix_d - self.matrix_b * self.matrix_c;
+        if det.abs() < 1e-6 {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        let ia = self.matrix_d * inv_det;
+        let ib = -self.matrix_b * inv_det;
+        let ic = -self.matrix_c * inv_det;
+        let id = self.matrix_a * inv_det;
+        let da = cur.a * ia + cur.c * ib;
+        let db = cur.b * ia + cur.d * ib;
+        let dc = cur.a * ic + cur.c * id;
+        let dd = cur.b * ic + cur.d * id;
+        let delta_det = da * dd - db * dc;
+        let sx = da.hypot(db);
+        let sy = dc.hypot(dd);
+        if delta_det <= 0.0 || !(0.75..=1.35).contains(&sx) || !(0.75..=1.35).contains(&sy) {
+            return None;
+        }
+        Some(Matrix {
+            a: da,
+            b: db,
+            c: dc,
+            d: dd,
+            tx: Twips::ZERO,
+            ty: Twips::ZERO,
+        })
+    }
+
+    fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
+        self.contents_changed
+            || self.is_matrix_different(other)
             || self.source_width != source_width
             || self.source_height != source_height
             || self.bitmap.is_none()
@@ -1069,6 +1116,9 @@ struct DrawCacheInfo {
     /// Where the bitmap is drawn, relative to the object's origin.
     offset: Point<Twips>,
     filters: Vec<Filter>,
+    /// Optional linear delta transform (`cur * cached^-1`) when reusing the previous
+    /// movie frame's bitmap on an interpolated sub-frame.
+    delta: Option<Matrix>,
 }
 
 pub fn render_base<'gc>(
@@ -1094,115 +1144,150 @@ pub fn render_base<'gc>(
     };
 
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
-        let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
-        let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
-            &base_transform.matrix,
-            false, // we want to do the filter growth for this object ourselves, to know the offsets
-            &context.stage.view_matrix(),
-        );
-        let name = this.name();
-        let mut filters: Vec<Filter> = this.filters().to_owned();
-        let swf_version = this.swf_version();
-        filters.retain(|f| !f.impotent());
-
-        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
-            let matrix = &base_transform.matrix;
-            let (origin, width, height) = if bounds.is_valid() {
-                let origin = cache.origin(matrix, &bounds);
-                (
-                    origin,
-                    (bounds.x_max - matrix.tx - origin.x).to_pixels().ceil(),
-                    (bounds.y_max - matrix.ty - origin.y).to_pixels().ceil(),
-                )
-            } else {
-                (Point::new(Twips::ZERO, Twips::ZERO), 0.0, 0.0)
-            };
-            if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
-                let width = width as u32;
-                let height = height as u32;
-                let mut filter_rect = Rectangle {
-                    x_min: Twips::ZERO,
-                    x_max: Twips::from_pixels_i32(width as i32),
-                    y_min: Twips::ZERO,
-                    y_max: Twips::from_pixels_i32(height as i32),
-                };
-                let stage_matrix = context.stage.view_matrix();
-                for filter in &mut filters {
-                    // Scaling is done by *stage view matrix* only, nothing in-between
-                    filter.scale(stage_matrix.a, stage_matrix.d);
-                    filter_rect = filter.calculate_dest_rect(filter_rect);
-                }
-                let filter_rect = Rectangle {
-                    x_min: filter_rect.x_min.to_pixels().floor() as i32,
-                    x_max: filter_rect.x_max.to_pixels().ceil() as i32,
-                    y_min: filter_rect.y_min.to_pixels().floor() as i32,
-                    y_max: filter_rect.y_max.to_pixels().ceil() as i32,
-                };
-                let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
-                // In order to render an object to a texture, we need to draw its entire bounds.
-                // Calculate the offset from tx/ty in order to accommodate any drawings that extend the bounds
-                // negatively
-                let offset = Point::new(
-                    origin.x + Twips::from_pixels_i32(draw_offset.x),
-                    origin.y + Twips::from_pixels_i32(draw_offset.y),
-                );
-                if cache.is_dirty(&base_transform.matrix, width, height)
-                    || interpolation::is_blending_tick(cache.changed_tick)
+        let inter_frame_hit = if interpolation::is_inter_frame() {
+            this.base().bitmap_cache_mut().as_ref().and_then(|cache| {
+                if cache.contents_changed
+                    || (cache.blends_in_tick && interpolation::is_blending_tick(cache.changed_tick))
+                    || !cache.is_matrix_different(&base_transform.matrix)
                 {
-                    cache.update(
-                        context.renderer,
-                        base_transform.matrix,
-                        width,
-                        height,
-                        filter_rect.width() as u32,
-                        filter_rect.height() as u32,
-                        draw_offset,
-                        swf_version,
-                        // Extra (transparent) space doesn't change what these filters
-                        // produce in the used part, unlike, for example, a displacement map.
-                        !ruffle_render::perf_flags::enabled(
-                            ruffle_render::perf_flags::PerfFlag::CacheSlack,
-                        ) || this.opaque_background().is_some()
-                            || !filters.iter().all(|filter| {
-                                matches!(
-                                    filter,
-                                    Filter::BlurFilter(_)
-                                        | Filter::GlowFilter(_)
-                                        | Filter::DropShadowFilter(_)
-                                        | Filter::ColorMatrixFilter(_)
-                                )
-                            }),
-                    );
-                    cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
-                        bitmap,
-                        dirty: true,
-                        base_transform,
-                        offset,
-                        filters,
-                    });
+                    return None;
+                }
+                let tick = interpolation::tick();
+                if cache.cached_tick != tick && cache.cached_tick != tick.wrapping_sub(1) {
+                    return None;
+                }
+                let bitmap = cache.bitmap()?;
+                let delta = cache.inter_frame_delta(&base_transform.matrix)?;
+                Some((bitmap, cache.cached_offset, delta))
+            })
+        } else {
+            None
+        };
+        if let Some((bitmap, offset, delta)) = inter_frame_hit {
+            Some(DrawCacheInfo {
+                bitmap,
+                dirty: false,
+                base_transform,
+                offset,
+                filters: Vec::new(),
+                delta: Some(delta),
+            })
+        } else {
+            let mut cache_info: Option<DrawCacheInfo> = None;
+            let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
+                &base_transform.matrix,
+                false, // we want to do the filter growth for this object ourselves, to know the offsets
+                &context.stage.view_matrix(),
+            );
+            let name = this.name();
+            let mut filters: Vec<Filter> = this.filters().to_owned();
+            let swf_version = this.swf_version();
+            filters.retain(|f| !f.impotent());
+
+            if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+                let matrix = &base_transform.matrix;
+                let (origin, width, height) = if bounds.is_valid() {
+                    let origin = cache.origin(matrix, &bounds);
+                    (
+                        origin,
+                        (bounds.x_max - matrix.tx - origin.x).to_pixels().ceil(),
+                        (bounds.y_max - matrix.ty - origin.y).to_pixels().ceil(),
+                    )
                 } else {
-                    cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
-                        bitmap,
-                        dirty: false,
-                        base_transform,
-                        offset,
-                        filters,
-                    });
-                }
-            } else {
-                if !cache.warned_for_oversize {
-                    tracing::warn!(
-                        "Skipping cacheAsBitmap for incredibly large object {:?} ({width} x {height})",
-                        name
+                    (Point::new(Twips::ZERO, Twips::ZERO), 0.0, 0.0)
+                };
+                if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
+                    let width = width as u32;
+                    let height = height as u32;
+                    let mut filter_rect = Rectangle {
+                        x_min: Twips::ZERO,
+                        x_max: Twips::from_pixels_i32(width as i32),
+                        y_min: Twips::ZERO,
+                        y_max: Twips::from_pixels_i32(height as i32),
+                    };
+                    let stage_matrix = context.stage.view_matrix();
+                    for filter in &mut filters {
+                        // Scaling is done by *stage view matrix* only, nothing in-between
+                        filter.scale(stage_matrix.a, stage_matrix.d);
+                        filter_rect = filter.calculate_dest_rect(filter_rect);
+                    }
+                    let filter_rect = Rectangle {
+                        x_min: filter_rect.x_min.to_pixels().floor() as i32,
+                        x_max: filter_rect.x_max.to_pixels().ceil() as i32,
+                        y_min: filter_rect.y_min.to_pixels().floor() as i32,
+                        y_max: filter_rect.y_max.to_pixels().ceil() as i32,
+                    };
+                    let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
+                    // In order to render an object to a texture, we need to draw its entire bounds.
+                    // Calculate the offset from tx/ty in order to accommodate any drawings that extend the bounds
+                    // negatively
+                    let offset = Point::new(
+                        origin.x + Twips::from_pixels_i32(draw_offset.x),
+                        origin.y + Twips::from_pixels_i32(draw_offset.y),
                     );
-                    cache.warned_for_oversize = true;
+                    if cache.is_dirty(&base_transform.matrix, width, height)
+                        || (cache.blends_in_tick
+                            && interpolation::is_blending_tick(cache.changed_tick))
+                    {
+                        cache.update(
+                            context.renderer,
+                            base_transform.matrix,
+                            width,
+                            height,
+                            filter_rect.width() as u32,
+                            filter_rect.height() as u32,
+                            draw_offset,
+                            swf_version,
+                            // Extra (transparent) space doesn't change what these filters
+                            // produce in the used part, unlike, for example, a displacement map.
+                            !ruffle_render::perf_flags::enabled(
+                                ruffle_render::perf_flags::PerfFlag::CacheSlack,
+                            ) || this.opaque_background().is_some()
+                                || !filters.iter().all(|filter| {
+                                    matches!(
+                                        filter,
+                                        Filter::BlurFilter(_)
+                                            | Filter::GlowFilter(_)
+                                            | Filter::DropShadowFilter(_)
+                                            | Filter::ColorMatrixFilter(_)
+                                    )
+                                }),
+                        );
+                        cache.cached_tick = interpolation::tick();
+                        cache.cached_offset = offset;
+                        cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
+                            bitmap,
+                            dirty: true,
+                            base_transform,
+                            offset,
+                            filters,
+                            delta: None,
+                        });
+                    } else {
+                        cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
+                            bitmap,
+                            dirty: false,
+                            base_transform,
+                            offset,
+                            filters,
+                            delta: None,
+                        });
+                    }
+                } else {
+                    if !cache.warned_for_oversize {
+                        tracing::warn!(
+                            "Skipping cacheAsBitmap for incredibly large object {:?} ({width} x {height})",
+                            name
+                        );
+                        cache.warned_for_oversize = true;
+                    }
+                    cache.clear();
+                    cache_info = None;
                 }
-                cache.clear();
-                cache_info = None;
             }
+            cache_info
         }
-        cache_info
     } else {
         None
     };
@@ -1236,7 +1321,12 @@ pub fn render_base<'gc>(
                 use_bitmap_cache: true,
                 stage: context.stage,
             };
-            this.render_self(&mut offscreen_context);
+            let (_, used_blended) = interpolation::track_blended(|| {
+                this.render_self(&mut offscreen_context);
+            });
+            if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+                cache.blends_in_tick = used_blended;
+            }
             offscreen_context.cache_draws.push(BitmapCacheEntry {
                 handle: cache_info.bitmap.handle.clone(),
                 commands: offscreen_context.commands,
@@ -1246,25 +1336,40 @@ pub fn render_base<'gc>(
         }
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
+        // (unless reusing a cached bitmap across an interpolated sub-frame via `delta`).
         apply_standard_mask_and_scroll(
             this,
             context,
             |context| {
                 let region = cache_info.bitmap.full_region();
-                context.commands.render_bitmap(
-                    cache_info.bitmap.handle,
-                    Transform {
-                        matrix: Matrix {
+                let (matrix, pixel_snapping) = if let Some(delta) = cache_info.delta {
+                    let cur = context.transform_stack.transform().matrix;
+                    (
+                        Matrix::translate(cur.tx, cur.ty)
+                            * delta
+                            * Matrix::translate(offset_x, offset_y),
+                        PixelSnapping::Never,
+                    )
+                } else {
+                    (
+                        Matrix {
                             tx: context.transform_stack.transform().matrix.tx + offset_x,
                             ty: context.transform_stack.transform().matrix.ty + offset_y,
                             ..Default::default()
                         },
+                        PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                    )
+                };
+                context.commands.render_bitmap(
+                    cache_info.bitmap.handle,
+                    Transform {
+                        matrix,
                         color_transform: cache_info.base_transform.color_transform,
                         perspective_projection: cache_info.base_transform.perspective_projection,
                         tz: cache_info.base_transform.tz,
                     },
                     true,
-                    PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                    pixel_snapping,
                     region,
                 )
             },

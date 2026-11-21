@@ -36,6 +36,8 @@ struct State {
     render_fraction: Option<f32>,
     /// The fraction to draw the next frame at (see `set_next_render_fraction`).
     next_render_fraction: Option<f32>,
+    /// Set whenever a display object reads a genuinely blended transform (see `track_blended`).
+    used_blended: bool,
 }
 
 thread_local! {
@@ -45,6 +47,7 @@ thread_local! {
             tick: 1,
             render_fraction: None,
             next_render_fraction: None,
+            used_blended: false,
         })
     };
 }
@@ -103,6 +106,24 @@ pub fn with_render_fraction<R>(fraction: Option<f32>, f: impl FnOnce() -> R) -> 
 pub fn is_blending_tick(tick: u32) -> bool {
     let state = state();
     state.render_fraction.is_some() && state.tick == tick
+}
+
+/// Whether an interpolated sub-frame strictly between movie frames (`0 < fraction < 1`)
+/// is currently being rendered.
+pub fn is_inter_frame() -> bool {
+    let state = state();
+    state.enabled && state.render_fraction.is_some_and(|f| f > 0.0 && f < 1.0)
+}
+
+/// Runs `f` and reports whether any display object inside it read a genuinely blended
+/// transform. Propagates upward to any enclosing `track_blended` call.
+pub fn track_blended<R>(f: impl FnOnce() -> R) -> (R, bool) {
+    let outer = state().used_blended;
+    update(|s| s.used_blended = false);
+    let result = f();
+    let inner = state().used_blended;
+    update(|s| s.used_blended = outer || inner);
+    (result, inner)
 }
 
 /// A display object's transform from before the movie frame `tick` first changed it.
@@ -179,11 +200,20 @@ impl InterpolationData {
     /// The blended transform, if the object changed in the current movie frame and a
     /// frame between movie frames is being drawn.
     fn blended(&self, matrix: Matrix, color_transform: ColorTransform) -> Option<Blended> {
-        let state = state();
-        let fraction = state.render_fraction?;
+        // Check `previous` before touching thread-local state: most objects didn't move.
         let previous = self.previous.get()?;
+        let state = state();
         if previous.tick != state.tick {
+            // Stale from an earlier movie frame; clear so future reads skip the TLS lookup.
+            self.previous.set(None);
             return None;
+        }
+        let fraction = state.render_fraction?;
+        if previous.matrix == matrix && previous.color_transform == color_transform {
+            return None;
+        }
+        if !state.used_blended {
+            update(|s| s.used_blended = true);
         }
         if let Some(blended) = self.blended.get()
             && blended.tick == state.tick
