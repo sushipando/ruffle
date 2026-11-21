@@ -182,8 +182,8 @@ impl Surface {
             texture_pool,
         );
 
-        if !leaf_layers.is_empty() {
-            layer_atlas::render_leaf_layers(
+        let atlas_layers = if !leaf_layers.is_empty() {
+            let layers = layer_atlas::render_leaf_layers(
                 leaf_layers,
                 descriptors,
                 meshes,
@@ -193,7 +193,14 @@ impl Surface {
                 texture_pool,
                 self.quality,
             );
-        }
+            commands::bind_atlas_layers(&mut chunks, &layers);
+            Some(layers)
+        } else {
+            None
+        };
+        let atlas_bind_groups = atlas_layers
+            .as_ref()
+            .map_or(&[][..], |layers| &layers.bind_groups);
 
         // Chunks are drawn with the stencil buffer attached only when they use masks. But
         // passes with and without it can't be merged, and each pass on a multisampled
@@ -319,6 +326,7 @@ impl Surface {
                             descriptors,
                             &dynamic_transforms.vertex_buffer,
                             offsets.vertices,
+                            atlas_bind_groups,
                             num_masks,
                             mask_state,
                             needs_stencil,

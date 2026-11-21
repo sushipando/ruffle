@@ -24,6 +24,12 @@ pub struct Shaders {
     /// Like `fetch_blend_shaders`, for solid fills drawn directly with a complex blend
     /// (with `color.wgsl` as the vertex stage).
     pub fetch_color_shaders: Option<EnumMap<ComplexBlend, wgpu::ShaderModule>>,
+    /// Like `fetch_blend_shaders`, for gradient fills drawn directly with a complex blend
+    /// (with `gradient.wgsl` as the vertex stage).
+    pub fetch_gradient_shaders: Option<EnumMap<ComplexBlend, wgpu::ShaderModule>>,
+    /// Like `fetch_blend_shaders`, for bitmap fills/bitmaps drawn directly with a complex
+    /// blend (with `bitmap.wgsl` as the vertex stage, applying color transforms).
+    pub fetch_bitmap_shaders: Option<EnumMap<ComplexBlend, wgpu::ShaderModule>>,
     pub color_matrix_filter: wgpu::ShaderModule,
     pub blur_filter: wgpu::ShaderModule,
     pub glow_filter: wgpu::ShaderModule,
@@ -102,14 +108,16 @@ impl Shaders {
             ComplexBlend::HardLight => make_shader(device, "blend/hardlight.wgsl", include_str!("../shaders/blend/hardlight.wgsl"), max_transforms),
         };
 
-        let fetch_blend_shaders = device
+        let has_fetch = device
             .features()
-            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
-            .then(|| make_fetch_blend_shaders(device, ""));
-        let fetch_color_shaders = device
-            .features()
-            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
-            .then(|| make_fetch_blend_shaders(device, "#define VERTEX_COLOR"));
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS);
+        let fetch_blend_shaders = has_fetch.then(|| make_fetch_blend_shaders(device, ""));
+        let fetch_color_shaders =
+            has_fetch.then(|| make_fetch_blend_shaders(device, "#define VERTEX_COLOR"));
+        let fetch_gradient_shaders =
+            has_fetch.then(|| make_fetch_blend_shaders(device, "#define FETCH_GRADIENT"));
+        let fetch_bitmap_shaders =
+            has_fetch.then(|| make_fetch_blend_shaders(device, "#define FETCH_BITMAP"));
 
         Self {
             color_shader,
@@ -120,6 +128,8 @@ impl Shaders {
             blend_shaders,
             fetch_blend_shaders,
             fetch_color_shaders,
+            fetch_gradient_shaders,
+            fetch_bitmap_shaders,
             color_matrix_filter,
             blur_filter,
             glow_filter,

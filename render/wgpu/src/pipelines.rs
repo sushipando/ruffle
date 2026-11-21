@@ -64,6 +64,10 @@ pub struct Pipelines {
     blended_fills: EnumMap<TrivialBlend, std::sync::OnceLock<BlendedFills>>,
     /// Solid fills drawn with a complex blend mode (see `fetch_color_blend`).
     fetch_color_blends: EnumMap<ComplexBlend, std::sync::OnceLock<ShapePipeline>>,
+    /// Gradient fills drawn with a complex blend mode (see `fetch_gradient_blend`).
+    fetch_gradient_blends: EnumMap<ComplexBlend, std::sync::OnceLock<ShapePipeline>>,
+    /// Bitmap fills/bitmaps drawn with a complex blend mode (see `fetch_bitmap_blend`).
+    fetch_bitmap_blends: EnumMap<ComplexBlend, std::sync::OnceLock<ShapePipeline>>,
     format: wgpu::TextureFormat,
     msaa_sample_count: u32,
 }
@@ -166,6 +170,72 @@ impl Pipelines {
                 self.msaa_sample_count,
                 &VERTEX_BUFFERS_DESCRIPTION_COLOR,
                 &[Some(&bind_layouts.globals), Some(&bind_layouts.transforms)],
+                BlendState::REPLACE,
+                0,
+                PrimitiveTopology::TriangleList,
+            )
+        })
+    }
+
+    /// The pipeline for gradient fills drawn directly with a complex blend mode.
+    pub fn fetch_gradient_blend(
+        &self,
+        device: &wgpu::Device,
+        shaders: &Shaders,
+        bind_layouts: &BindLayouts,
+        blend: ComplexBlend,
+    ) -> &ShapePipeline {
+        self.fetch_gradient_blends[blend].get_or_init(|| {
+            let fetch_shaders = shaders
+                .fetch_gradient_shaders
+                .as_ref()
+                .expect("fetch blends are only used where supported");
+            create_shape_pipeline_with_fragment(
+                &format!("Fetch gradient ({blend:?})"),
+                device,
+                self.format,
+                &shaders.gradient_shader,
+                &fetch_shaders[blend],
+                self.msaa_sample_count,
+                &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
+                &[
+                    Some(&bind_layouts.globals),
+                    Some(&bind_layouts.transforms),
+                    Some(&bind_layouts.gradient),
+                ],
+                BlendState::REPLACE,
+                0,
+                PrimitiveTopology::TriangleList,
+            )
+        })
+    }
+
+    /// The pipeline for bitmap fills/bitmaps drawn directly with a complex blend mode.
+    pub fn fetch_bitmap_blend(
+        &self,
+        device: &wgpu::Device,
+        shaders: &Shaders,
+        bind_layouts: &BindLayouts,
+        blend: ComplexBlend,
+    ) -> &ShapePipeline {
+        self.fetch_bitmap_blends[blend].get_or_init(|| {
+            let fetch_shaders = shaders
+                .fetch_bitmap_shaders
+                .as_ref()
+                .expect("fetch blends are only used where supported");
+            create_shape_pipeline_with_fragment(
+                &format!("Fetch bitmap ({blend:?})"),
+                device,
+                self.format,
+                &shaders.bitmap_shader,
+                &fetch_shaders[blend],
+                self.msaa_sample_count,
+                &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
+                &[
+                    Some(&bind_layouts.globals),
+                    Some(&bind_layouts.transforms),
+                    Some(&bind_layouts.bitmap),
+                ],
                 BlendState::REPLACE,
                 0,
                 PrimitiveTopology::TriangleList,
@@ -364,6 +434,8 @@ impl Pipelines {
             fetch_blends: fetch_blend_pipelines,
             blended_fills: Default::default(),
             fetch_color_blends: Default::default(),
+            fetch_gradient_blends: Default::default(),
+            fetch_bitmap_blends: Default::default(),
             format,
             msaa_sample_count,
             bitmap_opaque,

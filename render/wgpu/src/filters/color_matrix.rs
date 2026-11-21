@@ -10,49 +10,56 @@ use wgpu::util::StagingBelt;
 
 pub struct ColorMatrixFilter {
     pub(super) bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) dynamic_bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
+    dynamic_pipeline_layout: wgpu::PipelineLayout,
     vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
     pipelines: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
+    dynamic_pipeline: OnceLock<wgpu::RenderPipeline>,
 }
 
 impl ColorMatrixFilter {
     pub fn new(device: &wgpu::Device) -> Self {
         let uniform_size = std::mem::size_of::<[f32; 20]>() as u64;
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+        let make_layout = |dynamic: bool| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(uniform_size),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-            label: create_debug_label!("Color matrix filter binds").as_deref(),
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: dynamic,
+                            min_binding_size: wgpu::BufferSize::new(uniform_size),
+                        },
+                        count: None,
+                    },
+                ],
+                label: create_debug_label!("Color matrix filter binds").as_deref(),
+            })
+        };
+        let bind_group_layout = make_layout(false);
+        let dynamic_bind_group_layout = make_layout(true);
 
         let vertices_size = std::mem::size_of::<[FilterVertex; 4]>() as u64;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -67,6 +74,12 @@ impl ColorMatrixFilter {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
+        let dynamic_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&dynamic_bind_group_layout)],
+                immediate_size: 0,
+            });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -77,13 +90,56 @@ impl ColorMatrixFilter {
 
         Self {
             pipelines: Default::default(),
+            dynamic_pipeline: Default::default(),
             pipeline_layout,
+            dynamic_pipeline_layout,
             vertex_buffer,
             uniform_buffer,
             bind_group_layout,
+            dynamic_bind_group_layout,
             vertices_size: wgpu::BufferSize::new(vertices_size).expect("Definitely not zero."),
             uniform_size: wgpu::BufferSize::new(uniform_size).expect("Definitely not zero."),
         }
+    }
+
+    pub(super) fn dynamic_pipeline(&self, descriptors: &Descriptors) -> &wgpu::RenderPipeline {
+        self.dynamic_pipeline.get_or_init(|| {
+            descriptors
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: create_debug_label!("Color Matrix Filter (dynamic)").as_deref(),
+                    layout: Some(&self.dynamic_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &descriptors.shaders.color_matrix_filter,
+                        entry_point: Some("main_vertex"),
+                        buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS,
+                        compilation_options: Default::default(),
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::default(),
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: 1,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &descriptors.shaders.color_matrix_filter,
+                        entry_point: Some("main_fragment"),
+                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        compilation_options: Default::default(),
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        })
     }
 
     pub(super) fn pipeline(

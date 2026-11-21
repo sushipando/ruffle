@@ -32,6 +32,7 @@ pub struct CommandRenderer<'encoder> {
     dynamic_vertex_buffer: &'encoder wgpu::Buffer,
     /// Where this chunk's vertices start in `dynamic_vertex_buffer`.
     dynamic_vertex_base: wgpu::BufferAddress,
+    atlas_bind_groups: &'encoder [wgpu::BindGroup],
 }
 
 impl<'encoder> CommandRenderer<'encoder> {
@@ -41,6 +42,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         descriptors: &'encoder Descriptors,
         dynamic_vertex_buffer: &'encoder wgpu::Buffer,
         dynamic_vertex_base: wgpu::BufferAddress,
+        atlas_bind_groups: &'encoder [wgpu::BindGroup],
         num_masks: u32,
         mask_state: MaskState,
         needs_stencil: bool,
@@ -53,6 +55,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             descriptors,
             needs_stencil,
             dynamic_vertex_buffer,
+            atlas_bind_groups,
         }
     }
 
@@ -105,6 +108,19 @@ impl<'encoder> CommandRenderer<'encoder> {
                 instance_index,
                 blend_mode,
             } => self.render_fetch_blend(render_pass, *instance_index, binds, *blend_mode),
+            DrawCommand::RenderAtlasLayer {
+                atlas_index,
+                instance_index,
+                vertex_offset,
+                blend_mode,
+                ..
+            } => self.render_atlas_layer(
+                render_pass,
+                *atlas_index,
+                *instance_index,
+                *vertex_offset,
+                *blend_mode,
+            ),
             DrawCommand::RenderShape {
                 shape,
                 instance_index,
@@ -226,7 +242,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         bitmap: &'encoder BitmapHandle,
         instance_index: u32,
         smoothing: bool,
-        blend_mode: TrivialBlend,
+        blend_mode: ShapeBlend,
         render_stage3d: bool,
         vertex_offset: Option<wgpu::BufferAddress>,
     ) {
@@ -241,7 +257,25 @@ impl<'encoder> CommandRenderer<'encoder> {
             bitmap.clone(),
             &descriptors.bitmap_samplers,
         );
-        self.prep_bitmap(render_pass, &bind.bind_group, blend_mode, render_stage3d);
+        match blend_mode {
+            ShapeBlend::Trivial(mode) => {
+                self.prep_bitmap(render_pass, &bind.bind_group, mode, render_stage3d);
+            }
+            ShapeBlend::Fetch(mode) => {
+                let pipeline = self.pipelines.fetch_bitmap_blend(
+                    &descriptors.device,
+                    &descriptors.shaders,
+                    &descriptors.bind_layouts,
+                    mode,
+                );
+                render_pass.set_pipeline(if self.needs_stencil {
+                    pipeline.pipeline_for(self.mask_state)
+                } else {
+                    pipeline.stencilless_pipeline()
+                });
+                render_pass.set_bind_group(2, &bind.bind_group, &[]);
+            }
+        }
 
         let vertex_slice = if let Some(vertex_offset) = vertex_offset {
             self.dynamic_vertex_buffer
@@ -298,6 +332,43 @@ impl<'encoder> CommandRenderer<'encoder> {
         self.draw(
             render_pass,
             self.descriptors.quad.vertices_pos_uv.slice(..),
+            self.descriptors.quad.indices.slice(..),
+            6,
+            instance_index,
+        );
+    }
+
+    pub fn render_atlas_layer(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        atlas_index: usize,
+        instance_index: u32,
+        vertex_offset: wgpu::BufferAddress,
+        blend_mode: ShapeBlend,
+    ) {
+        let bind_group = &self.atlas_bind_groups[atlas_index];
+        match blend_mode {
+            ShapeBlend::Trivial(mode) => {
+                self.prep_bitmap(render_pass, bind_group, mode, false);
+            }
+            ShapeBlend::Fetch(mode) => {
+                let pipelines = &self
+                    .pipelines
+                    .fetch_blends
+                    .as_ref()
+                    .expect("fetch blends are only used where supported")[mode];
+                if self.needs_stencil {
+                    render_pass.set_pipeline(pipelines.pipeline_for(self.mask_state));
+                } else {
+                    render_pass.set_pipeline(pipelines.stencilless_pipeline());
+                }
+                render_pass.set_bind_group(2, bind_group, &[]);
+            }
+        }
+        self.draw(
+            render_pass,
+            self.dynamic_vertex_buffer
+                .slice(self.dynamic_vertex_base + vertex_offset..),
             self.descriptors.quad.indices.slice(..),
             6,
             instance_index,
@@ -361,6 +432,20 @@ impl<'encoder> CommandRenderer<'encoder> {
                         blended.color.stencilless_pipeline()
                     });
                 }
+                (DrawType::Gradient { bind_group, .. }, None) if fetch.is_some() => {
+                    let pipeline = self.pipelines.fetch_gradient_blend(
+                        &self.descriptors.device,
+                        &self.descriptors.shaders,
+                        &self.descriptors.bind_layouts,
+                        fetch.expect("checked above"),
+                    );
+                    render_pass.set_pipeline(if self.needs_stencil {
+                        pipeline.pipeline_for(self.mask_state)
+                    } else {
+                        pipeline.stencilless_pipeline()
+                    });
+                    render_pass.set_bind_group(2, bind_group, &[]);
+                }
                 (DrawType::Gradient { bind_group, .. }, None) => {
                     self.prep_gradient(render_pass, bind_group);
                 }
@@ -371,6 +456,20 @@ impl<'encoder> CommandRenderer<'encoder> {
                         blended.gradient.stencilless_pipeline()
                     });
                     render_pass.set_bind_group(2, bind_group, &[]);
+                }
+                (DrawType::Bitmap { binds, .. }, None) if fetch.is_some() => {
+                    let pipeline = self.pipelines.fetch_bitmap_blend(
+                        &self.descriptors.device,
+                        &self.descriptors.shaders,
+                        &self.descriptors.bind_layouts,
+                        fetch.expect("checked above"),
+                    );
+                    render_pass.set_pipeline(if self.needs_stencil {
+                        pipeline.pipeline_for(self.mask_state)
+                    } else {
+                        pipeline.stencilless_pipeline()
+                    });
+                    render_pass.set_bind_group(2, &binds.bind_group, &[]);
                 }
                 (DrawType::Bitmap { binds, .. }, _) => {
                     self.prep_bitmap(render_pass, &binds.bind_group, blend_mode, false);
@@ -516,7 +615,7 @@ pub enum DrawCommand {
         instance_index: u32,
         vertex_offset: Option<wgpu::BufferAddress>,
         smoothing: bool,
-        blend_mode: TrivialBlend,
+        blend_mode: ShapeBlend,
         render_stage3d: bool,
     },
     RenderTexture {
@@ -531,6 +630,14 @@ pub enum DrawCommand {
         binds: wgpu::BindGroup,
         instance_index: u32,
         blend_mode: ComplexBlend,
+    },
+    /// A leaf blend layer sampled directly from its slot in a shared layer atlas.
+    RenderAtlasLayer {
+        leaf_index: usize,
+        atlas_index: usize,
+        instance_index: u32,
+        vertex_offset: wgpu::BufferAddress,
+        blend_mode: ShapeBlend,
     },
     RenderAlphaMask {
         maskee: PoolOrArcTexture,
@@ -568,6 +675,7 @@ impl DrawCommand {
             DrawCommand::RenderShape { .. } => "render shape",
             DrawCommand::RenderTexture { .. } => "render texture",
             DrawCommand::FetchBlend { .. } => "fetch blend",
+            DrawCommand::RenderAtlasLayer { .. } => "render atlas layer",
             DrawCommand::DrawRect { .. } => "draw rect",
             DrawCommand::DrawLine { .. } => "draw line",
             DrawCommand::DrawLineRect { .. } => "draw line rect",
@@ -622,6 +730,42 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     handler.opaque = opaque;
     let chunks = handler.chunk_blends(commands);
     (chunks, mem::take(&mut handler.leaf_layers))
+}
+
+/// Fills in atlas bind-group indices and UV sub-rect vertices for every
+/// `DrawCommand::RenderAtlasLayer` after `layer_atlas::render_leaf_layers` packs them.
+pub fn bind_atlas_layers(chunks: &mut [Chunk], atlas_layers: &layer_atlas::AtlasLayers) {
+    for chunk in chunks {
+        let Chunk::Draw {
+            chunk, vertices, ..
+        } = chunk
+        else {
+            continue;
+        };
+        let bytes = vertices.bytes_mut();
+        for command in chunk {
+            if let DrawCommand::RenderAtlasLayer {
+                leaf_index,
+                atlas_index,
+                vertex_offset,
+                ..
+            } = command
+            {
+                let (bg_index, [u0, v0, u1, v1]) = atlas_layers.placements[*leaf_index]
+                    .expect("RenderAtlasLayer leaf must have an atlas placement");
+                *atlas_index = bg_index;
+                let quad = [
+                    PosUvVertex::new(0.0, 0.0, u0, v0, 1.0),
+                    PosUvVertex::new(1.0, 0.0, u1, v0, 1.0),
+                    PosUvVertex::new(1.0, 1.0, u1, v1, 1.0),
+                    PosUvVertex::new(0.0, 1.0, u0, v1, 1.0),
+                ];
+                let raw = bytemuck::cast_slice(&quad);
+                let start = *vertex_offset as usize;
+                bytes[start..start + raw.len()].copy_from_slice(raw);
+            }
+        }
+    }
 }
 
 /// Chunks the draws of several leaf layers into one target (an atlas).
@@ -985,58 +1129,71 @@ impl WgpuCommandHandler<'_, '_> {
             _ => create(),
         }
     }
+}
 
-    /// The trivial blend mode to draw `commands` with directly, without a layer, if that
-    /// gives the same result: when they're a single bitmap, or a single shape with a
-    /// single fill, which affect each pixel at most once.
+/// The blend mode to draw `commands` with directly, without a layer, if that gives the
+/// same result: when they're a single bitmap, or a single shape with a single fill,
+/// which affect each pixel at most once.
+pub(crate) fn direct_blend_mode_for(
+    descriptors: &Descriptors,
+    commands: &CommandList,
+    blend_mode: &RenderBlendMode,
+    opaque: bool,
+) -> Option<ShapeBlend> {
+    if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::DirectBlends) {
+        return None;
+    }
+    let [command] = commands.commands.as_slice() else {
+        return None;
+    };
+    let single_fill = match command {
+        Command::RenderShape { shape, .. } => {
+            let mesh = as_mesh(shape);
+            mesh.draws.len() == 1 && mesh.draws[0].single_fill
+        }
+        Command::RenderBitmap { .. } => true,
+        _ => false,
+    };
+    if !single_fill {
+        return None;
+    }
+    match BlendType::from(blend_mode.clone()) {
+        BlendType::Trivial(mode) => Some(ShapeBlend::Trivial(mode)),
+        BlendType::Complex(ComplexBlend::Multiply)
+            if opaque
+                && ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::OpaqueMultiply,
+                ) =>
+        {
+            Some(ShapeBlend::Trivial(TrivialBlend::MultiplyOpaque))
+        }
+        // Solid, gradient, and bitmap fills can read the backdrop themselves (see
+        // `fetch.metal`). Alpha and Erase blend with their layer, which may be another
+        // target.
+        BlendType::Complex(mode)
+            if !matches!(mode, ComplexBlend::Alpha | ComplexBlend::Erase)
+                && descriptors.shaders.fetch_color_shaders.is_some()
+                && ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::FetchBlends,
+                ) =>
+        {
+            Some(ShapeBlend::Fetch(mode))
+        }
+        _ => None,
+    }
+}
+
+impl WgpuCommandHandler<'_, '_> {
+    /// See `direct_blend_mode_for`.
     fn direct_blend_mode(
         &self,
         commands: &CommandList,
         blend_mode: &RenderBlendMode,
     ) -> Option<ShapeBlend> {
-        if self.direct_blend.is_some()
-            || !ruffle_render::perf_flags::enabled(
-                ruffle_render::perf_flags::PerfFlag::DirectBlends,
-            )
-        {
+        if self.direct_blend.is_some() {
             return None;
         }
-        let [command] = commands.commands.as_slice() else {
-            return None;
-        };
-        let single_fill = |color_only: bool| match command {
-            Command::RenderShape { shape, .. } => {
-                let mesh = as_mesh(shape);
-                mesh.draws.len() == 1
-                    && mesh.draws[0].single_fill
-                    && (!color_only || matches!(mesh.draws[0].draw_type, DrawType::Color))
-            }
-            Command::RenderBitmap { .. } => !color_only,
-            _ => false,
-        };
-        match BlendType::from(blend_mode.clone()) {
-            BlendType::Trivial(mode) => single_fill(false).then_some(ShapeBlend::Trivial(mode)),
-            BlendType::Complex(ComplexBlend::Multiply)
-                if self.opaque
-                    && ruffle_render::perf_flags::enabled(
-                        ruffle_render::perf_flags::PerfFlag::OpaqueMultiply,
-                    ) =>
-            {
-                single_fill(false).then_some(ShapeBlend::Trivial(TrivialBlend::MultiplyOpaque))
-            }
-            // Solid fills can read the backdrop themselves (see `fetch.metal`). Alpha and
-            // Erase blend with their layer, which may be another target.
-            BlendType::Complex(mode)
-                if !matches!(mode, ComplexBlend::Alpha | ComplexBlend::Erase)
-                    && self.descriptors.shaders.fetch_color_shaders.is_some()
-                    && ruffle_render::perf_flags::enabled(
-                        ruffle_render::perf_flags::PerfFlag::FetchBlends,
-                    ) =>
-            {
-                single_fill(true).then_some(ShapeBlend::Fetch(mode))
-            }
-            _ => None,
-        }
+        direct_blend_mode_for(self.descriptors, commands, blend_mode, self.opaque)
     }
 
     fn blend_impl(
@@ -1082,54 +1239,6 @@ impl WgpuCommandHandler<'_, '_> {
         let blend_type = BlendType::from(blend_mode);
         let clear_color = blend_type.default_color();
 
-        let texture = if rect.is_some()
-            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LayerAtlas)
-            && layer_atlas::is_leaf(&commands, width, height)
-        {
-            // Rendered later, together with other such layers (see `layer_atlas`).
-            let texture = self.texture_pool.get_texture(
-                self.descriptors,
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                layer_atlas::LAYER_TEXTURE_USAGE,
-                wgpu::TextureFormat::Rgba8Unorm,
-                1,
-            );
-            self.leaf_layers.push(layer_atlas::LeafLayer {
-                commands,
-                origin,
-                width,
-                height,
-                destination: texture.0.clone(),
-            });
-            PoolOrArcTexture::Pool(texture)
-        } else {
-            let surface = Surface::new(
-                self.descriptors,
-                self.quality,
-                width,
-                height,
-                wgpu::TextureFormat::Rgba8Unorm,
-            )
-            .with_origin(origin);
-            let target = surface.draw_commands(
-                RenderTargetMode::FreshWithColor(clear_color),
-                self.descriptors,
-                self.meshes,
-                commands,
-                self.staging_belt,
-                self.dynamic_transforms,
-                self.draw_encoder,
-                target_layer,
-                self.texture_pool,
-            );
-            target.ensure_cleared(self.draw_encoder);
-            target.take_color_texture()
-        };
-
         // We currently do not support shader blends in masks. In order not to
         // break other parts of the scene, we just fall back to a normal blend.
         //
@@ -1165,7 +1274,7 @@ impl WgpuCommandHandler<'_, '_> {
             blend_type => blend_type,
         };
 
-        match blend_type {
+        let inline_blend = match blend_type {
             BlendType::Complex(blend_mode)
                 if !matches!(blend_mode, ComplexBlend::Alpha | ComplexBlend::Erase)
                     && self.descriptors.shaders.fetch_blend_shaders.is_some()
@@ -1173,6 +1282,100 @@ impl WgpuCommandHandler<'_, '_> {
                         ruffle_render::perf_flags::PerfFlag::FetchBlends,
                     ) =>
             {
+                Some(ShapeBlend::Fetch(blend_mode))
+            }
+            BlendType::Trivial(blend_mode) => Some(ShapeBlend::Trivial(blend_mode)),
+            _ => None,
+        };
+
+        let use_leaf_atlas = rect.is_some()
+            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LayerAtlas)
+            && layer_atlas::is_leaf(self.descriptors, &commands, width, height);
+
+        if use_leaf_atlas && let Some(shape_blend) = inline_blend {
+            // Sample directly from the layer atlas via UV sub-rect, avoiding a per-layer
+            // texture allocation, copy-out blit, and per-layer bind group.
+            match shape_blend {
+                ShapeBlend::Fetch(_) => crate::perf_counters::count_named("fetch-blend"),
+                ShapeBlend::Trivial(_) => {
+                    crate::perf_counters::count(crate::perf_counters::Counter::BlendTrivial)
+                }
+            }
+            let leaf_index = self.leaf_layers.len();
+            self.leaf_layers.push(layer_atlas::LeafLayer {
+                commands,
+                origin,
+                width,
+                height,
+                destination: None,
+            });
+            let placeholder = [PosUvVertex::new(0.0, 0.0, 0.0, 0.0, 1.0); 4];
+            self.add_to_current_with_vertices(
+                Matrix::translate(
+                    Twips::from_pixels_i32(origin.0),
+                    Twips::from_pixels_i32(origin.1),
+                ) * Matrix::scale(width as f32, height as f32),
+                0.0,
+                Default::default(),
+                Some(&placeholder),
+                |instance_index, vertex_offset| DrawCommand::RenderAtlasLayer {
+                    leaf_index,
+                    atlas_index: 0,
+                    instance_index,
+                    vertex_offset: vertex_offset.expect("vertices were provided"),
+                    blend_mode: shape_blend,
+                },
+            );
+            return;
+        }
+
+        let texture = if use_leaf_atlas {
+            // Rendered later, together with other such layers (see `layer_atlas`).
+            let texture = self.texture_pool.get_texture(
+                self.descriptors,
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                layer_atlas::LAYER_TEXTURE_USAGE,
+                wgpu::TextureFormat::Rgba8Unorm,
+                1,
+            );
+            self.leaf_layers.push(layer_atlas::LeafLayer {
+                commands,
+                origin,
+                width,
+                height,
+                destination: Some(texture.0.clone()),
+            });
+            PoolOrArcTexture::Pool(texture)
+        } else {
+            let surface = Surface::new(
+                self.descriptors,
+                self.quality,
+                width,
+                height,
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
+            .with_origin(origin);
+            let target = surface.draw_commands(
+                RenderTargetMode::FreshWithColor(clear_color),
+                self.descriptors,
+                self.meshes,
+                commands,
+                self.staging_belt,
+                self.dynamic_transforms,
+                self.draw_encoder,
+                target_layer,
+                self.texture_pool,
+            );
+            target.ensure_cleared(self.draw_encoder);
+            target.take_color_texture()
+        };
+
+        match inline_blend {
+            Some(ShapeBlend::Fetch(blend_mode)) => {
                 // Drawn like a trivial blend, but its shader blends with the pixel
                 // underneath (framebuffer fetch), so there's no need to split the pass
                 // and copy the backdrop. (Alpha and Erase blend with their layer,
@@ -1194,7 +1397,7 @@ impl WgpuCommandHandler<'_, '_> {
                     },
                 );
             }
-            BlendType::Trivial(blend_mode) => {
+            Some(ShapeBlend::Trivial(blend_mode)) => {
                 crate::perf_counters::count(crate::perf_counters::Counter::BlendTrivial);
                 let transform = Transform {
                     matrix: Matrix::translate(
@@ -1218,7 +1421,7 @@ impl WgpuCommandHandler<'_, '_> {
                     },
                 );
             }
-            blend_type => {
+            None => {
                 crate::perf_counters::count(crate::perf_counters::Counter::BlendComplex);
                 if !self.current.is_empty() {
                     self.result.push(Chunk::Draw {
@@ -1284,11 +1487,9 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         pixel_snapping: PixelSnapping,
         region: PixelRegion,
     ) {
-        let direct_blend = match self.direct_blend {
-            Some(ShapeBlend::Trivial(mode)) => mode,
-            // Only solid fills are drawn directly with fetch blends.
-            Some(ShapeBlend::Fetch(_)) | None => TrivialBlend::Normal,
-        };
+        let direct_blend = self
+            .direct_blend
+            .unwrap_or(ShapeBlend::Trivial(TrivialBlend::Normal));
         let texture = as_texture(&bitmap);
 
         let mut matrix = transform.matrix;
@@ -1344,7 +1545,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 instance_index,
                 vertex_offset: None,
                 smoothing: false,
-                blend_mode: TrivialBlend::Normal,
+                blend_mode: ShapeBlend::Trivial(TrivialBlend::Normal),
                 render_stage3d: true,
             },
         );

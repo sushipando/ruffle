@@ -643,11 +643,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 && ruffle_render::filters::rendering_for_display();
 
         // Cache entries whose contents are simple enough are all drawn together in an
-        // atlas, and copied into their textures. They mustn't use other cache entries'
+        // atlas, and copied into their textures (or drawn straight into the filter atlas
+        // when they're filtered together). They mustn't use other cache entries'
         // textures, as those may not be drawn yet.
         let is_atlased: Vec<bool> = cache_entries
             .iter()
-            .map(|entry| {
+            .enumerate()
+            .map(|(index, entry)| {
                 use ruffle_render::commands::Command;
                 let texture = as_texture(&entry.handle);
                 let (width, height) = (texture.texture.width(), texture.texture.height());
@@ -664,7 +666,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     Some("clear")
                 } else if !crate::surface::layer_atlas::fits(width, height) {
                     Some("size")
-                } else if !crate::surface::layer_atlas::is_leaf(&entry.commands, width, height) {
+                } else if !crate::surface::layer_atlas::is_leaf(
+                    &self.descriptors,
+                    &entry.commands,
+                    width,
+                    height,
+                ) {
                     Some(
                         if entry.commands.commands.iter().any(|command| {
                             matches!(command, Command::Blend(..) | Command::BlendBounded(..))
@@ -678,10 +685,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             "commands"
                         },
                     )
-                } else if entry.commands.commands.iter().any(|command| {
-                    matches!(command, Command::RenderBitmap { bitmap, .. }
-                            if cache_handles.contains(bitmap))
-                }) {
+                } else if !references[index].is_empty() {
                     Some("nested")
                 } else {
                     None
@@ -695,12 +699,26 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 reason.is_none()
             })
             .collect();
+        let max_filter_size = crate::surface::layer_atlas::max_batched_filter_size();
+        let direct_to_filter_atlas: Vec<bool> = cache_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                is_atlased[index]
+                    && batching
+                    && together
+                    && !entry.filters.is_empty()
+                    && cache_textures[index].width() <= max_filter_size
+                    && cache_textures[index].height() <= max_filter_size
+                    && entry.filters.iter().all(crate::filters::can_apply_together)
+            })
+            .collect();
         let mut cache_entries: Vec<_> = cache_entries.into_iter().map(Some).collect();
         let atlased: Vec<_> = cache_entries
             .iter_mut()
-            .zip(&is_atlased)
-            .filter(|(_, atlased)| **atlased)
-            .filter_map(|(entry, _)| {
+            .enumerate()
+            .filter(|&(index, _)| is_atlased[index] && !direct_to_filter_atlas[index])
+            .filter_map(|(_, entry)| {
                 let entry = entry.as_mut()?;
                 let texture = as_texture(&entry.handle);
                 Some(crate::surface::layer_atlas::LeafLayer {
@@ -708,12 +726,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     origin: (0, 0),
                     width: texture.texture.width(),
                     height: texture.texture.height(),
-                    destination: texture.texture.clone(),
+                    destination: Some(texture.texture.clone()),
                 })
             })
             .collect();
         if !atlased.is_empty() {
-            crate::surface::layer_atlas::render_leaf_layers(
+            drop(crate::surface::layer_atlas::render_leaf_layers(
                 atlased,
                 &self.descriptors,
                 &self.meshes,
@@ -724,7 +742,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     .scope("Draw to CABs", &mut self.active_frame.command_encoder),
                 &mut self.offscreen_texture_pool,
                 self.surface.quality(),
-            );
+            ));
         }
 
         for level in 0..=max_level {
@@ -786,17 +804,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             for &index in &filtered_together {
                 filter_batched[index] = true;
             }
-            let filtered_together: Vec<(wgpu::Texture, Vec<Filter>)> = filtered_together
+            let mut filtered_together: Vec<crate::filters::FilterTogetherEntry> = filtered_together
                 .into_iter()
                 .map(|index| {
-                    (
-                        cache_textures[index].clone(),
-                        cache_entries[index]
-                            .as_ref()
-                            .expect("entries are only taken once")
-                            .filters
-                            .clone(),
-                    )
+                    let entry = cache_entries[index]
+                        .as_mut()
+                        .expect("entries are only taken once");
+                    let direct_commands = direct_to_filter_atlas[index]
+                        .then(|| std::mem::take(&mut entry.commands));
+                    crate::filters::FilterTogetherEntry {
+                        texture: cache_textures[index].clone(),
+                        filters: entry.filters.clone(),
+                        direct_commands,
+                    }
                 })
                 .collect();
 
@@ -916,31 +936,62 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         );
                     }
                 }
-                // Periodically flush GPU work to prevent OOM when many cache entries
-                // accumulate (e.g. when a large container's cacheAsBitmap is skipped
-                // but its hundreds of children each have their own bitmap caches).
-                self.active_frame.maybe_flush(&self.descriptors);
+                // Periodically flush GPU work to prevent OOM when many unbatched cache
+                // entries accumulate; batched atlas/filter entries share a single pass.
+                if !atlased || !filter_batched[index] {
+                    self.active_frame.maybe_flush(&self.descriptors);
+                }
             }
 
             if !filtered_together.is_empty() {
                 let skipped = crate::filters::apply_together(
-                    &filtered_together,
+                    &mut filtered_together,
                     &self.descriptors,
-                    &mut self.active_frame.command_encoder,
+                    &self.meshes,
+                    &mut self
+                        .profiler
+                        .scope("Filter together", &mut self.active_frame.command_encoder),
                     &mut self.active_frame.staging_belt,
+                    &self.active_frame.dynamic_transforms,
                     &mut self.offscreen_texture_pool,
+                    self.surface.quality(),
                     crate::surface::layer_atlas::max_filter_atlas_size()
                         .min(self.descriptors.limits.max_texture_dimension_2d),
                 );
                 for index in skipped {
-                    let (texture, filters) = &filtered_together[index];
+                    let entry = &mut filtered_together[index];
+                    if let Some(commands) = entry.direct_commands.take() {
+                        let surface = Surface::new(
+                            &self.descriptors,
+                            self.surface.quality(),
+                            entry.texture.width(),
+                            entry.texture.height(),
+                            wgpu::TextureFormat::Rgba8Unorm,
+                        );
+                        surface.draw_commands(
+                            RenderTargetMode::ExistingWithColor(
+                                entry.texture.clone(),
+                                wgpu::Color::TRANSPARENT,
+                            ),
+                            &self.descriptors,
+                            &self.meshes,
+                            commands,
+                            &mut self.active_frame.staging_belt,
+                            &self.active_frame.dynamic_transforms,
+                            &mut self
+                                .profiler
+                                .scope("Draw to CAB", &mut self.active_frame.command_encoder),
+                            LayerRef::None,
+                            &mut self.offscreen_texture_pool,
+                        );
+                    }
                     filter_texture_in_place(
                         &self.descriptors,
                         &mut self.active_frame.command_encoder,
                         &mut self.offscreen_texture_pool,
                         &mut self.active_frame.staging_belt,
-                        texture,
-                        filters,
+                        &entry.texture,
+                        &entry.filters,
                     );
                 }
             }

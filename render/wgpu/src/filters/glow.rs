@@ -24,8 +24,8 @@ pub(super) struct GlowUniform {
 
 pub struct GlowFilter {
     bind_group_layout: wgpu::BindGroupLayout,
-    /// Like `bind_group_layout`, with a filtering sampler (single-sampled, see
-    /// `linear_pipeline`).
+    /// Like `bind_group_layout`, with a filtering sampler and dynamic uniform offset
+    /// (single-sampled, see `linear_pipeline`).
     pub(super) linear_bind_group_layout: wgpu::BindGroupLayout,
     linear_pipeline_layout: wgpu::PipelineLayout,
     linear_pipeline: OnceLock<wgpu::RenderPipeline>,
@@ -40,8 +40,9 @@ pub struct GlowFilter {
 impl GlowFilter {
     pub fn new(device: &wgpu::Device) -> Self {
         let uniform_size = std::mem::size_of::<GlowUniform>() as u64;
-        // The batched path (`filters::batch`) samples scaled-down blurs bilinearly.
-        let make_layout = |filterable: bool| {
+        // The batched path (`filters::batch`) samples scaled-down blurs bilinearly
+        // and indexes per-quad uniforms with a dynamic offset.
+        let make_layout = |filterable: bool, dynamic: bool| {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
@@ -69,7 +70,7 @@ impl GlowFilter {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
+                            has_dynamic_offset: dynamic,
                             min_binding_size: wgpu::BufferSize::new(uniform_size),
                         },
                         count: None,
@@ -88,8 +89,8 @@ impl GlowFilter {
                 label: create_debug_label!("Blur filter binds").as_deref(),
             })
         };
-        let bind_group_layout = make_layout(false);
-        let linear_bind_group_layout = make_layout(true);
+        let bind_group_layout = make_layout(false, false);
+        let linear_bind_group_layout = make_layout(true, true);
 
         let vertices_size = std::mem::size_of::<[FilterVertexWithBlur; 4]>() as u64;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {

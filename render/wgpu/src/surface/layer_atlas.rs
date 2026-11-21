@@ -14,13 +14,13 @@ use crate::descriptors::Descriptors;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::mesh::Mesh;
 use crate::surface::commands::{Chunk, CommandRenderer, chunk_leaf_layers};
-use crate::surface::target::CommandTarget;
+use crate::surface::target::{CommandTarget, PoolOrArcTexture};
 use ruffle_render::commands::{Command, CommandList};
 use ruffle_render::quality::StageQuality;
 use wgpu_profiler::Scope;
 
 /// Layers larger than this (in either dimension) are rendered on their own.
-const MAX_LAYER_SIZE: u32 = 1024;
+const MAX_LAYER_SIZE: u32 = 2048;
 
 /// The maximum size of an atlas texture (in either dimension).
 const MAX_ATLAS_SIZE: u32 = 4096;
@@ -37,8 +37,18 @@ pub struct LeafLayer {
     pub origin: (i32, i32),
     pub width: u32,
     pub height: u32,
-    /// The texture the rendered layer must end up in.
-    pub destination: wgpu::Texture,
+    /// If `Some`, the rendered layer is copied out into this texture; if `None`, the
+    /// caller samples it directly from the atlas via `AtlasLayers`.
+    pub destination: Option<wgpu::Texture>,
+}
+
+/// Rendered layer atlases kept alive for direct sampling by the parent pass (avoiding
+/// per-layer textures, copy-out blits, and per-layer bind groups).
+pub struct AtlasLayers {
+    _textures: Vec<PoolOrArcTexture>,
+    pub bind_groups: Vec<wgpu::BindGroup>,
+    /// For each direct-sampled `LeafLayer` index: `(atlas_bind_group_index, [u0, v0, u1, v1])`.
+    pub placements: Vec<Option<(usize, [f32; 4])>>,
 }
 
 /// Whether a layer of this size is small enough for the atlas.
@@ -47,18 +57,21 @@ pub fn fits(width: u32, height: u32) -> bool {
 }
 
 /// Whether a layer with these commands can be rendered in the atlas: it must only
-/// contain plain draws (no masks or nested layers), and be reasonably small.
-pub fn is_leaf(commands: &CommandList, width: u32, height: u32) -> bool {
+/// contain plain draws (or blends that draw directly without a sub-layer), and be
+/// reasonably small.
+pub fn is_leaf(descriptors: &Descriptors, commands: &CommandList, width: u32, height: u32) -> bool {
     fits(width, height)
-        && commands.commands.iter().all(|command| {
-            matches!(
-                command,
-                Command::RenderBitmap { .. }
-                    | Command::RenderShape { .. }
-                    | Command::DrawRect { .. }
-                    | Command::DrawLine { .. }
-                    | Command::DrawLineRect { .. }
-            )
+        && commands.commands.iter().all(|command| match command {
+            Command::RenderBitmap { .. }
+            | Command::RenderShape { .. }
+            | Command::DrawRect { .. }
+            | Command::DrawLine { .. }
+            | Command::DrawLineRect { .. } => true,
+            Command::Blend(inner, mode) | Command::BlendBounded(inner, mode, _) => {
+                crate::surface::commands::direct_blend_mode_for(descriptors, inner, mode, false)
+                    .is_some()
+            }
+            _ => false,
         })
 }
 
@@ -114,7 +127,12 @@ pub fn render_leaf_layers(
     draw_encoder: &mut Scope<'_, wgpu::CommandEncoder>,
     texture_pool: &mut TexturePool,
     quality: StageQuality,
-) {
+) -> AtlasLayers {
+    let mut result = AtlasLayers {
+        _textures: vec![],
+        bind_groups: vec![],
+        placements: vec![None; layers.len()],
+    };
     let max_size = MAX_ATLAS_SIZE.min(descriptors.limits.max_texture_dimension_2d);
     for (batch, width, height) in pack(&layers, max_size) {
         // Round sizes up, so that textures can be reused between frames.
@@ -215,6 +233,7 @@ pub fn render_leaf_layers(
                     descriptors,
                     &dynamic_transforms.vertex_buffer,
                     offsets.vertices,
+                    &[],
                     0,
                     MaskState::NoMask,
                     false,
@@ -230,26 +249,69 @@ pub fn render_leaf_layers(
         }
         target.ensure_resolved(draw_encoder);
 
+        let mut needs_direct = false;
         for (index, slot) in &batch {
             let layer = &layers[*index];
-            draw_encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: target.color_texture(),
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: slot.x,
-                        y: slot.y,
-                        z: 0,
+            if let Some(destination) = &layer.destination {
+                draw_encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: target.color_texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: slot.x,
+                            y: slot.y,
+                            z: 0,
+                        },
+                        aspect: Default::default(),
                     },
-                    aspect: Default::default(),
-                },
-                layer.destination.as_image_copy(),
-                wgpu::Extent3d {
-                    width: layer.width,
-                    height: layer.height,
-                    depth_or_array_layers: 1,
-                },
-            );
+                    destination.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: layer.width,
+                        height: layer.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            } else {
+                needs_direct = true;
+            }
+        }
+        if needs_direct {
+            let atlas_index = result.bind_groups.len();
+            let atlas_texture = target.take_color_texture();
+            let bind_group = descriptors
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &descriptors.bind_layouts.bitmap,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(atlas_texture.view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(
+                                descriptors.bitmap_samplers.get_sampler(false, false),
+                            ),
+                        },
+                    ],
+                    label: create_debug_label!("Layer atlas bind group").as_deref(),
+                });
+            result._textures.push(atlas_texture);
+            result.bind_groups.push(bind_group);
+            for (index, slot) in &batch {
+                let layer = &layers[*index];
+                if layer.destination.is_none() {
+                    result.placements[*index] = Some((
+                        atlas_index,
+                        [
+                            slot.x as f32 / width as f32,
+                            slot.y as f32 / height as f32,
+                            (slot.x + layer.width) as f32 / width as f32,
+                            (slot.y + layer.height) as f32 / height as f32,
+                        ],
+                    ));
+                }
+            }
         }
         if crate::perf_counters::enabled() {
             crate::perf_counters::count_named(format!(
@@ -258,6 +320,7 @@ pub fn render_leaf_layers(
             ));
         }
     }
+    result
 }
 
 /// Whether a filter only depends on pixels near each output pixel, so that it can
@@ -282,10 +345,127 @@ pub fn is_local_filter(filter: &ruffle_render::filters::Filter) -> bool {
 ///
 /// Returns the indices of textures that were too large to batch, which the caller
 /// must filter itself.
+/// Draws a set of leaf layers straight into `destination` (clearing it to transparent and
+/// resolving MSAA straight into it), at each layer's `(x, y, width, height)` scissor slot.
+#[expect(clippy::too_many_arguments)]
+pub fn render_into_atlas(
+    layers: impl Iterator<Item = (CommandList, (i32, i32), (u32, u32, u32, u32))>,
+    destination: &wgpu::Texture,
+    descriptors: &Descriptors,
+    meshes: &Vec<Mesh>,
+    staging_belt: &mut wgpu::util::StagingBelt,
+    dynamic_transforms: &DynamicTransforms,
+    draw_encoder: &mut Scope<'_, wgpu::CommandEncoder>,
+    texture_pool: &mut TexturePool,
+    quality: StageQuality,
+) {
+    let width = destination.width();
+    let height = destination.height();
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let format = destination.format();
+    let sample_count = crate::utils::supported_sample_count(
+        &descriptors.adapter,
+        quality.sample_count(),
+        format,
+    );
+    let pipelines = descriptors.pipelines(sample_count, format);
+    let target = CommandTarget::new(
+        descriptors,
+        texture_pool,
+        size,
+        format,
+        sample_count,
+        RenderTargetMode::ExistingWithColor(destination.clone(), wgpu::Color::TRANSPARENT),
+        draw_encoder,
+    );
+
+    let chunks = chunk_leaf_layers(
+        layers,
+        descriptors,
+        staging_belt,
+        dynamic_transforms,
+        draw_encoder,
+        meshes,
+        quality,
+        width,
+        height,
+        texture_pool,
+    );
+
+    let mut chunks: std::collections::VecDeque<_> = chunks
+        .into_iter()
+        .map(|chunk| {
+            let Chunk::Draw {
+                chunk,
+                needs_stencil: _,
+                transforms,
+                vertices,
+            } = chunk
+            else {
+                unreachable!("Leaf layers only contain draws");
+            };
+            (chunk, transforms, vertices)
+        })
+        .collect();
+    while !chunks.is_empty() {
+        let mut group = vec![];
+        while let Some((chunk, transforms, vertices)) = chunks.pop_front() {
+            let offsets =
+                dynamic_transforms.upload(transforms, vertices, staging_belt, draw_encoder);
+            group.push((chunk, offsets));
+            if offsets.fallback
+                || !ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::MergeChunks,
+                )
+            {
+                break;
+            }
+        }
+        crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
+        let mut render_pass = draw_encoder.scoped_render_pass(
+            "Layer atlas",
+            wgpu::RenderPassDescriptor {
+                color_attachments: &[target.color_attachments_for_pass(chunks.is_empty())],
+                ..Default::default()
+            },
+        );
+        render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
+        for (chunk, offsets) in &group {
+            render_pass.set_bind_group(
+                1,
+                &dynamic_transforms.bind_group,
+                &[offsets.transforms],
+            );
+            let mut renderer = CommandRenderer::new(
+                &pipelines,
+                descriptors,
+                &dynamic_transforms.vertex_buffer,
+                offsets.vertices,
+                &[],
+                0,
+                MaskState::NoMask,
+                false,
+            );
+            for command in chunk {
+                if crate::utils::PROFILE_COMMANDS {
+                    renderer.execute(&mut render_pass.scope(command.name()), command);
+                } else {
+                    renderer.execute(&mut render_pass, command);
+                }
+            }
+        }
+    }
+    target.ensure_resolved(draw_encoder);
+}
+
 /// The largest cached bitmaps whose filters are applied in an atlas (in either dimension).
 pub fn max_batched_filter_size() -> u32 {
     if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::BatchLargeFilters) {
-        1024
+        2048
     } else {
         512
     }
