@@ -93,6 +93,9 @@ impl<'gc> OrphanManager<'gc> {
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
     ) {
+        if context.orphan_manager.orphans.is_empty() {
+            return;
+        }
         // Clone the Rc before iterating over it. Any modifications must go through
         // `Rc::make_mut` in `orphan_objects_mut`, which will leave this `Rc` unmodified.
         // This ensures that any orphan additions/removals done by `f` will not affect
@@ -110,6 +113,14 @@ impl<'gc> OrphanManager<'gc> {
     /// that have been garbage collected, or are no longer orphans
     /// (they've since acquired a parent).
     pub fn cleanup_dead_orphans(&mut self, mc: &Mutation<'gc>) {
+        // Fast check: avoid `Rc::make_mut` cloning the orphan Vec during nested gotos
+        // when no entries need to be removed.
+        let any_dead = self.orphans.iter().any(|d| {
+            valid_orphan(*d, mc).is_none_or(|dobj| !dobj.placed_by_avm2_script())
+        });
+        if !any_dead {
+            return;
+        }
         self.orphans_mut().retain(|d| {
             if let Some(dobj) = valid_orphan(*d, mc) {
                 // All clips that become orphaned (have their parent removed, or start out with no parent)

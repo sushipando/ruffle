@@ -18,7 +18,7 @@ use gc_arena::barrier::unlock;
 use gc_arena::lock::{Lock, RefLock};
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use ruffle_common::utils::HasPrefixField;
-use std::cell::{Ref, RefMut};
+use std::cell::{Cell, Ref, RefMut};
 
 use super::interactive::Avm2MousePick;
 
@@ -42,6 +42,7 @@ pub struct LoaderDisplayData<'gc> {
     container: RefLock<ChildContainer<'gc>>,
     avm2_object: Lock<Option<Avm2StageObject<'gc>>>,
     movie: SwfMovie<'gc>,
+    settled_epoch: Cell<u64>,
 }
 
 impl<'gc> LoaderDisplay<'gc> {
@@ -53,6 +54,7 @@ impl<'gc> LoaderDisplay<'gc> {
                 container: RefLock::new(ChildContainer::new(&movie)),
                 avm2_object: Lock::new(None),
                 movie,
+                settled_epoch: Cell::new(0),
             },
         ));
 
@@ -63,6 +65,60 @@ impl<'gc> LoaderDisplay<'gc> {
 
     pub fn downgrade(self) -> LoaderDisplayWeak<'gc> {
         LoaderDisplayWeak(Gc::downgrade(self.0))
+    }
+
+    #[inline(always)]
+    pub(crate) fn settled_epoch(self) -> u64 {
+        self.0.settled_epoch.get()
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear_settled_epoch(self) -> u64 {
+        self.0.settled_epoch.replace(0)
+    }
+
+    pub(crate) fn unsettle(self) {
+        crate::display_object::unsettle_ancestors(Some(self.into()));
+    }
+
+    fn is_idle(self) -> bool {
+        crate::display_object::is_packed_idle(self.0.settled_epoch.get())
+    }
+
+    fn is_settled(self, context: &UpdateContext<'gc>) -> bool {
+        crate::display_object::is_packed_settled(
+            self.0.settled_epoch.get(),
+            context.stage.frame_epoch(),
+        )
+    }
+
+    fn settle(self, context: &UpdateContext<'gc>) {
+        if !self.movie().is_action_script_3() {
+            return;
+        }
+        let mut idle = !self.base().should_skip_next_enter_frame();
+        let epoch = context.stage.frame_epoch();
+        let generation = crate::display_object::button_state_unsettle_gen();
+        for child in self.iter_render_list() {
+            let (settled, child_idle) =
+                crate::display_object::child_settled_state(child, epoch, generation);
+            if !settled {
+                return;
+            }
+            if !child_idle {
+                idle = false;
+            }
+        }
+        self.0
+            .settled_epoch
+            .set(crate::display_object::pack_settled_epoch(
+                generation,
+                if idle {
+                    crate::display_object::SETTLED_IDLE_LOW
+                } else {
+                    epoch
+                },
+            ));
     }
 }
 
@@ -98,6 +154,9 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
         let skip_frame = self.base().should_skip_next_enter_frame();
+        if !skip_frame && self.is_idle() {
+            return;
+        }
         for child in self.iter_render_list() {
             // See MovieClip::enter_frame for an explanation of this.
             if skip_frame {
@@ -109,9 +168,22 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
     }
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        if self.is_settled(context) {
+            return;
+        }
         for child in self.iter_render_list() {
             child.construct_frame(context);
         }
+    }
+
+    fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if self.is_settled(context) {
+            return;
+        }
+        for child in self.iter_render_list() {
+            child.run_frame_scripts(context);
+        }
+        self.settle(context);
     }
 
     fn post_instantiation(
@@ -210,6 +282,7 @@ impl<'gc> TDisplayObjectContainer<'gc> for LoaderDisplay<'gc> {
     }
 
     fn raw_container_mut(&self, gc_context: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
+        self.unsettle();
         unlock!(Gc::write(gc_context, self.0), LoaderDisplayData, container).borrow_mut()
     }
 }

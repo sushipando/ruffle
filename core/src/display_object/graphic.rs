@@ -103,11 +103,25 @@ impl<'gc> Graphic<'gc> {
         movie: SwfMovie<'gc>,
         source: Option<Range<usize>>,
     ) -> Self {
+        let mut styles = swf_shape.styles.fill_styles.len() + swf_shape.styles.line_styles.len();
+        for rec in &swf_shape.shape {
+            if let swf::ShapeRecord::StyleChange(ch) = rec
+                && let Some(ns) = &ch.new_styles
+            {
+                styles += ns.fill_styles.len() + ns.line_styles.len();
+            }
+        }
+        let draw_cost = if swf_shape.shape.is_empty() {
+            0
+        } else {
+            (1 + styles / 2 + swf_shape.shape.len() / 64).min(u16::MAX as usize) as u16
+        };
         let shared = GraphicShared {
             id: swf_shape.id,
             shape_bounds: swf_shape.shape_bounds,
             edge_bounds: swf_shape.edge_bounds,
             is_empty: swf_shape.shape.is_empty(),
+            draw_cost,
             shape: ShapeRecords::new(swf_shape, source),
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
@@ -136,6 +150,7 @@ impl<'gc> Graphic<'gc> {
             shape_bounds: Default::default(),
             edge_bounds: Default::default(),
             is_empty: true,
+            draw_cost: 0,
             shape: ShapeRecords::new(
                 swf::Shape {
                     version: 32,
@@ -174,6 +189,15 @@ impl<'gc> Graphic<'gc> {
 
     pub fn drawing_mut(&self) -> RefMut<'_, Drawing> {
         self.0.drawing.get_or_init(Default::default).borrow_mut()
+    }
+
+    /// Estimated vector draw cost for `AutoCache` heuristics (accounts for multi-style
+    /// vector artwork such as armor/helm/cape shapes that contain dozens of fills/strokes).
+    pub(crate) fn draw_cost(self) -> usize {
+        if self.0.drawing.get().is_some() {
+            return (self.0.shared.get().draw_cost as usize).max(4);
+        }
+        self.0.shared.get().draw_cost as usize
     }
 
     pub fn set_avm2_class(self, mc: &Mutation<'gc>, class: Avm2ClassObject<'gc>) {
@@ -448,6 +472,9 @@ struct GraphicShared<'gc> {
 
     /// Whether the shape has no records (and so isn't drawn).
     is_empty: bool,
+
+    /// Approximate draw complexity derived from style and record counts.
+    draw_cost: u16,
 
     #[collect(require_static)]
     shape_bounds: Rectangle<Twips>,

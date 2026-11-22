@@ -96,6 +96,9 @@ pub struct Avm2ButtonData<'gc> {
     /// we run the framescripts for our states in a different order then
     /// we do for all other framescript runs.
     weird_framescript_order: Cell<bool>,
+
+    /// Packed `(button_state_gen, frame_epoch | SETTLED_IDLE_LOW)` for `SkipSettled`.
+    settled_epoch: Cell<u64>,
 }
 
 impl<'gc> Avm2Button<'gc> {
@@ -140,6 +143,7 @@ impl<'gc> Avm2Button<'gc> {
                 use_hand_cursor: Cell::new(true),
                 skip_current_frame: Cell::new(false),
                 weird_framescript_order: Cell::new(false),
+                settled_epoch: Cell::new(0),
             },
         ))
     }
@@ -158,7 +162,67 @@ impl<'gc> Avm2Button<'gc> {
     }
 
     pub fn instantiate(self, mc: &Mutation<'gc>) -> Self {
-        Self(Gc::new(mc, (*self.0).clone()))
+        let mut data = (*self.0).clone();
+        data.settled_epoch = Cell::new(0);
+        Self(Gc::new(mc, data))
+    }
+
+    #[inline(always)]
+    pub(crate) fn settled_epoch(self) -> u64 {
+        self.0.settled_epoch.get()
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear_settled_epoch(self) -> u64 {
+        self.0.settled_epoch.replace(0)
+    }
+
+    pub(crate) fn unsettle(self) {
+        crate::display_object::unsettle_ancestors(Some(self.into()));
+    }
+
+    fn is_idle(self) -> bool {
+        crate::display_object::is_packed_idle(self.0.settled_epoch.get())
+    }
+
+    fn is_settled(self, context: &UpdateContext<'gc>) -> bool {
+        crate::display_object::is_packed_settled(
+            self.0.settled_epoch.get(),
+            context.stage.frame_epoch(),
+        )
+    }
+
+    fn settle(self, context: &UpdateContext<'gc>) {
+        if !self.movie().is_action_script_3()
+            || self.0.needs_frame_construction.get()
+            || self.0.weird_framescript_order.get()
+            || self.0.object.get().is_none()
+        {
+            return;
+        }
+        let mut idle = true;
+        let epoch = context.stage.frame_epoch();
+        let generation = crate::display_object::button_state_unsettle_gen();
+        for state in self.all_state_children(false) {
+            let (settled, state_idle) =
+                crate::display_object::child_settled_state(state, epoch, generation);
+            if !settled {
+                return;
+            }
+            if !state_idle {
+                idle = false;
+            }
+        }
+        self.0
+            .settled_epoch
+            .set(crate::display_object::pack_settled_epoch(
+                generation,
+                if idle {
+                    crate::display_object::SETTLED_IDLE_LOW
+                } else {
+                    epoch
+                },
+            ));
     }
 
     pub fn set_sounds(self, sounds: swf::ButtonSounds) {
@@ -281,6 +345,7 @@ impl<'gc> Avm2Button<'gc> {
 
     /// Change the rendered state of the button.
     pub fn set_state(self, context: &mut UpdateContext<'gc>, state: ButtonState) {
+        self.unsettle();
         self.invalidate_cached_bitmap();
         self.0.state.set(state);
 
@@ -333,6 +398,11 @@ impl<'gc> Avm2Button<'gc> {
         state: swf::ButtonState,
         child: Option<DisplayObject<'gc>>,
     ) {
+        self.unsettle();
+        self.invalidate_cached_bitmap();
+        if let Some(child) = child {
+            child.base().mark_button_state();
+        }
         let child_was_on_stage = child.map(|c| c.is_on_stage(context)).unwrap_or(false);
         let old_state_child = self.get_state_child(state);
         let is_cur_state = swf::ButtonState::from(self.0.state.get()) == state;
@@ -438,12 +508,18 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
     }
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
+        if self.is_idle() {
+            return;
+        }
         for state in self.all_state_children(false) {
             state.enter_frame(context);
         }
     }
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        if self.is_settled(context) {
+            return;
+        }
         for state in self.all_state_children(false) {
             state.construct_frame(context);
         }
@@ -483,6 +559,10 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
                     .any(|display| display.as_movie_clip().is_some())
             };
 
+            up_state.base().mark_button_state();
+            over_state.base().mark_button_state();
+            down_state.base().mark_button_state();
+            hit_area.base().mark_button_state();
             let write = Gc::write(context.gc(), self.0);
             unlock!(write, Avm2ButtonData, up_state).set(Some(up_state));
             unlock!(write, Avm2ButtonData, over_state).set(Some(over_state));
@@ -561,9 +641,13 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if self.is_settled(context) {
+            return;
+        }
         for state in self.all_state_children(self.0.weird_framescript_order.take()) {
             state.run_frame_scripts(context);
         }
+        self.settle(context);
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {

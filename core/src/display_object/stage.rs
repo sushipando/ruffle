@@ -430,6 +430,7 @@ impl<'gc> Stage<'gc> {
             next = 1;
         }
         self.0.frame_epoch.set(next);
+        crate::display_object::set_last_frame_epoch(next);
     }
 
     pub fn stage_size(self) -> (u32, u32) {
@@ -911,9 +912,11 @@ impl<'gc> Stage<'gc> {
     /// TODO: Need additional check as Flash Player does not
     /// broadcast the 'render' event on the first render
     pub fn broadcast_render(self, context: &mut UpdateContext<'gc>) {
-        let render_evt = Avm2EventObject::bare_default_event(context, "render");
-        let dobject_constr = context.avm2.classes().display_object;
-        Avm2::broadcast_event(context, render_evt, dobject_constr);
+        if context.avm2.has_broadcast_listeners("render") {
+            let render_evt = Avm2EventObject::bare_default_event(context, "render");
+            let dobject_constr = context.avm2.classes().display_object;
+            Avm2::broadcast_event(context, render_evt, dobject_constr);
+        }
 
         self.set_invalidated(false);
     }

@@ -25,7 +25,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::num::NonZero;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use swf::{ColorTransform, Fixed8};
 
 mod avm1_button;
@@ -477,7 +477,7 @@ pub struct DisplayObjectBase<'gc> {
 
 /// Total GPU texture bytes currently allocated to automatic static-subtree caches.
 static AUTO_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
-const MAX_AUTO_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AUTO_CACHE_BYTES: usize = 96 * 1024 * 1024;
 const AUTO_CACHE_STABLE_TICKS: u32 = 24;
 const AUTO_CACHE_MIN_COST: usize = 6;
 
@@ -503,6 +503,54 @@ impl Drop for AutoCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct RunChildKey {
+    ptr: usize,
+    visible: bool,
+    is_maskee: bool,
+    blend_mode: ExtendedBlendMode,
+    last_inv_tick: u32,
+    matrix: Matrix,
+    color_transform: ColorTransform,
+}
+
+#[derive(Debug)]
+struct CachedChildRun {
+    start_idx: usize,
+    end_idx: usize,
+    children: Vec<RunChildKey>,
+    bitmap: BitmapInfo,
+    origin: Point<i32>,
+    bytes: usize,
+}
+
+impl Drop for CachedChildRun {
+    fn drop(&mut self) {
+        AUTO_CACHE_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Cached contiguous static-sibling runs inside a container whose own subtree is
+/// invalidated by one or more animating siblings (e.g. an avatar's static torso/head/limbs
+/// between an animating cape and weapon, or static HUD panels next to dynamic widgets).
+#[derive(Debug)]
+struct ChildRuns {
+    parent_matrix: Matrix,
+    parent_ct: ColorTransform,
+    viewport_bounds: Rectangle<Twips>,
+    num_children: usize,
+    runs: Vec<CachedChildRun>,
+    last_scan_tick: u32,
+    evictions: u8,
+}
+
+pub(crate) struct ActiveChildRun {
+    pub(crate) start_idx: usize,
+    pub(crate) end_idx: usize,
+    pub(crate) bitmap: BitmapInfo,
+    pub(crate) origin: Point<i32>,
+}
+
 struct DisplayObjectBaseMut {
     filters: Box<[Filter]>,
 
@@ -514,6 +562,9 @@ struct DisplayObjectBaseMut {
 
     /// Automatic cache for a static subtree (zero visual loss; dropped on any mutation).
     auto_cache: Option<AutoCache>,
+
+    /// Automatic caches for contiguous static sibling runs inside this container.
+    child_runs: Option<ChildRuns>,
 
     /// Set when a stable subtree was checked and found ineligible for auto-caching,
     /// avoiding repeated walks until the next mutation.
@@ -531,6 +582,7 @@ impl Clone for DisplayObjectBaseMut {
             blend_shader: self.blend_shader.clone(),
             cache: self.cache.clone(),
             auto_cache: None,
+            child_runs: None,
             auto_cache_rejected: false,
             auto_cache_evictions: 0,
         }
@@ -545,6 +597,7 @@ impl Default for DisplayObjectBase<'_> {
                 blend_shader: None,
                 cache: None,
                 auto_cache: None,
+                child_runs: None,
                 auto_cache_rejected: false,
                 auto_cache_evictions: 0,
             }),
@@ -962,6 +1015,14 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.set_flag(DisplayObjectFlags::SKIP_NEXT_ENTER_FRAME, skip);
     }
 
+    pub(crate) fn is_button_state(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::IS_BUTTON_STATE)
+    }
+
+    pub(crate) fn mark_button_state(&self) {
+        self.set_flag(DisplayObjectFlags::IS_BUTTON_STATE, true);
+    }
+
     fn set_avm1_removed(&self, value: bool) {
         self.set_flag(DisplayObjectFlags::AVM1_REMOVED, value);
     }
@@ -1127,6 +1188,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn clear_auto_cache(&self) {
         let mut cell = self.cell.borrow_mut();
         cell.auto_cache = None;
+        cell.child_runs = None;
         cell.auto_cache_rejected = false;
     }
 
@@ -1278,92 +1340,147 @@ fn is_descendant_of<'gc>(obj: DisplayObject<'gc>, ancestor: DisplayObject<'gc>) 
     false
 }
 
+/// Inspects a single node (and recursively its subtree) to verify that caching it
+/// into an offscreen texture rooted at `root` is strictly zero-loss, and estimates its
+/// draw cost. When `in_layer` is true, the node lies inside an isolated `BlendMode::Layer`
+/// subtree (whose output composites onto its parent with `Normal`/`SrcOver`), so internal
+/// blend modes (including `Alpha`/`Erase`/`Multiply`/`Overlay`) never read pixels behind
+/// `root`.
+fn check_auto_cache_node<'gc>(
+    root: DisplayObject<'gc>,
+    child: DisplayObject<'gc>,
+    in_layer: bool,
+    has_non_normal_blend: &mut bool,
+    draw_cost: &mut usize,
+) -> bool {
+    if !child.visible() || child.maskee().is_some() {
+        return true;
+    }
+    let base = child.base();
+    if base.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED) || base.z() != 0.0 {
+        return false;
+    }
+    let child_in_layer = match child.blend_mode() {
+        ExtendedBlendMode::Normal => in_layer,
+        ExtendedBlendMode::Layer => {
+            *draw_cost += 4;
+            true
+        }
+        ExtendedBlendMode::Shader => return false,
+        ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase => {
+            if !in_layer {
+                return false;
+            }
+            *draw_cost += 2;
+            true
+        }
+        _ => {
+            if !in_layer {
+                *has_non_normal_blend = true;
+            }
+            *draw_cost += 4;
+            in_layer
+        }
+    };
+    if let Some(mask) = child.masker() {
+        if !is_descendant_of(mask, root)
+            || mask.base().contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+        {
+            return false;
+        }
+        *draw_cost += 4;
+    }
+    if !child.filters().is_empty() {
+        *draw_cost += 4;
+    }
+    match child {
+        DisplayObject::Video(_) | DisplayObject::Avm1Button(_) => return false,
+        DisplayObject::EditText(et) => {
+            if et.is_editable() {
+                return false;
+            }
+            *draw_cost += 2;
+        }
+        DisplayObject::Graphic(g) => {
+            *draw_cost += g.draw_cost();
+        }
+        DisplayObject::MorphShape(_) | DisplayObject::Bitmap(_) | DisplayObject::Text(_) => {
+            *draw_cost += 1;
+        }
+        DisplayObject::Avm2Button(btn) => {
+            if let Some(state) = btn.get_state_child(btn.state().into())
+                && !check_auto_cache_node(
+                    root,
+                    state,
+                    child_in_layer,
+                    has_non_normal_blend,
+                    draw_cost,
+                )
+            {
+                return false;
+            }
+        }
+        DisplayObject::MovieClip(mc) => {
+            if mc.drawing().is_some() {
+                *draw_cost += 2;
+            }
+            if !subtree_allows_auto_cache(
+                root,
+                child,
+                child_in_layer,
+                has_non_normal_blend,
+                draw_cost,
+            ) {
+                return false;
+            }
+        }
+        DisplayObject::LoaderDisplay(_) => {
+            if !subtree_allows_auto_cache(
+                root,
+                child,
+                child_in_layer,
+                has_non_normal_blend,
+                draw_cost,
+            ) {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Inspects a static candidate subtree to verify that caching it into an offscreen
 /// texture is strictly zero-loss (no async/editable dynamic content, no external masks,
 /// no Alpha/Erase/Shader blends), and estimates its draw cost.
 fn subtree_allows_auto_cache<'gc>(
     root: DisplayObject<'gc>,
     obj: DisplayObject<'gc>,
+    in_layer: bool,
     has_non_normal_blend: &mut bool,
     draw_cost: &mut usize,
 ) -> bool {
-    let check_child = |child: DisplayObject<'gc>,
-                       has_non_normal_blend: &mut bool,
-                       draw_cost: &mut usize|
-     -> bool {
-        if !child.visible() || child.maskee().is_some() {
-            return true;
-        }
-        let base = child.base();
-        if base.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED) || base.z() != 0.0 {
-            return false;
-        }
-        match child.blend_mode() {
-            ExtendedBlendMode::Normal => {}
-            ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase | ExtendedBlendMode::Shader => {
-                return false;
-            }
-            _ => {
-                *has_non_normal_blend = true;
-                *draw_cost += 4;
-            }
-        }
-        if let Some(mask) = child.masker() {
-            if !is_descendant_of(mask, root)
-                || mask.base().contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
-            {
-                return false;
-            }
-            *draw_cost += 4;
-        }
-        if !child.filters().is_empty() {
-            *draw_cost += 4;
-        }
-        match child {
-            DisplayObject::Video(_) | DisplayObject::Avm1Button(_) => return false,
-            DisplayObject::EditText(et) => {
-                if et.is_editable() {
-                    return false;
-                }
-                *draw_cost += 2;
-            }
-            DisplayObject::Graphic(_)
-            | DisplayObject::MorphShape(_)
-            | DisplayObject::Bitmap(_)
-            | DisplayObject::Text(_) => {
-                *draw_cost += 1;
-            }
-            DisplayObject::Avm2Button(btn) => {
-                if let Some(state) = btn.get_state_child(btn.state().into())
-                    && !subtree_allows_auto_cache(root, state, has_non_normal_blend, draw_cost)
-                {
-                    return false;
-                }
-            }
-            DisplayObject::MovieClip(mc) => {
-                if mc.drawing().is_some() {
-                    *draw_cost += 2;
-                }
-                if !subtree_allows_auto_cache(root, child, has_non_normal_blend, draw_cost) {
-                    return false;
-                }
-            }
-            DisplayObject::LoaderDisplay(_) => {
-                if !subtree_allows_auto_cache(root, child, has_non_normal_blend, draw_cost) {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-        true
-    };
-
     if let Some(container) = obj.as_container() {
         for child in container.iter_render_list() {
-            if !check_child(child, has_non_normal_blend, draw_cost) {
+            if !check_auto_cache_node(root, child, in_layer, has_non_normal_blend, draw_cost) {
                 return false;
             }
         }
+    }
+    true
+}
+
+fn ancestors_transform_stable<'gc>(
+    obj: DisplayObject<'gc>,
+    tick: u32,
+    required_ticks: u32,
+) -> bool {
+    let mut anc = obj.parent();
+    while let Some(p) = anc {
+        if tick.wrapping_sub(p.base().last_transform_tick.get()) < required_ticks {
+            return false;
+        }
+        anc = p.parent();
     }
     true
 }
@@ -1376,7 +1493,9 @@ fn try_auto_cache<'gc>(
     no_enclosing_blend: bool,
 ) -> Option<AutoCacheDraw> {
     if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::AutoCache) {
-        if this.base().cell.borrow().auto_cache.is_some() {
+        if this.base().cell.borrow().auto_cache.is_some()
+            || this.base().cell.borrow().child_runs.is_some()
+        {
             this.base().clear_auto_cache();
         }
         return None;
@@ -1386,7 +1505,10 @@ fn try_auto_cache<'gc>(
         || !options.skip_masks
         || !matches!(
             this,
-            DisplayObject::MovieClip(_) | DisplayObject::LoaderDisplay(_)
+            DisplayObject::MovieClip(_)
+                | DisplayObject::LoaderDisplay(_)
+                | DisplayObject::Graphic(_)
+                | DisplayObject::Avm2Button(_)
         )
         || this.opaque_background().is_some()
         || this.scroll_rect().is_some()
@@ -1465,21 +1587,45 @@ fn try_auto_cache<'gc>(
     let last_tx = this.base().last_transform_tick.get();
     let evictions = this.base().cell.borrow().auto_cache_evictions.min(3);
     let required_ticks = AUTO_CACHE_STABLE_TICKS << evictions;
-    if tick.wrapping_sub(last_inv) < required_ticks || tick.wrapping_sub(last_tx) < required_ticks {
+    if tick.wrapping_sub(last_inv) < required_ticks
+        || tick.wrapping_sub(last_tx) < required_ticks
+        || !ancestors_transform_stable(this, tick, required_ticks)
+    {
         return None;
     }
 
     // Subtree has been unchanged for AUTO_CACHE_STABLE_TICKS movie frames: check eligibility once.
     let mut has_non_normal_blend = false;
-    let mut draw_cost = if this
-        .as_movie_clip()
-        .is_some_and(|mc| mc.drawing().is_some())
-    {
-        2
-    } else {
-        0
+    let in_layer = blend_mode == ExtendedBlendMode::Layer;
+    let mut draw_cost = 0usize;
+    let sub_ok = match this {
+        DisplayObject::Graphic(g) => {
+            if crate::display_object::scale9::Slicing::of(this).is_some() {
+                false
+            } else {
+                draw_cost = g.draw_cost();
+                true
+            }
+        }
+        DisplayObject::Avm2Button(btn) => {
+            if let Some(state) = btn.get_state_child(btn.state().into()) {
+                check_auto_cache_node(this, state, in_layer, &mut has_non_normal_blend, &mut draw_cost)
+            } else {
+                false
+            }
+        }
+        DisplayObject::MovieClip(mc) => {
+            if mc.drawing().is_some() {
+                draw_cost += 2;
+            }
+            subtree_allows_auto_cache(this, this, in_layer, &mut has_non_normal_blend, &mut draw_cost)
+        }
+        DisplayObject::LoaderDisplay(_) => {
+            subtree_allows_auto_cache(this, this, in_layer, &mut has_non_normal_blend, &mut draw_cost)
+        }
+        _ => false,
     };
-    let eligible = subtree_allows_auto_cache(this, this, &mut has_non_normal_blend, &mut draw_cost)
+    let eligible = sub_ok
         && draw_cost >= AUTO_CACHE_MIN_COST
         && (!has_non_normal_blend || is_backdrop || blend_mode != ExtendedBlendMode::Normal);
     if !eligible {
@@ -1555,6 +1701,436 @@ fn try_auto_cache<'gc>(
         origin,
         clear: backdrop_clear.unwrap_or(Color::TRANSPARENT),
     })
+}
+
+fn make_run_child_key<'gc>(child: DisplayObject<'gc>) -> RunChildKey {
+    let base = child.base();
+    let tx = base.transform(true);
+    RunChildKey {
+        ptr: Gc::as_ptr(base) as usize,
+        visible: child.visible(),
+        is_maskee: child.maskee().is_some(),
+        blend_mode: child.blend_mode(),
+        last_inv_tick: base.last_invalidated_tick.get(),
+        matrix: tx.matrix,
+        color_transform: tx.color_transform,
+    }
+}
+
+fn run_child_matches<'gc>(child: DisplayObject<'gc>, key: &RunChildKey) -> bool {
+    let base = child.base();
+    if Gc::as_ptr(base) as usize != key.ptr
+        || child.visible() != key.visible
+        || child.maskee().is_some() != key.is_maskee
+        || child.clip_depth() > 0
+    {
+        return false;
+    }
+    if !key.visible || key.is_maskee {
+        return true;
+    }
+    if child.blend_mode() != key.blend_mode
+        || base.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+        || base.last_invalidated_tick.get() != key.last_inv_tick
+        || base.has_scroll_rect()
+        || base.z() != 0.0
+    {
+        return false;
+    }
+    let tx = base.transform(true);
+    tx.matrix == key.matrix && tx.color_transform == key.color_transform
+}
+
+/// Validates and (on movie ticks after the stability window) builds contiguous
+/// static-sibling run caches for a container (`MovieClip` or `LoaderDisplay`).
+/// Returns the active valid runs (sorted by `start_idx`) to emit as single bitmap
+/// draws in `render_children`.
+pub(crate) fn prepare_child_runs<'gc>(
+    container_obj: DisplayObject<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+) -> Vec<ActiveChildRun> {
+    if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::AutoCache) {
+        if container_obj.base().cell.borrow().child_runs.is_some() {
+            container_obj.base().cell.borrow_mut().child_runs = None;
+        }
+        return Vec::new();
+    }
+    let Some(container) = container_obj.as_container() else {
+        return Vec::new();
+    };
+    let num_children = container.num_children();
+    if num_children < 2 {
+        return Vec::new();
+    }
+    let parent_tx = context.transform_stack.transform();
+    if parent_tx.tz != 0.0 {
+        container_obj.base().cell.borrow_mut().child_runs = None;
+        return Vec::new();
+    }
+    let viewport_bounds = context.stage.viewport_view_bounds();
+    let tick = interpolation::tick();
+
+    // Fast path: validate existing runs without cloning child lists.
+    let mut should_scan = false;
+    let mut active = Vec::new();
+    {
+        let base = container_obj.base();
+        let mut cell = base.cell.borrow_mut();
+        let cr = cell.child_runs.get_or_insert_with(|| ChildRuns {
+            parent_matrix: parent_tx.matrix,
+            parent_ct: parent_tx.color_transform,
+            viewport_bounds,
+            num_children,
+            runs: Vec::new(),
+            last_scan_tick: tick,
+            evictions: 0,
+        });
+        let parent_unchanged = cr.parent_matrix == parent_tx.matrix
+            && cr.parent_ct == parent_tx.color_transform
+            && cr.viewport_bounds == viewport_bounds
+            && cr.num_children == num_children;
+        if !parent_unchanged {
+            if !cr.runs.is_empty() {
+                cr.runs.clear();
+                cr.evictions = cr.evictions.saturating_add(1);
+            }
+            cr.parent_matrix = parent_tx.matrix;
+            cr.parent_ct = parent_tx.color_transform;
+            cr.viewport_bounds = viewport_bounds;
+            cr.num_children = num_children;
+            cr.last_scan_tick = tick;
+        } else if !cr.runs.is_empty() {
+            let raw = container.raw_container();
+            let mut any_evicted = false;
+            cr.runs.retain(|run| {
+                let valid = run.end_idx <= num_children
+                    && (run.start_idx..run.end_idx)
+                        .zip(run.children.iter())
+                        .all(|(i, key)| {
+                            raw.get_id(i).is_some_and(|ch| run_child_matches(ch, key))
+                        });
+                if !valid {
+                    any_evicted = true;
+                }
+                valid
+            });
+            if any_evicted {
+                cr.evictions = cr.evictions.saturating_add(1);
+                cr.last_scan_tick = tick;
+            }
+            for run in &cr.runs {
+                active.push(ActiveChildRun {
+                    start_idx: run.start_idx,
+                    end_idx: run.end_idx,
+                    bitmap: run.bitmap.clone(),
+                    origin: run.origin,
+                });
+            }
+        }
+        if !interpolation::is_inter_frame()
+            && AUTO_CACHE_BYTES.load(Ordering::Relaxed) < MAX_AUTO_CACHE_BYTES
+        {
+            let required_ticks = AUTO_CACHE_STABLE_TICKS << cr.evictions.min(3);
+            if tick.wrapping_sub(cr.last_scan_tick) >= required_ticks
+                && tick.wrapping_sub(base.last_transform_tick.get()) >= required_ticks
+                && ancestors_transform_stable(container_obj, tick, required_ticks)
+            {
+                cr.last_scan_tick = tick;
+                should_scan = true;
+            }
+        }
+    }
+
+    if !should_scan {
+        return active;
+    }
+
+    // Slow path (at most once every 24..192 movie ticks per container): scan for new
+    // compact contiguous static sibling runs not already covered by an active run.
+    let children: Vec<DisplayObject<'gc>> = container.iter_render_list().collect();
+    if children.len() != num_children {
+        return active;
+    }
+    let stage_view = context.stage.view_matrix();
+    let vp_x0 = viewport_bounds.x_min.to_pixels().floor() as i32;
+    let vp_y0 = viewport_bounds.y_min.to_pixels().floor() as i32;
+    let vp_x1 = viewport_bounds.x_max.to_pixels().ceil() as i32;
+    let vp_y1 = viewport_bounds.y_max.to_pixels().ceil() as i32;
+    if vp_x1 <= vp_x0 || vp_y1 <= vp_y0 {
+        return active;
+    }
+
+    let mut new_runs: Vec<CachedChildRun> = Vec::new();
+    let mut clip_depth: Depth = 0;
+    let mut clip_depth_stack: Vec<Depth> = Vec::new();
+
+    struct OpenRun {
+        start_idx: usize,
+        end_idx: usize,
+        visible_count: usize,
+        cost: usize,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        sum_area: u64,
+    }
+    let mut open: Option<OpenRun> = None;
+
+    let flush_run = |open: &mut Option<OpenRun>,
+                         new_runs: &mut Vec<CachedChildRun>,
+                         context: &mut RenderContext<'_, 'gc>| {
+        let Some(run) = open.take() else {
+            return;
+        };
+        if run.visible_count < 2
+            || run.cost < AUTO_CACHE_MIN_COST
+            || run.x1 <= run.x0
+            || run.y1 <= run.y0
+        {
+            return;
+        }
+        let width = (run.x1 - run.x0) as u32;
+        let height = (run.y1 - run.y0) as u32;
+        if !(16..=2048).contains(&width) || !(16..=2048).contains(&height) {
+            return;
+        }
+        let bytes = width as usize * height as usize * 4;
+        if AUTO_CACHE_BYTES.load(Ordering::Relaxed) + bytes > MAX_AUTO_CACHE_BYTES {
+            return;
+        }
+        let (Some(nw), Some(nh)) = (NonZero::new(width), NonZero::new(height)) else {
+            return;
+        };
+        let Ok(handle) = context.renderer.create_empty_texture(nw, nh) else {
+            return;
+        };
+        AUTO_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+
+        let origin = Point::new(run.x0, run.y0);
+        let mut keys = Vec::with_capacity(run.end_idx - run.start_idx);
+        for &child in &children[run.start_idx..run.end_idx] {
+            clear_descendant_auto_caches(child);
+            keys.push(make_run_child_key(child));
+        }
+        let mut transform_stack = TransformStack::new();
+        transform_stack.push(&Transform {
+            color_transform: parent_tx.color_transform,
+            matrix: Matrix {
+                tx: parent_tx.matrix.tx - Twips::from_pixels_i32(origin.x),
+                ty: parent_tx.matrix.ty - Twips::from_pixels_i32(origin.y),
+                ..parent_tx.matrix
+            },
+            perspective_projection: None,
+            tz: 0.0,
+        });
+        let mut offscreen_context = RenderContext {
+            renderer: context.renderer,
+            commands: CommandList::new(),
+            cache_draws: context.cache_draws,
+            gc_context: context.gc_context,
+            library: context.library,
+            ui: context.ui,
+            transform_stack: &mut transform_stack,
+            is_offscreen: true,
+            use_bitmap_cache: true,
+            stage: context.stage,
+        };
+        for &child in &children[run.start_idx..run.end_idx] {
+            child.pre_render(&mut offscreen_context);
+            if child.visible() && child.maskee().is_none() {
+                child.render(&mut offscreen_context);
+            }
+        }
+        offscreen_context.cache_draws.push(BitmapCacheEntry {
+            handle: handle.clone(),
+            size: (width, height),
+            commands: offscreen_context.commands,
+            clear: Color::TRANSPARENT,
+            filters: Vec::new(),
+            volatility: CacheVolatility::Persistent,
+        });
+        new_runs.push(CachedChildRun {
+            start_idx: run.start_idx,
+            end_idx: run.end_idx,
+            children: keys,
+            bitmap: BitmapInfo {
+                handle,
+                width,
+                height,
+            },
+            origin,
+            bytes,
+        });
+    };
+
+    let mut active_cursor = 0usize;
+    for (idx, &child) in children.iter().enumerate() {
+        let depth = child.depth();
+        while clip_depth > 0 && depth > clip_depth {
+            clip_depth = clip_depth_stack.pop().unwrap_or(0);
+        }
+        if child.clip_depth() > 0 && child.allow_as_mask() {
+            flush_run(&mut open, &mut new_runs, context);
+            clip_depth_stack.push(clip_depth);
+            clip_depth = child.clip_depth();
+            continue;
+        }
+        if clip_depth > 0 {
+            flush_run(&mut open, &mut new_runs, context);
+            continue;
+        }
+        // Skip indices already covered by an existing valid run.
+        while active_cursor < active.len() && active[active_cursor].end_idx <= idx {
+            active_cursor += 1;
+        }
+        if active_cursor < active.len()
+            && idx >= active[active_cursor].start_idx
+            && idx < active[active_cursor].end_idx
+        {
+            flush_run(&mut open, &mut new_runs, context);
+            continue;
+        }
+
+        if !child.visible() || child.maskee().is_some() {
+            if let Some(run) = &mut open {
+                run.end_idx = idx + 1;
+            }
+            continue;
+        }
+
+        let base = child.base();
+        let blend_mode = child.blend_mode();
+        let last_inv = base.last_invalidated_tick.get();
+        let last_tx = base.last_transform_tick.get();
+        let evictions = base.cell.borrow().auto_cache_evictions.min(3);
+        let child_req = AUTO_CACHE_STABLE_TICKS << evictions;
+        let child_stable = !base.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+            && base.z() == 0.0
+            && !base.has_scroll_rect()
+            && child.opaque_background().is_none()
+            && matches!(
+                blend_mode,
+                ExtendedBlendMode::Normal | ExtendedBlendMode::Layer
+            )
+            && tick.wrapping_sub(last_inv) >= child_req
+            && tick.wrapping_sub(last_tx) >= child_req;
+
+        let mut child_cost = 0usize;
+        let mut has_non_normal = false;
+        let eligible = child_stable
+            && check_auto_cache_node(
+                child,
+                child,
+                blend_mode == ExtendedBlendMode::Layer,
+                &mut has_non_normal,
+                &mut child_cost,
+            )
+            && !has_non_normal;
+
+        if !eligible {
+            flush_run(&mut open, &mut new_runs, context);
+            continue;
+        }
+
+        let child_tx = base.transform(true);
+        let child_world = parent_tx.matrix * child_tx.matrix;
+        let bounds = child.render_bounds_with_transform(&child_world, true, &stage_view);
+        let (cx0, cy0, cx1, cy1, carea) = if bounds.is_valid() {
+            let x0 = (bounds.x_min.to_pixels().floor() as i32 - 2).max(vp_x0);
+            let y0 = (bounds.y_min.to_pixels().floor() as i32 - 2).max(vp_y0);
+            let x1 = (bounds.x_max.to_pixels().ceil() as i32 + 2).min(vp_x1);
+            let y1 = (bounds.y_max.to_pixels().ceil() as i32 + 2).min(vp_y1);
+            if x1 > x0 && y1 > y0 {
+                let a = (x1 - x0) as u64 * (y1 - y0) as u64;
+                (x0, y0, x1, y1, a)
+            } else {
+                (0, 0, 0, 0, 0)
+            }
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+
+        if let Some(run) = &mut open {
+            if carea == 0 {
+                run.end_idx = idx + 1;
+                run.visible_count += 1;
+                run.cost += child_cost;
+            } else {
+                let (ux0, uy0, ux1, uy1) = if run.x1 > run.x0 && run.y1 > run.y0 {
+                    (
+                        run.x0.min(cx0),
+                        run.y0.min(cy0),
+                        run.x1.max(cx1),
+                        run.y1.max(cy1),
+                    )
+                } else {
+                    (cx0, cy0, cx1, cy1)
+                };
+                let uw = (ux1 - ux0) as u64;
+                let uh = (uy1 - uy0) as u64;
+                let uarea = uw * uh;
+                let new_sum = run.sum_area + carea;
+                let compact = uw <= 2048 && uh <= 2048 && uarea <= new_sum * 2 + 16_384;
+                if compact {
+                    run.end_idx = idx + 1;
+                    run.visible_count += 1;
+                    run.cost += child_cost;
+                    run.x0 = ux0;
+                    run.y0 = uy0;
+                    run.x1 = ux1;
+                    run.y1 = uy1;
+                    run.sum_area = new_sum;
+                } else {
+                    flush_run(&mut open, &mut new_runs, context);
+                    open = Some(OpenRun {
+                        start_idx: idx,
+                        end_idx: idx + 1,
+                        visible_count: 1,
+                        cost: child_cost,
+                        x0: cx0,
+                        y0: cy0,
+                        x1: cx1,
+                        y1: cy1,
+                        sum_area: carea,
+                    });
+                }
+            }
+        } else {
+            open = Some(OpenRun {
+                start_idx: idx,
+                end_idx: idx + 1,
+                visible_count: 1,
+                cost: child_cost,
+                x0: cx0,
+                y0: cy0,
+                x1: cx1,
+                y1: cy1,
+                sum_area: carea,
+            });
+        }
+    }
+    flush_run(&mut open, &mut new_runs, context);
+
+    if !new_runs.is_empty() {
+        let base = container_obj.base();
+        let mut cell = base.cell.borrow_mut();
+        if let Some(cr) = &mut cell.child_runs {
+            for run in new_runs {
+                active.push(ActiveChildRun {
+                    start_idx: run.start_idx,
+                    end_idx: run.end_idx,
+                    bitmap: run.bitmap.clone(),
+                    origin: run.origin,
+                });
+                cr.runs.push(run);
+            }
+            cr.runs.sort_by_key(|r| r.start_idx);
+            active.sort_by_key(|r| r.start_idx);
+        }
+    }
+
+    active
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1673,6 +2249,7 @@ fn collect_backdrop_prefix<'gc>(
         let mut node_cost = 0usize;
         let whole_static = if self_stable && mask_ok {
             let mut has_blend = false;
+            let in_layer = blend_mode == ExtendedBlendMode::Layer;
             match child {
                 DisplayObject::Video(_) | DisplayObject::Avm1Button(_) => false,
                 DisplayObject::EditText(et) => {
@@ -1683,8 +2260,11 @@ fn collect_backdrop_prefix<'gc>(
                         true
                     }
                 }
-                DisplayObject::Graphic(_)
-                | DisplayObject::MorphShape(_)
+                DisplayObject::Graphic(g) => {
+                    node_cost = g.draw_cost();
+                    true
+                }
+                DisplayObject::MorphShape(_)
                 | DisplayObject::Bitmap(_)
                 | DisplayObject::Text(_) => {
                     node_cost = 1;
@@ -1692,7 +2272,7 @@ fn collect_backdrop_prefix<'gc>(
                 }
                 DisplayObject::Avm2Button(btn) => {
                     if let Some(state) = btn.get_state_child(btn.state().into()) {
-                        subtree_allows_auto_cache(child, state, &mut has_blend, &mut node_cost)
+                        check_auto_cache_node(child, state, in_layer, &mut has_blend, &mut node_cost)
                     } else {
                         true
                     }
@@ -1701,10 +2281,22 @@ fn collect_backdrop_prefix<'gc>(
                     if mc.drawing().is_some() {
                         node_cost += 2;
                     }
-                    subtree_allows_auto_cache(child, child, &mut has_blend, &mut node_cost)
+                    subtree_allows_auto_cache(
+                        child,
+                        child,
+                        in_layer,
+                        &mut has_blend,
+                        &mut node_cost,
+                    )
                 }
                 DisplayObject::LoaderDisplay(_) => {
-                    subtree_allows_auto_cache(child, child, &mut has_blend, &mut node_cost)
+                    subtree_allows_auto_cache(
+                        child,
+                        child,
+                        in_layer,
+                        &mut has_blend,
+                        &mut node_cost,
+                    )
                 }
                 _ => false,
             }
@@ -4375,6 +4967,147 @@ bitflags! {
         /// (they need to be instantiated "manually" by
         /// `Sprite.constructChildren`).
         const MANUAL_FRAME_CONSTRUCT  = 1 << 16;
+
+        /// Whether this object has ever been installed as a state child of an `Avm2Button`.
+        /// Inactive button states have `parent == None`, so unsettling one bumps
+        /// `BUTTON_STATE_UNSETTLE_GEN` to invalidate settled buttons and their ancestors.
+        const IS_BUTTON_STATE         = 1 << 17;
+    }
+}
+
+/// Monotonic generation bumped whenever an unparented display object marked
+/// `IS_BUTTON_STATE` is unsettled. Folded into the upper 32 bits of `settled_epoch`
+/// so `Avm2Button`s with `Sprite`/`MovieClip` inactive states (whose `parent()` is
+/// `None`) can settle soundly without breaking if AS3 mutates an inactive state.
+static BUTTON_STATE_UNSETTLE_GEN: AtomicU32 = AtomicU32::new(1);
+static LAST_FRAME_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) const SETTLED_IDLE_LOW: u32 = u32::MAX;
+
+#[inline(always)]
+pub(crate) fn set_last_frame_epoch(epoch: u32) {
+    LAST_FRAME_EPOCH.store(epoch, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub(crate) fn button_state_unsettle_gen() -> u32 {
+    BUTTON_STATE_UNSETTLE_GEN.load(Ordering::Relaxed)
+}
+
+#[inline(always)]
+fn bump_button_state_unsettle_gen() {
+    // Skip 0 so a packed `(gen, epoch)` is always non-zero when settled.
+    if BUTTON_STATE_UNSETTLE_GEN
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        == 0
+    {
+        BUTTON_STATE_UNSETTLE_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn pack_settled_epoch(generation: u32, epoch: u32) -> u64 {
+    ((generation as u64) << 32) | (epoch as u64)
+}
+
+#[inline(always)]
+pub(crate) fn is_packed_idle(packed: u64) -> bool {
+    packed == pack_settled_epoch(button_state_unsettle_gen(), SETTLED_IDLE_LOW)
+        && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipSettled)
+}
+
+#[inline(always)]
+pub(crate) fn is_packed_settled(packed: u64, frame_epoch: u32) -> bool {
+    let generation = button_state_unsettle_gen();
+    ((packed >> 32) as u32) == generation
+        && ((packed as u32) == SETTLED_IDLE_LOW || (packed as u32) == frame_epoch)
+        && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipSettled)
+}
+
+/// Returns `(settled, idle)` for a child inside a `MovieClip`, `LoaderDisplay`, or `Avm2Button`.
+pub(crate) fn child_settled_state<'gc>(
+    child: DisplayObject<'gc>,
+    frame_epoch: u32,
+    generation: u32,
+) -> (bool, bool) {
+    match child {
+        DisplayObject::MovieClip(mc) => {
+            let packed = mc.settled_epoch();
+            if ((packed >> 32) as u32) != generation {
+                return (false, false);
+            }
+            let low = packed as u32;
+            (
+                low == SETTLED_IDLE_LOW || low == frame_epoch,
+                low == SETTLED_IDLE_LOW,
+            )
+        }
+        DisplayObject::LoaderDisplay(ld) => {
+            let packed = ld.settled_epoch();
+            if ((packed >> 32) as u32) != generation {
+                return (false, false);
+            }
+            let low = packed as u32;
+            (
+                low == SETTLED_IDLE_LOW || low == frame_epoch,
+                low == SETTLED_IDLE_LOW,
+            )
+        }
+        DisplayObject::Avm2Button(btn) => {
+            let packed = btn.settled_epoch();
+            if ((packed >> 32) as u32) != generation {
+                return (false, false);
+            }
+            let low = packed as u32;
+            (
+                low == SETTLED_IDLE_LOW || low == frame_epoch,
+                low == SETTLED_IDLE_LOW,
+            )
+        }
+        // Their frame construction only constructs their AVM2 object, and they
+        // have no `enter_frame`, frame scripts, or children.
+        DisplayObject::Graphic(_)
+        | DisplayObject::MorphShape(_)
+        | DisplayObject::Text(_)
+        | DisplayObject::EditText(_)
+        | DisplayObject::Video(_) => {
+            let ok = !child.movie().is_action_script_3() || child.object2().is_some();
+            (ok, ok)
+        }
+        DisplayObject::Bitmap(_) | DisplayObject::TextLine(_) => (true, true),
+        _ => (false, false),
+    }
+}
+
+/// Clears `settled_epoch` on `start` and all settled ancestors (`MovieClip`,
+/// `LoaderDisplay`, `Avm2Button`). If the ancestor chain terminates at an
+/// unparented inactive button state, bumps `BUTTON_STATE_UNSETTLE_GEN` so the
+/// owning `Avm2Button` and its ancestors also re-evaluate.
+pub(crate) fn unsettle_ancestors<'gc>(mut cur: Option<DisplayObject<'gc>>) {
+    while let Some(obj) = cur {
+        let prev = match obj {
+            DisplayObject::MovieClip(mc) => mc.clear_settled_epoch(),
+            DisplayObject::LoaderDisplay(ld) => ld.clear_settled_epoch(),
+            DisplayObject::Avm2Button(btn) => btn.clear_settled_epoch(),
+            _ => break,
+        };
+        let parent = obj.parent();
+        if prev == 0 {
+            break;
+        }
+        if parent.is_none() && obj.base().is_button_state() {
+            let prev_low = prev as u32;
+            let prev_gen = (prev >> 32) as u32;
+            if prev_gen == button_state_unsettle_gen()
+                && (prev_low == SETTLED_IDLE_LOW
+                    || prev_low == LAST_FRAME_EPOCH.load(Ordering::Relaxed))
+            {
+                bump_button_state_unsettle_gen();
+            }
+            return;
+        }
+        cur = parent;
     }
 }
 

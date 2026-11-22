@@ -397,6 +397,14 @@ impl<'gc> Avm2<'gc> {
         bucket.push(object.downgrade());
     }
 
+    /// Returns whether any broadcast listeners are currently registered for `event_name`.
+    #[inline]
+    pub fn has_broadcast_listeners(&self, event_name: &'static str) -> bool {
+        self.broadcast_list
+            .get(crate::string::WStr::from_units(event_name.as_bytes()))
+            .is_some_and(|bucket| !bucket.is_empty())
+    }
+
     /// Dispatch an event on all objects in the current execution list.
     ///
     /// `on_type` specifies a class or interface constructor whose instances,
@@ -419,12 +427,15 @@ impl<'gc> Avm2<'gc> {
             return;
         }
 
-        let el_length = context
+        let Some(el_length) = context
             .avm2
             .broadcast_list
-            .entry(event_name)
-            .or_default()
-            .len();
+            .get(&event_name)
+            .map(|bucket| bucket.len())
+            .filter(|&len| len > 0)
+        else {
+            return;
+        };
 
         for i in 0..el_length {
             let object = context

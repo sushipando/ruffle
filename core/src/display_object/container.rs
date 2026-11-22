@@ -553,9 +553,30 @@ pub trait TDisplayObjectContainer<'gc>:
     /// Renders the children of this container in render list order.
     #[no_dynamic]
     fn render_children(self, context: &mut RenderContext<'_, 'gc>) {
+        let container_obj: DisplayObject<'gc> = self.into();
+        let active_runs = if !context.is_offscreen
+            && context.use_bitmap_cache
+            && !context.commands.drawing_mask()
+            && !context.stage.has_backdrop_skip()
+            && matches!(
+                container_obj,
+                DisplayObject::MovieClip(_) | DisplayObject::LoaderDisplay(_)
+            )
+            && self.num_children() >= 2
+            && context.renderer.is_offscreen_supported()
+        {
+            crate::display_object::prepare_child_runs(container_obj, context)
+        } else {
+            Vec::new()
+        };
+        let mut run_cursor = 0usize;
+        let mut skip_until = 0usize;
         let mut clip_depth = 0;
         let mut clip_depth_stack: Vec<(Depth, DisplayObject<'_>)> = vec![];
-        for child in self.iter_render_list() {
+        for (idx, child) in self.iter_render_list().enumerate() {
+            if idx < skip_until {
+                continue;
+            }
             if !context.is_offscreen
                 && context.stage.has_backdrop_skip()
                 && context
@@ -565,8 +586,6 @@ pub trait TDisplayObjectContainer<'gc>:
                 continue;
             }
             let depth = child.depth();
-
-            child.pre_render(context);
 
             // Check if we need to pop off a mask.
             // This must be a while loop because multiple masks can be popped
@@ -579,6 +598,37 @@ pub trait TDisplayObjectContainer<'gc>:
                 clip_child.render(context);
                 context.commands.pop_mask();
             }
+
+            if clip_depth == 0 && !active_runs.is_empty() {
+                while run_cursor < active_runs.len() && active_runs[run_cursor].end_idx <= idx {
+                    run_cursor += 1;
+                }
+                if run_cursor < active_runs.len() && active_runs[run_cursor].start_idx == idx {
+                    let run = &active_runs[run_cursor];
+                    let region = run.bitmap.full_region();
+                    context.commands.render_bitmap(
+                        run.bitmap.handle.clone(),
+                        ruffle_render::transform::Transform {
+                            matrix: ruffle_render::matrix::Matrix::translate(
+                                swf::Twips::from_pixels_i32(run.origin.x),
+                                swf::Twips::from_pixels_i32(run.origin.y),
+                            ),
+                            color_transform: Default::default(),
+                            perspective_projection: None,
+                            tz: 0.0,
+                        },
+                        false,
+                        ruffle_render::bitmap::PixelSnapping::Always,
+                        region,
+                    );
+                    skip_until = run.end_idx;
+                    run_cursor += 1;
+                    continue;
+                }
+            }
+
+            child.pre_render(context);
+
             if child.clip_depth() > 0 && child.allow_as_mask() {
                 // Push and render the mask.
                 clip_depth_stack.push((clip_depth, child));
@@ -937,7 +987,7 @@ impl<'gc> ChildContainer<'gc> {
     }
 
     /// Get a child by it's render list position (ID).
-    fn get_id(&self, id: usize) -> Option<DisplayObject<'gc>> {
+    pub(crate) fn get_id(&self, id: usize) -> Option<DisplayObject<'gc>> {
         self.render_list.get(id).copied()
     }
 

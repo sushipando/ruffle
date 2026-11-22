@@ -1741,6 +1741,60 @@ Metal). Cuts frame resolve/blit DRAM traffic in half (**58.5 MB → 29.5 MB/fr**
 full-window render pass per frame (verified in 20p `yulgar-2` with exact letterbox and sRGB
 colors: ~0.35–0.5 ms/fr GPU saved over `MovieView` + `egui_render`, ~0.9 ms/fr vs `direct-frame 0`).
 
+### 89. Settling `LoaderDisplay`, `Avm2Button`, script-created `Sprite`/`MovieClip`s, and faster nested gotos
+
+*Files: `core/src/display_object.rs`, `core/src/display_object/movie_clip.rs`, `core/src/display_object/loader_display.rs`, `core/src/display_object/avm2_button.rs`, `core/src/display_object/stage.rs`, `core/src/avm2.rs`, `core/src/frame_lifecycle.rs`, `core/src/orphan_manager.rs`, `core/src/loader.rs`, `core/src/avm2/globals/flash/display/display_object.rs`.*
+
+`MovieClip::settle()` (48) previously stopped at `LoaderDisplay`, `Avm2Button`, `TextLine`, and
+script-created empty `Sprite`/`MovieClip` instances (`MovieClipShared::empty()` leaves
+`next_preload_chunk == 0` and `playing == true` even after reaching frame 1, so `enter_frame` is a
+no-op yet `idle` was always `false`). Because loaded SWF roots, maps, UI bars, and avatars sit
+under `LoaderDisplay`, `Avm2Button`, and `Sprite` containers, nearly the entire stage stayed out of
+`IDLE_EPOCH`, and `set_has_pending_script` also unsettled ancestors for already-executed frame
+scripts (`last_queued_script_frame == Some(queued_script_frame)`).
+
+* Added packed `(button_state_gen, frame_epoch | SETTLED_IDLE_LOW)` settling to `LoaderDisplay` and
+  `Avm2Button` (with an `IS_BUTTON_STATE` flag + `LAST_FRAME_EPOCH`-guarded generation bump when an
+  unparented inactive button state is mutated while settled/idle, keeping inactive `Sprite` button
+  states 100% sound), plus `TextLine` leaf support and `empty_done` idle settling for script-created
+  empty `Sprite`/`MovieClip`s without altering `isPlaying`.
+* Unified ancestor unsettling through `LoaderDisplay` and `Avm2Button`, guarded
+  `set_has_pending_script` against already-run frame scripts, skipped `EventObject` allocation in
+  `broadcast_frame_*`/`Stage::broadcast_render` when no listeners are registered for that event, and
+  avoided `Rc::make_mut` cloning in `OrphanManager::cleanup_dead_orphans` when no orphans are dead.
+* Live Artix `icestormunder` room 2 (42–46 nested gotos/s): `nested gotos` dropped **3.5×**
+  (**20.3–31.1 ms/s → 5.0–8.1 ms/s**; scripts **7.3–13.5 → 1.2–1.6 ms**, orphans **3.5–4.7 →
+  0.4–0.6 ms**, exit **0.1 ms**); combat `frame avg / max` dropped from **4.5–6.4 / 8.8–13.8 ms**
+  to **2.9–3.2 / 5.8–7.2 ms**; 20p `yulgar` `frame avg / max` dropped **3×** (**4.1–5.6 /
+  6.3–11.4 ms → 1.35–2.19 / 1.69–4.56 ms**).
+
+### 90. Sub-part `AutoCache` (`Graphic` complexity, `BlendMode::Layer`, `ChildRunCache`)
+
+*Files: `core/src/display_object.rs` (`check_auto_cache_node`, `try_auto_cache`, `prepare_child_runs`, `ancestors_transform_stable`), `core/src/display_object/container.rs` (`render_children`), `core/src/display_object/graphic.rs` (`draw_cost`), `core/src/display_object/avm2_button.rs` (`set_state_child`).*
+
+Live `AutoCache` telemetry in 20p `yulgar` and `icestormunder` showed ~75% of direct main-pass
+`Graphic` draws (**1,816 of 2,437/fr** in `yulgar`) were completely stationary, rejected because
+multi-style artwork shapes counted as `draw_cost = 1` (< `AUTO_CACHE_MIN_COST = 6`), `BlendMode::Layer`
+children were treated as destination-reading blends, and animating sibling capes/weapons invalidated
+the parent avatar `MovieClip` every frame.
+
+* Computed per-`Graphic` `draw_cost` from fill/line style and shape record counts, allowed
+  `try_auto_cache` on non-9-slice `Graphic` and `Avm2Button` nodes, treated `BlendMode::Layer`
+  subtrees as self-contained `Normal`-composited layers in `check_auto_cache_node` (and
+  `BackdropCache`), and raised the `AutoCache` VRAM cap from 64 MB to 96 MB.
+* Added `ChildRunCache` (`prepare_child_runs` in `render_children`): flattens compact contiguous
+  runs of 2+ static siblings inside a partially-animating container (e.g., an avatar's static
+  torso/head/limbs between an animating cape and weapon, or adjacent static UI panels) into a single
+  offscreen texture quad without clearing runs when an unrelated sibling invalidates the parent.
+* Added `ancestors_transform_stable` to prevent child nodes inside moving/rotating parents from
+  promoting and immediately evicting textures (cut `AutoCache` dirty churn in combat from
+  **300–399/s → 1–6/s**).
+* Live Artix 20p `yulgar`: `AutoCache` + `ChildRunCache` jumped from **68 hits/fr** to **265–286
+  node hits + 201–215 run hits/fr** (~1,000 skipped subtrees/fr), cutting direct main-pass `Graphic`
+  draws from **2,437 → 1,358–1,657/fr**, render passes **17.3 → 13.8–14.5/fr**, CPU render
+  **3.5–4.1 → 2.68–3.02 ms**, and lifting live 20p `yulgar` framerate from **47–51 fps (2×)** to
+  **72–94 fps (3×–4×)** with zero visual loss (all 151 Metal `visual/` regression tests pass).
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

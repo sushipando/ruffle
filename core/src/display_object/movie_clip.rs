@@ -211,7 +211,7 @@ pub struct MovieClipData<'gc> {
 
     /// The `Stage::frame_epoch` in which this clip and everything below it were found to
     /// have nothing to do in frame construction and frame scripts (see `settle`), or 0.
-    settled_epoch: Cell<u32>,
+    settled_epoch: Cell<u64>,
 
     current_frame: Cell<FrameNumber>,
 
@@ -836,7 +836,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_has_pending_script(self, value: bool) {
-        if value {
+        if value && self.last_queued_script_frame() != Some(self.0.queued_script_frame.get()) {
             self.unsettle();
         }
         self.0.has_pending_script.set(value);
@@ -853,23 +853,28 @@ impl<'gc> MovieClip<'gc> {
         self.0.last_queued_script_frame.set(frame);
     }
 
-    /// `settled_epoch` value meaning this clip and everything below it are idle across
-    /// frames: `enter_frame`, `construct_frame`, and `run_frame_scripts` all have nothing
-    /// to do until something mutates this subtree (`unsettle`).
-    const IDLE_EPOCH: u32 = u32::MAX;
+    #[inline(always)]
+    pub(crate) fn settled_epoch(self) -> u64 {
+        self.0.settled_epoch.get()
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear_settled_epoch(self) -> u64 {
+        self.0.settled_epoch.replace(0)
+    }
 
     /// Whether this clip and its subtree are persistently idle across frames.
     fn is_idle(self) -> bool {
-        self.0.settled_epoch.get() == Self::IDLE_EPOCH
-            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipSettled)
+        crate::display_object::is_packed_idle(self.0.settled_epoch.get())
     }
 
     /// Whether this clip is settled in the current frame: frame construction and frame
     /// scripts have nothing to do for it and everything below it, so they skip it.
     fn is_settled(self, context: &UpdateContext<'gc>) -> bool {
-        let settled = self.0.settled_epoch.get();
-        (settled == Self::IDLE_EPOCH || settled == context.stage.frame_epoch())
-            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipSettled)
+        crate::display_object::is_packed_settled(
+            self.0.settled_epoch.get(),
+            context.stage.frame_epoch(),
+        )
     }
 
     /// Something about this clip changed that frame construction or frame scripts may have
@@ -877,18 +882,12 @@ impl<'gc> MovieClip<'gc> {
     /// its ancestors aren't settled anymore. An ancestor of a settled clip can only be
     /// settled if the clip is, so this stops at the first clip that isn't.
     pub fn unsettle(self) {
-        let mut clip = Some(self);
-        while let Some(mc) = clip {
-            if mc.0.settled_epoch.replace(0) == 0 {
-                break;
-            }
-            clip = mc.parent().and_then(|parent| parent.as_movie_clip());
-        }
+        crate::display_object::unsettle_ancestors(Some(self.into()));
     }
 
     /// Marks this clip as settled in the current frame (see `is_settled`) if frame
     /// construction and frame scripts would now do nothing for it and its children, or
-    /// persistently idle (`IDLE_EPOCH`) if `enter_frame` will also do nothing on future
+    /// persistently idle (`SETTLED_IDLE_LOW`) if `enter_frame` will also do nothing on future
     /// frames until something mutates the subtree.
     fn settle(self, context: &UpdateContext<'gc>) {
         if !self.movie().is_action_script_3()
@@ -911,48 +910,36 @@ impl<'gc> MovieClip<'gc> {
         {
             return;
         }
-        let mut idle = !self.playing()
+        let shared = self.0.shared.get();
+        // Script-created empty Sprite/MovieClip instances (`MovieClipShared::empty`) have an
+        // empty tag stream and `next_preload_chunk == 0`; once on their final frame (1),
+        // `enter_frame` is a guaranteed no-op even while `playing()` remains true.
+        let empty_done =
+            shared.swf_data.is_empty() && self.current_frame() >= self.header_frames();
+        let mut idle = (!self.playing() || empty_done)
             && !self.base().should_skip_next_enter_frame()
             && self.0.queued_tags.borrow().is_empty()
-            && self
-                .0
-                .shared
-                .get()
-                .preload_progress
-                .next_preload_chunk
-                .get()
-                == u64::MAX;
+            && (empty_done || shared.preload_progress.next_preload_chunk.get() == u64::MAX);
         let epoch = context.stage.frame_epoch();
+        let generation = crate::display_object::button_state_unsettle_gen();
         for child in self.iter_render_list() {
-            let settled = match child {
-                DisplayObject::MovieClip(mc) => {
-                    let child_epoch = mc.0.settled_epoch.get();
-                    if child_epoch != Self::IDLE_EPOCH {
-                        idle = false;
-                    }
-                    child_epoch == Self::IDLE_EPOCH || child_epoch == epoch
-                }
-                // Their frame construction only constructs their AVM2 object, and they
-                // have no `enter_frame`, frame scripts or children.
-                DisplayObject::Graphic(_)
-                | DisplayObject::MorphShape(_)
-                | DisplayObject::Text(_)
-                | DisplayObject::EditText(_)
-                | DisplayObject::Video(_) => {
-                    !child.movie().is_action_script_3() || child.object2().is_some()
-                }
-                DisplayObject::Bitmap(_) => true,
-                // Buttons construct and run frame scripts for all their states, and
-                // other containers aren't tracked.
-                _ => false,
-            };
+            let (settled, child_idle) =
+                crate::display_object::child_settled_state(child, epoch, generation);
             if !settled {
                 return;
             }
+            if !child_idle {
+                idle = false;
+            }
         }
-        self.0
-            .settled_epoch
-            .set(if idle { Self::IDLE_EPOCH } else { epoch });
+        self.0.settled_epoch.set(crate::display_object::pack_settled_epoch(
+            generation,
+            if idle {
+                crate::display_object::SETTLED_IDLE_LOW
+            } else {
+                epoch
+            },
+        ));
     }
 
     pub fn set_programmatically_played(self) {

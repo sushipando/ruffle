@@ -2175,6 +2175,7 @@ impl<'gc> MovieLoader<'gc> {
             // and consequently are observed to have their currentFrame lag one
             // frame behind objects placed by the timeline (even if they were
             // both placed in the same frame to begin with).
+            mc.unsettle();
             mc.base().set_skip_next_enter_frame(true);
 
             let movie = movie.unwrap();
