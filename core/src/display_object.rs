@@ -62,7 +62,7 @@ pub use interactive::{Avm2MousePick, InteractiveObject, TInteractiveObject};
 pub use loader_display::LoaderDisplay;
 pub use morph_shape::MorphShape;
 pub use movie_clip::{GotoInfo, MovieClip, MovieClipHandle, MovieClipWeak, Scene, StopOrPlay};
-use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
+use ruffle_render::backend::{BitmapCacheEntry, CacheVolatility, RenderBackend};
 use ruffle_render::bitmap::{BitmapInfo, PixelSnapping};
 use ruffle_render::blend::ExtendedBlendMode;
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
@@ -142,6 +142,18 @@ pub struct BitmapCache {
     /// Stage view scale when `bitmap` was last drawn (filters scale by stage view matrix).
     stage_scale_x: f32,
     stage_scale_y: f32,
+
+    /// True if the previous rebuild skipped copying out into `bitmap` for a single
+    /// interpolated sub-frame; requires a rebuild on the next render.
+    volatile_subframe: bool,
+    /// Movie tick whose transient tick-scoped filter atlas holds this CAB's filtered pixels
+    /// (`0` if stored persistently in `bitmap`).
+    tick_atlas_tick: u32,
+    /// Last movie tick on which this CAB was genuinely dirty and rebuilt.
+    last_rebuild_tick: u32,
+    /// Consecutive movie ticks on which this CAB has rebuilt (used to detect continuously
+    /// animating frame-by-frame CABs that benefit from tick-scoped filter atlases).
+    consecutive_rebuild_ticks: u8,
 }
 
 impl BitmapCache {
@@ -1232,6 +1244,9 @@ struct DrawCacheInfo {
     /// Optional linear delta transform (`cur * cached^-1`) when reusing the previous
     /// movie frame's bitmap on an interpolated sub-frame.
     delta: Option<Matrix>,
+    /// Whether the renderer may keep this filtered result in a transient filter atlas
+    /// without copying it out into `bitmap.handle`.
+    volatility: CacheVolatility,
 }
 
 struct AutoCacheDraw {
@@ -1869,9 +1884,11 @@ pub(crate) fn render_stage_backdrop<'gc>(
 
     context.cache_draws.push(BitmapCacheEntry {
         handle: handle.clone(),
+        size: (width, height),
         commands: offscreen_commands,
         clear: bg,
         filters: Vec::new(),
+        volatility: CacheVolatility::Persistent,
     });
 
     let bitmap = BitmapInfo {
@@ -1934,8 +1951,11 @@ pub fn render_base<'gc>(
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
         let base_transform = context.transform_stack.transform();
         let stage_matrix = context.stage.view_matrix();
+        let cur_tick = interpolation::tick();
         let fast_hit = this.base().bitmap_cache_mut().as_ref().and_then(|cache| {
             if cache.contents_changed
+                || cache.volatile_subframe
+                || (cache.tick_atlas_tick != 0 && cache.tick_atlas_tick != cur_tick)
                 || (cache.blends_in_tick && interpolation::is_blending_tick(cache.changed_tick))
                 || cache.stage_scale_x != stage_matrix.a
                 || cache.stage_scale_y != stage_matrix.d
@@ -1963,6 +1983,7 @@ pub fn render_base<'gc>(
                 offset,
                 filters: Vec::new(),
                 delta,
+                volatility: CacheVolatility::Persistent,
             })
         } else {
             let mut cache_info: Option<DrawCacheInfo> = None;
@@ -2017,10 +2038,52 @@ pub fn render_base<'gc>(
                         origin.x + Twips::from_pixels_i32(draw_offset.x),
                         origin.y + Twips::from_pixels_i32(draw_offset.y),
                     );
-                    if cache.is_dirty(&base_transform.matrix, width, height)
-                        || (cache.blends_in_tick
-                            && interpolation::is_blending_tick(cache.changed_tick))
-                    {
+                    let blends_now = cache.blends_in_tick
+                        && interpolation::is_blending_tick(cache.changed_tick);
+                    let genuinely_dirty =
+                        cache.is_dirty(&base_transform.matrix, width, height) || blends_now;
+                    let stale_tick_atlas =
+                        cache.tick_atlas_tick != 0 && cache.tick_atlas_tick != cur_tick;
+                    if genuinely_dirty || cache.volatile_subframe || stale_tick_atlas {
+                        if genuinely_dirty {
+                            if cache.last_rebuild_tick != cur_tick {
+                                if cache.last_rebuild_tick.wrapping_add(1) == cur_tick {
+                                    cache.consecutive_rebuild_ticks =
+                                        cache.consecutive_rebuild_ticks.saturating_add(1);
+                                } else {
+                                    cache.consecutive_rebuild_ticks = 1;
+                                }
+                                cache.last_rebuild_tick = cur_tick;
+                            }
+                        } else {
+                            cache.consecutive_rebuild_ticks = 0;
+                        }
+                        let can_direct = !filters.is_empty()
+                            && this.opaque_background().is_none()
+                            && filters.iter().all(|f| {
+                                matches!(
+                                    f,
+                                    Filter::BlurFilter(_)
+                                        | Filter::GlowFilter(_)
+                                        | Filter::ColorMatrixFilter(_)
+                                )
+                            });
+                        let volatility =
+                            if can_direct && interpolation::is_inter_frame() && blends_now {
+                                CacheVolatility::Subframe
+                            } else if can_direct
+                                && (!blends_now || !interpolation::is_inter_frame())
+                                && cache.consecutive_rebuild_ticks >= 3
+                            {
+                                CacheVolatility::Tick(cur_tick)
+                            } else {
+                                CacheVolatility::Persistent
+                            };
+                        cache.volatile_subframe = matches!(volatility, CacheVolatility::Subframe);
+                        cache.tick_atlas_tick = match volatility {
+                            CacheVolatility::Tick(t) => t,
+                            _ => 0,
+                        };
                         cache.update(
                             context.renderer,
                             base_transform.matrix,
@@ -2055,6 +2118,7 @@ pub fn render_base<'gc>(
                             offset,
                             filters,
                             delta: None,
+                            volatility,
                         });
                     } else {
                         cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
@@ -2064,6 +2128,7 @@ pub fn render_base<'gc>(
                             offset,
                             filters,
                             delta: None,
+                            volatility: CacheVolatility::Persistent,
                         });
                     }
                 } else {
@@ -2121,9 +2186,11 @@ pub fn render_base<'gc>(
             }
             offscreen_context.cache_draws.push(BitmapCacheEntry {
                 handle: cache_info.bitmap.handle.clone(),
+                size: (cache_info.bitmap.width, cache_info.bitmap.height),
                 commands: offscreen_context.commands,
                 clear: this.opaque_background().unwrap_or_default(),
                 filters: cache_info.filters,
+                volatility: cache_info.volatility,
             });
         }
 
@@ -2201,9 +2268,11 @@ pub fn render_base<'gc>(
             this.render_self(&mut offscreen_context);
             offscreen_context.cache_draws.push(BitmapCacheEntry {
                 handle: auto_draw.bitmap.handle.clone(),
+                size: (auto_draw.bitmap.width, auto_draw.bitmap.height),
                 commands: offscreen_context.commands,
                 clear: auto_draw.clear,
                 filters: Vec::new(),
+                volatility: CacheVolatility::Persistent,
             });
         }
         apply_standard_mask_and_scroll(

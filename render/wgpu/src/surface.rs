@@ -90,6 +90,7 @@ impl Surface {
         layer: LayerRef<'encoder>,
         texture_pool: &'global mut TexturePool,
         frame_region: Option<(i32, i32, u32, u32)>,
+        filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
     ) {
         let target = self.draw_commands(
             render_target_mode,
@@ -101,6 +102,7 @@ impl Surface {
             draw_encoder,
             layer,
             texture_pool,
+            filter_atlas,
         );
 
         run_copy_pipeline_into_region(
@@ -128,6 +130,7 @@ impl Surface {
         draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
+        filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
     ) -> CommandTarget {
         // Everything drawn over an opaque background keeps it opaque
         // (except shader blends, which the command handler accounts for).
@@ -180,6 +183,7 @@ impl Surface {
                 layer => layer,
             },
             texture_pool,
+            filter_atlas,
         );
 
         let atlas_layers = if !leaf_layers.is_empty() {
@@ -192,6 +196,7 @@ impl Surface {
                 draw_encoder,
                 texture_pool,
                 self.quality,
+                filter_atlas,
             );
             commands::bind_atlas_layers(&mut chunks, &layers);
             Some(layers)
@@ -201,6 +206,7 @@ impl Surface {
         let atlas_bind_groups = atlas_layers
             .as_ref()
             .map_or(&[][..], |layers| &layers.bind_groups);
+        let filter_atlas_bind_groups = filter_atlas.map_or(&[][..], |fa| &fa.bind_groups);
 
         // Chunks are drawn with the stencil buffer attached only when they use masks. But
         // passes with and without it can't be merged, and each pass on a multisampled
@@ -327,6 +333,7 @@ impl Surface {
                             &dynamic_transforms.vertex_buffer,
                             offsets.vertices,
                             atlas_bind_groups,
+                            filter_atlas_bind_groups,
                             num_masks,
                             mask_state,
                             needs_stencil,

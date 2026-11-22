@@ -18,11 +18,28 @@ use std::rc::Rc;
 use std::sync::Arc;
 use swf::{Color, Rectangle, Twips};
 
+/// Whether a cached bitmap's filtered output needs to be copied out into `handle`, or can
+/// stay in a transient filter atlas for direct sampling.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum CacheVolatility {
+    /// Copy into `handle` so the cached bitmap persists across ticks.
+    #[default]
+    Persistent,
+    /// Valid only for the current render frame (interpolated sub-frames of blending CABs).
+    Subframe,
+    /// Valid for the remainder of the given movie tick (continuously animating CABs).
+    Tick(u32),
+}
+
 pub struct BitmapCacheEntry {
     pub handle: BitmapHandle,
+    /// Used sub-region `(width, height)` inside `handle` (may be smaller than the backing
+    /// texture when `CacheSlack` rounded/kept extra slack).
+    pub size: (u32, u32),
     pub commands: CommandList,
     pub clear: Color,
     pub filters: Vec<Filter>,
+    pub volatility: CacheVolatility,
 }
 
 pub trait RenderBackend: Any {

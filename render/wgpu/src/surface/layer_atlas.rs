@@ -9,11 +9,12 @@
 
 use crate::MaskState;
 use crate::backend::RenderTargetMode;
+use crate::blend::{BlendType, ComplexBlend};
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::mesh::Mesh;
-use crate::surface::commands::{Chunk, CommandRenderer, chunk_leaf_layers};
+use crate::surface::commands::{Chunk, CommandRenderer, bind_atlas_layers, chunk_leaf_layers};
 use crate::surface::target::{CommandTarget, PoolOrArcTexture};
 use ruffle_render::commands::{Command, CommandList};
 use ruffle_render::quality::StageQuality;
@@ -56,23 +57,102 @@ pub fn fits(width: u32, height: u32) -> bool {
     width <= MAX_LAYER_SIZE && height <= MAX_LAYER_SIZE
 }
 
-/// Whether a layer with these commands can be rendered in the atlas: it must only
-/// contain plain draws (or blends that draw directly without a sub-layer), and be
-/// reasonably small.
-pub fn is_leaf(descriptors: &Descriptors, commands: &CommandList, width: u32, height: u32) -> bool {
-    fits(width, height)
-        && commands.commands.iter().all(|command| match command {
+fn inline_blend_supported(
+    descriptors: &Descriptors,
+    blend_mode: &ruffle_render::commands::RenderBlendMode,
+) -> bool {
+    match BlendType::from(blend_mode.clone()) {
+        BlendType::Trivial(_) => true,
+        BlendType::Complex(mode) => {
+            !matches!(mode, ComplexBlend::Alpha | ComplexBlend::Erase)
+                && descriptors.shaders.fetch_blend_shaders.is_some()
+                && ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::FetchBlends,
+                )
+        }
+        BlendType::Shader(_) => false,
+    }
+}
+
+fn check_leaf_commands(
+    descriptors: &Descriptors,
+    commands: &CommandList,
+    width: u32,
+    height: u32,
+    allow_nested_blend: bool,
+) -> bool {
+    if !fits(width, height) {
+        return false;
+    }
+    let mut mask_depth: u32 = 0;
+    let mut mask_defining: u32 = 0;
+    for command in &commands.commands {
+        match command {
             Command::RenderBitmap { .. }
             | Command::RenderShape { .. }
             | Command::DrawRect { .. }
             | Command::DrawLine { .. }
-            | Command::DrawLineRect { .. } => true,
-            Command::Blend(inner, mode) | Command::BlendBounded(inner, mode, _) => {
-                crate::surface::commands::direct_blend_mode_for(descriptors, inner, mode, false)
-                    .is_some()
+            | Command::DrawLineRect { .. } => {}
+            Command::PushMask => {
+                mask_depth += 1;
+                mask_defining += 1;
             }
-            _ => false,
-        })
+            Command::ActivateMask => {
+                let Some(next) = mask_defining.checked_sub(1) else {
+                    return false;
+                };
+                mask_defining = next;
+            }
+            Command::DeactivateMask => {
+                if mask_depth == 0 || mask_defining != 0 {
+                    return false;
+                }
+            }
+            Command::PopMask => {
+                let Some(next) = mask_depth.checked_sub(1) else {
+                    return false;
+                };
+                mask_depth = next;
+            }
+            Command::Blend(inner, mode) | Command::BlendBounded(inner, mode, _) => {
+                if mask_defining != 0 {
+                    return false;
+                }
+                if crate::surface::commands::direct_blend_mode_for(descriptors, inner, mode, false)
+                    .is_some()
+                {
+                    continue;
+                }
+                if allow_nested_blend
+                    && inline_blend_supported(descriptors, mode)
+                    && check_leaf_commands(descriptors, inner, width, height, false)
+                {
+                    continue;
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    }
+    mask_depth == 0 && mask_defining == 0
+}
+
+/// Whether a layer with these commands can be rendered in the atlas: it must only
+/// contain plain draws, balanced stencil masks, or direct blends, and be reasonably small.
+pub fn is_leaf(descriptors: &Descriptors, commands: &CommandList, width: u32, height: u32) -> bool {
+    check_leaf_commands(descriptors, commands, width, height, false)
+}
+
+/// Whether a CAB with these commands can be rendered in the CAB/filter atlas: like
+/// `is_leaf`, and also permits one level of inline-blendable nested leaf blend layers
+/// (pre-rendered into a shared `LayerAtlas` before the CAB pass).
+pub fn is_cab_leaf(
+    descriptors: &Descriptors,
+    commands: &CommandList,
+    width: u32,
+    height: u32,
+) -> bool {
+    check_leaf_commands(descriptors, commands, width, height, true)
 }
 
 /// Where a layer was placed in an atlas.
@@ -127,7 +207,9 @@ pub fn render_leaf_layers(
     draw_encoder: &mut Scope<'_, wgpu::CommandEncoder>,
     texture_pool: &mut TexturePool,
     quality: StageQuality,
+    filter_atlas: Option<&crate::filters::FilterAtlasResult>,
 ) -> AtlasLayers {
+    let filter_atlas_bind_groups = filter_atlas.map_or(&[][..], |fa| &fa.bind_groups);
     let mut result = AtlasLayers {
         _textures: vec![],
         bind_groups: vec![],
@@ -160,7 +242,7 @@ pub fn render_leaf_layers(
             draw_encoder,
         );
 
-        let chunks = chunk_leaf_layers(
+        let (mut chunks, inner_leaf_layers) = chunk_leaf_layers(
             batch.iter().map(|(index, slot)| {
                 let layer = &layers[*index];
                 (
@@ -181,7 +263,32 @@ pub fn render_leaf_layers(
             width,
             height,
             texture_pool,
+            filter_atlas,
         );
+
+        let inner_atlas = if !inner_leaf_layers.is_empty() {
+            let atlas = render_leaf_layers(
+                inner_leaf_layers,
+                descriptors,
+                meshes,
+                staging_belt,
+                dynamic_transforms,
+                draw_encoder,
+                texture_pool,
+                quality,
+                filter_atlas,
+            );
+            bind_atlas_layers(&mut chunks, &atlas);
+            Some(atlas)
+        } else {
+            None
+        };
+        let atlas_bind_groups = inner_atlas
+            .as_ref()
+            .map_or(&[][..], |atlas| &atlas.bind_groups);
+        let needs_stencil = chunks
+            .iter()
+            .any(|chunk| matches!(chunk, Chunk::Draw { needs_stencil: true, .. }));
 
         let mut chunks: std::collections::VecDeque<_> = chunks
             .into_iter()
@@ -198,6 +305,8 @@ pub fn render_leaf_layers(
                 (chunk, transforms, vertices)
             })
             .collect();
+        let mut num_masks = 0;
+        let mut mask_state = MaskState::NoMask;
         while !chunks.is_empty() {
             // As many chunks per pass as possible (see `Surface::draw_commands`).
             let mut group = vec![];
@@ -213,11 +322,17 @@ pub fn render_leaf_layers(
                     break;
                 }
             }
+            let is_last = chunks.is_empty();
             crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
             let mut render_pass = draw_encoder.scoped_render_pass(
                 "Layer atlas",
                 wgpu::RenderPassDescriptor {
-                    color_attachments: &[target.color_attachments_for_pass(chunks.is_empty())],
+                    color_attachments: &[target.color_attachments_for_pass(is_last)],
+                    depth_stencil_attachment: if needs_stencil {
+                        target.stencil_attachment(descriptors, texture_pool, is_last)
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
             );
@@ -233,10 +348,11 @@ pub fn render_leaf_layers(
                     descriptors,
                     &dynamic_transforms.vertex_buffer,
                     offsets.vertices,
-                    &[],
-                    0,
-                    MaskState::NoMask,
-                    false,
+                    atlas_bind_groups,
+                    filter_atlas_bind_groups,
+                    num_masks,
+                    mask_state,
+                    needs_stencil,
                 );
                 for command in chunk {
                     if crate::utils::PROFILE_COMMANDS {
@@ -245,6 +361,8 @@ pub fn render_leaf_layers(
                         renderer.execute(&mut render_pass, command);
                     }
                 }
+                num_masks = renderer.num_masks();
+                mask_state = renderer.mask_state();
             }
         }
         target.ensure_resolved(draw_encoder);
@@ -358,6 +476,7 @@ pub fn render_into_atlas(
     draw_encoder: &mut Scope<'_, wgpu::CommandEncoder>,
     texture_pool: &mut TexturePool,
     quality: StageQuality,
+    filter_atlas: Option<&crate::filters::FilterAtlasResult>,
 ) {
     let width = destination.width();
     let height = destination.height();
@@ -383,7 +502,7 @@ pub fn render_into_atlas(
         draw_encoder,
     );
 
-    let chunks = chunk_leaf_layers(
+    let (mut chunks, inner_leaf_layers) = chunk_leaf_layers(
         layers,
         descriptors,
         staging_belt,
@@ -394,7 +513,33 @@ pub fn render_into_atlas(
         width,
         height,
         texture_pool,
+        filter_atlas,
     );
+
+    let inner_atlas = if !inner_leaf_layers.is_empty() {
+        let atlas = render_leaf_layers(
+            inner_leaf_layers,
+            descriptors,
+            meshes,
+            staging_belt,
+            dynamic_transforms,
+            draw_encoder,
+            texture_pool,
+            quality,
+            filter_atlas,
+        );
+        bind_atlas_layers(&mut chunks, &atlas);
+        Some(atlas)
+    } else {
+        None
+    };
+    let atlas_bind_groups = inner_atlas
+        .as_ref()
+        .map_or(&[][..], |atlas| &atlas.bind_groups);
+    let filter_atlas_bind_groups = filter_atlas.map_or(&[][..], |fa| &fa.bind_groups);
+    let needs_stencil = chunks
+        .iter()
+        .any(|chunk| matches!(chunk, Chunk::Draw { needs_stencil: true, .. }));
 
     let mut chunks: std::collections::VecDeque<_> = chunks
         .into_iter()
@@ -411,6 +556,8 @@ pub fn render_into_atlas(
             (chunk, transforms, vertices)
         })
         .collect();
+    let mut num_masks = 0;
+    let mut mask_state = MaskState::NoMask;
     while !chunks.is_empty() {
         let mut group = vec![];
         while let Some((chunk, transforms, vertices)) = chunks.pop_front() {
@@ -425,11 +572,17 @@ pub fn render_into_atlas(
                 break;
             }
         }
+        let is_last = chunks.is_empty();
         crate::perf_counters::count(crate::perf_counters::Counter::RenderPass);
         let mut render_pass = draw_encoder.scoped_render_pass(
             "Layer atlas",
             wgpu::RenderPassDescriptor {
-                color_attachments: &[target.color_attachments_for_pass(chunks.is_empty())],
+                color_attachments: &[target.color_attachments_for_pass(is_last)],
+                depth_stencil_attachment: if needs_stencil {
+                    target.stencil_attachment(descriptors, texture_pool, is_last)
+                } else {
+                    None
+                },
                 ..Default::default()
             },
         );
@@ -445,10 +598,11 @@ pub fn render_into_atlas(
                 descriptors,
                 &dynamic_transforms.vertex_buffer,
                 offsets.vertices,
-                &[],
-                0,
-                MaskState::NoMask,
-                false,
+                atlas_bind_groups,
+                filter_atlas_bind_groups,
+                num_masks,
+                mask_state,
+                needs_stencil,
             );
             for command in chunk {
                 if crate::utils::PROFILE_COMMANDS {
@@ -457,6 +611,8 @@ pub fn render_into_atlas(
                     renderer.execute(&mut render_pass, command);
                 }
             }
+            num_masks = renderer.num_masks();
+            mask_state = renderer.mask_state();
         }
     }
     target.ensure_resolved(draw_encoder);

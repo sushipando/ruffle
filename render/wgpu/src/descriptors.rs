@@ -155,12 +155,15 @@ impl Descriptors {
     }
 }
 
+pub const MAX_BATCH_QUADS: usize = 1024;
+
 pub struct Quad {
     pub vertices_pos: wgpu::Buffer,
     pub vertices_pos_uv: wgpu::Buffer,
     pub vertices_pos_color: wgpu::Buffer,
     pub filter_vertices: wgpu::Buffer,
     pub indices: wgpu::Buffer,
+    pub batch_quad_indices: wgpu::Buffer,
     pub indices_line: wgpu::Buffer,
     pub indices_line_rect: wgpu::Buffer,
 }
@@ -273,6 +276,17 @@ impl Quad {
             wgpu::BufferUsages::INDEX,
             create_debug_label!("Quad ibo"),
         );
+        let mut batch_indices = Vec::with_capacity(MAX_BATCH_QUADS * 6);
+        for q in 0..MAX_BATCH_QUADS as u32 {
+            let base = q * 4;
+            batch_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        let ibo_batch = create_buffer_with_data(
+            device,
+            bytemuck::cast_slice(&batch_indices),
+            wgpu::BufferUsages::INDEX,
+            create_debug_label!("Batch quad ibo"),
+        );
         let ibo_line = create_buffer_with_data(
             device,
             bytemuck::cast_slice(&indices_line),
@@ -292,6 +306,7 @@ impl Quad {
             vertices_pos_color: vbo_pos_color,
             filter_vertices: vbo_filter,
             indices: ibo,
+            batch_quad_indices: ibo_batch,
             indices_line: ibo_line,
             indices_line_rect: ibo_line_rect,
         }

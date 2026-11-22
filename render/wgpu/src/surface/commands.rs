@@ -33,6 +33,7 @@ pub struct CommandRenderer<'encoder> {
     /// Where this chunk's vertices start in `dynamic_vertex_buffer`.
     dynamic_vertex_base: wgpu::BufferAddress,
     atlas_bind_groups: &'encoder [wgpu::BindGroup],
+    filter_atlas_bind_groups: &'encoder [wgpu::BindGroup],
 }
 
 impl<'encoder> CommandRenderer<'encoder> {
@@ -43,6 +44,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         dynamic_vertex_buffer: &'encoder wgpu::Buffer,
         dynamic_vertex_base: wgpu::BufferAddress,
         atlas_bind_groups: &'encoder [wgpu::BindGroup],
+        filter_atlas_bind_groups: &'encoder [wgpu::BindGroup],
         num_masks: u32,
         mask_state: MaskState,
         needs_stencil: bool,
@@ -56,6 +58,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             needs_stencil,
             dynamic_vertex_buffer,
             atlas_bind_groups,
+            filter_atlas_bind_groups,
         }
     }
 
@@ -115,6 +118,18 @@ impl<'encoder> CommandRenderer<'encoder> {
                 blend_mode,
                 ..
             } => self.render_atlas_layer(
+                render_pass,
+                *atlas_index,
+                *instance_index,
+                *vertex_offset,
+                *blend_mode,
+            ),
+            DrawCommand::RenderFilterAtlas {
+                atlas_index,
+                instance_index,
+                vertex_offset,
+                blend_mode,
+            } => self.render_filter_atlas(
                 render_pass,
                 *atlas_index,
                 *instance_index,
@@ -362,6 +377,44 @@ impl<'encoder> CommandRenderer<'encoder> {
                 } else {
                     render_pass.set_pipeline(pipelines.stencilless_pipeline());
                 }
+                render_pass.set_bind_group(2, bind_group, &[]);
+            }
+        }
+        self.draw(
+            render_pass,
+            self.dynamic_vertex_buffer
+                .slice(self.dynamic_vertex_base + vertex_offset..),
+            self.descriptors.quad.indices.slice(..),
+            6,
+            instance_index,
+        );
+    }
+
+    pub fn render_filter_atlas(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        atlas_index: usize,
+        instance_index: u32,
+        vertex_offset: wgpu::BufferAddress,
+        blend_mode: ShapeBlend,
+    ) {
+        let bind_group = &self.filter_atlas_bind_groups[atlas_index];
+        match blend_mode {
+            ShapeBlend::Trivial(mode) => {
+                self.prep_bitmap(render_pass, bind_group, mode, false);
+            }
+            ShapeBlend::Fetch(mode) => {
+                let pipeline = self.pipelines.fetch_bitmap_blend(
+                    &self.descriptors.device,
+                    &self.descriptors.shaders,
+                    &self.descriptors.bind_layouts,
+                    mode,
+                );
+                render_pass.set_pipeline(if self.needs_stencil {
+                    pipeline.pipeline_for(self.mask_state)
+                } else {
+                    pipeline.stencilless_pipeline()
+                });
                 render_pass.set_bind_group(2, bind_group, &[]);
             }
         }
@@ -639,6 +692,13 @@ pub enum DrawCommand {
         vertex_offset: wgpu::BufferAddress,
         blend_mode: ShapeBlend,
     },
+    /// A filtered CAB sampled directly from its slot in a shared filter atlas.
+    RenderFilterAtlas {
+        atlas_index: usize,
+        instance_index: u32,
+        vertex_offset: wgpu::BufferAddress,
+        blend_mode: ShapeBlend,
+    },
     RenderAlphaMask {
         maskee: PoolOrArcTexture,
         mask: PoolOrArcTexture,
@@ -676,6 +736,7 @@ impl DrawCommand {
             DrawCommand::RenderTexture { .. } => "render texture",
             DrawCommand::FetchBlend { .. } => "fetch blend",
             DrawCommand::RenderAtlasLayer { .. } => "render atlas layer",
+            DrawCommand::RenderFilterAtlas { .. } => "render filter atlas",
             DrawCommand::DrawRect { .. } => "draw rect",
             DrawCommand::DrawLine { .. } => "draw line",
             DrawCommand::DrawLineRect { .. } => "draw line rect",
@@ -713,6 +774,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     opaque: bool,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
+    filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
 ) -> (Vec<Chunk>, Vec<layer_atlas::LeafLayer>) {
     let mut handler = WgpuCommandHandler::new(
         descriptors,
@@ -726,6 +788,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         origin,
         nearest_layer,
         texture_pool,
+        filter_atlas,
     );
     handler.opaque = opaque;
     let chunks = handler.chunk_blends(commands);
@@ -783,7 +846,8 @@ pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
     width: u32,
     height: u32,
     texture_pool: &'encoder mut TexturePool,
-) -> Vec<Chunk> {
+    filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
+) -> (Vec<Chunk>, Vec<layer_atlas::LeafLayer>) {
     let mut handler = WgpuCommandHandler::new(
         descriptors,
         staging_belt,
@@ -796,6 +860,7 @@ pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
         (0, 0),
         LayerRef::None,
         texture_pool,
+        filter_atlas,
     );
     for (commands, (dx, dy), scissor) in layers {
         handler.scissor = Some(scissor);
@@ -804,8 +869,7 @@ pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
         commands.execute(&mut handler);
     }
     let chunks = handler.chunk_blends(CommandList::new());
-    debug_assert!(handler.leaf_layers.is_empty());
-    chunks
+    (chunks, handler.leaf_layers)
 }
 
 /// How a shape is drawn onto its target (see `WgpuCommandHandler::direct_blend_mode`).
@@ -849,6 +913,8 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     num_masks: i32,
     /// While drawing the content of a blend directly (instead of in a layer), its mode.
     direct_blend: Option<ShapeBlend>,
+    /// Optional filtered CAB atlas for direct sampling without copy-out blits.
+    filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
 }
 
 impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
@@ -865,6 +931,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         origin: (i32, i32),
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
+        filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
     ) -> Self {
         let transforms = Self::new_transforms(descriptors, dynamic_transforms);
         let vertices = Self::new_vertices(descriptors, dynamic_transforms);
@@ -903,6 +970,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             needs_stencil: false,
             num_masks: 0,
             direct_blend: None,
+            filter_atlas,
         }
     }
 
@@ -1066,9 +1134,12 @@ impl WgpuCommandHandler<'_, '_> {
 
         // Padding for anti-aliasing and bitmap smoothing at the edges.
         const PADDING: i32 = 2;
-        let (ox, oy) = self.origin;
-        let clamp_x = |v: f64| (v as i32).clamp(ox, ox + self.width as i32);
-        let clamp_y = |v: f64| (v as i32).clamp(oy, oy + self.height as i32);
+        let (ox, oy, target_w, target_h) = match self.scissor {
+            Some((_, _, sw, sh)) => (0, 0, sw, sh),
+            None => (self.origin.0, self.origin.1, self.width, self.height),
+        };
+        let clamp_x = |v: f64| (v as i32).clamp(ox, ox + target_w as i32);
+        let clamp_y = |v: f64| (v as i32).clamp(oy, oy + target_h as i32);
         let x0 = clamp_x(bounds.x_min.to_pixels().floor() - PADDING as f64);
         let y0 = clamp_y(bounds.y_min.to_pixels().floor() - PADDING as f64);
         let x1 = clamp_x(bounds.x_max.to_pixels().ceil() + PADDING as f64);
@@ -1084,12 +1155,12 @@ impl WgpuCommandHandler<'_, '_> {
             let start = start.min(max - size).max(min);
             (start, start + size)
         };
-        let (x0, x1) = round(x0, x1, ox, ox + self.width as i32);
-        let (y0, y1) = round(y0, y1, oy, oy + self.height as i32);
+        let (x0, x1) = round(x0, x1, ox, ox + target_w as i32);
+        let (y0, y1) = round(y0, y1, oy, oy + target_h as i32);
         let (width, height) = ((x1 - x0) as u32, (y1 - y0) as u32);
 
         // Not worth it if we'd cover most of the target anyway.
-        if (width as u64 * height as u64) * 4 > (self.width as u64 * self.height as u64) * 3 {
+        if (width as u64 * height as u64) * 4 > (target_w as u64 * target_h as u64) * 3 {
             return None;
         }
         Some(Some((x0, y0, width, height)))
@@ -1297,7 +1368,10 @@ impl WgpuCommandHandler<'_, '_> {
         }
         let (origin, width, height) = match rect {
             Some((x, y, width, height)) => ((x, y), width, height),
-            None => (self.origin, self.width, self.height),
+            None => match self.scissor {
+                Some((_, _, sw, sh)) => ((0, 0), sw, sh),
+                None => (self.origin, self.width, self.height),
+            },
         };
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
             LayerRef::Current
@@ -1356,7 +1430,7 @@ impl WgpuCommandHandler<'_, '_> {
             _ => None,
         };
 
-        let use_leaf_atlas = rect.is_some()
+        let use_leaf_atlas = (rect.is_some() || self.scissor.is_some())
             && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LayerAtlas)
             && layer_atlas::is_leaf(self.descriptors, &commands, width, height);
 
@@ -1437,6 +1511,7 @@ impl WgpuCommandHandler<'_, '_> {
                 self.draw_encoder,
                 target_layer,
                 self.texture_pool,
+                self.filter_atlas,
             );
             target.ensure_cleared(self.draw_encoder);
             target.take_color_texture()
@@ -1558,11 +1633,43 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         let direct_blend = self
             .direct_blend
             .unwrap_or(ShapeBlend::Trivial(TrivialBlend::Normal));
-        let texture = as_texture(&bitmap);
-
         let mut matrix = transform.matrix;
         pixel_snapping.apply(&mut matrix);
         matrix *= Matrix::scale(region.width() as f32, region.height() as f32);
+
+        if let Some(filter_atlas) = self.filter_atlas
+            && let Some(&(atlas_index, slot_x, slot_y, atlas_w, atlas_h)) = filter_atlas
+                .slots
+                .get(&(std::sync::Arc::as_ptr(&bitmap.0) as *const () as usize))
+        {
+            let (u0, u1, v0, v1) = (
+                (slot_x + region.x_min) as f32 / atlas_w as f32,
+                (slot_x + region.x_max) as f32 / atlas_w as f32,
+                (slot_y + region.y_min) as f32 / atlas_h as f32,
+                (slot_y + region.y_max) as f32 / atlas_h as f32,
+            );
+            let vertices = [
+                PosUvVertex::new(0.0, 0.0, u0, v0, 1.0),
+                PosUvVertex::new(1.0, 0.0, u1, v0, 1.0),
+                PosUvVertex::new(1.0, 1.0, u1, v1, 1.0),
+                PosUvVertex::new(0.0, 1.0, u0, v1, 1.0),
+            ];
+            self.add_to_current_with_vertices(
+                matrix,
+                transform.tz,
+                transform.color_transform,
+                Some(&vertices),
+                |instance_index, vertex_offset| DrawCommand::RenderFilterAtlas {
+                    atlas_index,
+                    instance_index,
+                    vertex_offset: vertex_offset.expect("vertices were provided"),
+                    blend_mode: direct_blend,
+                },
+            );
+            return;
+        }
+
+        let texture = as_texture(&bitmap);
 
         let vertices: &[PosUvVertex] = {
             let (u0, u1, v0, v1) = (
@@ -1721,6 +1828,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.draw_encoder,
             LayerRef::None,
             self.texture_pool,
+            self.filter_atlas,
         );
         maskee.ensure_cleared(self.draw_encoder);
         let matrix = Matrix::translate(
@@ -1739,6 +1847,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.draw_encoder,
             LayerRef::None,
             self.texture_pool,
+            self.filter_atlas,
         );
         mask.ensure_cleared(self.draw_encoder);
         let mask = mask.take_color_texture();

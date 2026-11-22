@@ -206,6 +206,17 @@ impl DisplacementMapFilter {
 
 thread_local! {
     static VIEW_SCALE: Cell<Option<f32>> = const { Cell::new(None) };
+    static RENDER_TICK: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Records the movie tick of the frame being submitted on this thread, so renderers can
+/// expire tick-scoped transient atlases as soon as the movie advances to a new tick.
+pub fn set_render_tick(tick: u32) {
+    RENDER_TICK.with(|v| v.set(tick));
+}
+
+pub fn render_tick() -> u32 {
+    RENDER_TICK.with(|v| v.get())
 }
 
 /// Sets how much the stage is magnified for display while a frame is rendered on this

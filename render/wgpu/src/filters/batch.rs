@@ -12,7 +12,7 @@
 //! and only while rendering for display, since the results aren't bit-exact (see
 //! `BlurFilter::apply_merged`).
 
-use crate::buffer_pool::TexturePool;
+use crate::buffer_pool::{AlwaysCompatible, PoolEntry, PooledTexture, TexturePool};
 use crate::descriptors::Descriptors;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::blur::{KERNEL_UNIFORM_SIZE, downscale_factors, merged_kernel};
@@ -20,6 +20,8 @@ use crate::filters::glow::GlowUniform;
 use crate::filters::{FilterVertex, FilterVertexWithBlur};
 use crate::mesh::Mesh;
 use crate::surface::layer_atlas::{self, LAYER_TEXTURE_USAGE};
+use ruffle_render::backend::CacheVolatility;
+use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::commands::CommandList;
 use ruffle_render::filters::Filter;
 use ruffle_render::quality::StageQuality;
@@ -35,11 +37,89 @@ const ALIGN: u32 = 8;
 /// An entry to be filtered by `apply_together`.
 pub struct FilterTogetherEntry {
     pub texture: wgpu::Texture,
+    /// Used sub-region `(width, height)` inside `texture` (excluding `CacheSlack` padding).
+    pub used_size: (u32, u32),
     pub filters: Vec<Filter>,
     /// If `Some`, the entry hasn't been drawn into `texture` yet and can be drawn
     /// directly into the filter atlas, avoiding a separate layer atlas pass and two
     /// texture copies.
     pub direct_commands: Option<CommandList>,
+    /// Kept alive in tick-scoped `FilterAtlasResult` so `handle_ptr` can never dangle.
+    pub handle: BitmapHandle,
+    /// Raw pointer identity of the entry's `BitmapHandle` (`Arc::as_ptr(&handle.0) as usize`).
+    pub handle_ptr: usize,
+    /// Persistence policy for this filtered entry.
+    pub volatility: CacheVolatility,
+}
+
+/// Filtered CAB atlases kept alive for direct sampling during the current frame (and, for
+/// `CacheVolatility::Tick`, the remaining sub-frames of the current movie tick), avoiding
+/// per-CAB copy-out blits and per-CAB bind groups for animated CABs.
+#[derive(Default)]
+pub struct FilterAtlasResult {
+    textures: Vec<PoolEntry<PooledTexture, AlwaysCompatible>>,
+    pub bind_groups: Vec<wgpu::BindGroup>,
+    /// Maps `BitmapHandle` pointer -> `(atlas_bind_group_index, slot_x, slot_y, atlas_w, atlas_h)`.
+    pub slots: fnv::FnvHashMap<usize, (usize, u32, u32, u32, u32)>,
+    handles: fnv::FnvHashMap<usize, BitmapHandle>,
+    subframe_keys: Vec<usize>,
+}
+
+impl FilterAtlasResult {
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.handles.clear();
+        self.subframe_keys.clear();
+        self.bind_groups.clear();
+        self.textures.clear();
+    }
+
+    pub fn remove_slot(&mut self, handle_ptr: usize) {
+        self.slots.remove(&handle_ptr);
+        self.handles.remove(&handle_ptr);
+    }
+
+    /// Drops single-subframe slots and any atlas textures no longer referenced by live
+    /// tick-scoped slots, returning those textures to the pool immediately.
+    pub fn end_frame(&mut self) {
+        for key in self.subframe_keys.drain(..) {
+            self.slots.remove(&key);
+            self.handles.remove(&key);
+        }
+        if self.slots.is_empty() {
+            self.clear();
+            return;
+        }
+        let mut used = vec![false; self.bind_groups.len()];
+        for &(bg_idx, _, _, _, _) in self.slots.values() {
+            if bg_idx < used.len() {
+                used[bg_idx] = true;
+            }
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut remap = vec![0usize; used.len()];
+        let mut new_textures = Vec::with_capacity(self.textures.len());
+        let mut new_bind_groups = Vec::with_capacity(self.bind_groups.len());
+        for (old_idx, (tex, bg)) in self
+            .textures
+            .drain(..)
+            .zip(self.bind_groups.drain(..))
+            .enumerate()
+        {
+            if used[old_idx] {
+                remap[old_idx] = new_bind_groups.len();
+                new_textures.push(tex);
+                new_bind_groups.push(bg);
+            }
+        }
+        self.textures = new_textures;
+        self.bind_groups = new_bind_groups;
+        for slot in self.slots.values_mut() {
+            slot.0 = remap[slot.0];
+        }
+    }
 }
 
 /// The kernels and scale of a blur (see `BlurFilter::apply`), if it can be merged.
@@ -92,15 +172,6 @@ struct Region {
 }
 
 impl Region {
-    fn scaled(self, factors: (u32, u32)) -> Self {
-        Self {
-            x: self.x / factors.0,
-            y: self.y / factors.1,
-            width: self.width / factors.0,
-            height: self.height / factors.1,
-        }
-    }
-
     /// The region's corners in a texture of the given size, normalized (0 to 1).
     fn normalized(self, size: (u32, u32)) -> [[f32; 2]; 4] {
         let (left, top) = (self.x as f32 / size.0 as f32, self.y as f32 / size.1 as f32);
@@ -126,10 +197,12 @@ fn parent_scale(scale: (u32, u32)) -> (u32, u32) {
     (nsx, nsy)
 }
 
-/// Collects per-quad uniforms at aligned offsets of one buffer.
+/// Collects per-quad uniforms at aligned offsets of one buffer, deduplicating identical
+/// payloads so consecutive quads sharing the same uniform can be drawn in one call.
 struct Uniforms {
     bytes: Vec<u8>,
     alignment: usize,
+    dedup: HashMap<Vec<u8>, u32>,
 }
 
 impl Uniforms {
@@ -137,15 +210,22 @@ impl Uniforms {
         Self {
             bytes: vec![],
             alignment: descriptors.limits.min_uniform_buffer_offset_alignment as usize,
+            dedup: HashMap::new(),
         }
     }
 
-    /// Adds `data`, reserving at least `size` bytes, and returns its offset.
+    /// Adds `data`, reserving at least `size` bytes, and returns its offset (reusing an
+    /// existing offset if identical bytes were already pushed).
     fn push(&mut self, data: &[u8], size: usize) -> u32 {
+        if let Some(&offset) = self.dedup.get(data) {
+            return offset;
+        }
         let offset = self.bytes.len().next_multiple_of(self.alignment);
         self.bytes.resize(offset + size.max(data.len()), 0);
         self.bytes[offset..offset + data.len()].copy_from_slice(data);
-        offset as u32
+        let offset = offset as u32;
+        self.dedup.insert(data.to_vec(), offset);
+        offset
     }
 
     fn buffer(
@@ -285,6 +365,30 @@ fn clear_pass<'a>(
     })
 }
 
+/// Draws consecutive runs of quads sharing the same dynamic uniform offset in a single
+/// `draw_indexed` call using `descriptors.quad.batch_quad_indices`.
+fn draw_batched_quads(
+    render_pass: &mut wgpu::RenderPass<'_>,
+    bind_group: &wgpu::BindGroup,
+    offsets: &[u32],
+) {
+    let mut i = 0;
+    while i < offsets.len() {
+        let offset = offsets[i];
+        let mut end = i + 1;
+        while end < offsets.len()
+            && offsets[end] == offset
+            && end - i < crate::descriptors::MAX_BATCH_QUADS
+        {
+            end += 1;
+        }
+        let count = (end - i) as u32;
+        render_pass.set_bind_group(0, bind_group, &[offset]);
+        render_pass.draw_indexed(0..(count * 6), i as i32 * 4, 0..1);
+        i = end;
+    }
+}
+
 /// Draws quads (four vertices each, from `vertices`) with the dynamic kernel pipeline,
 /// each with its own kernel at the given offset of `uniforms`.
 fn draw_kernel_quads(
@@ -324,13 +428,10 @@ fn draw_kernel_quads(
     render_pass.set_pipeline(blur.dynamic_kernel_pipeline(descriptors));
     render_pass.set_vertex_buffer(0, vertices.slice(..));
     render_pass.set_index_buffer(
-        descriptors.quad.indices.slice(..),
+        descriptors.quad.batch_quad_indices.slice(..),
         wgpu::IndexFormat::Uint32,
     );
-    for (index, offset) in offsets.iter().enumerate() {
-        render_pass.set_bind_group(0, &bind_group, &[*offset]);
-        render_pass.draw_indexed(0..6, index as i32 * 4, 0..1);
-    }
+    draw_batched_quads(render_pass, &bind_group, offsets);
 }
 
 /// A texture that holds a whole atlas (or a scaled-down version of it).
@@ -386,15 +487,22 @@ pub fn apply_together(
     texture_pool: &mut TexturePool,
     quality: StageQuality,
     max_size: u32,
+    direct_out: &mut FilterAtlasResult,
 ) -> Vec<usize> {
     let mut scratch = Scratch {
         descriptors,
         taken: vec![],
     };
-    // Shelf-pack the textures, each with transparent space around it as wide as its
-    // filters can spread (like `apply_filters_batched`).
+    // Shelf-pack the textures by their used sub-region (excluding `CacheSlack` dead
+    // padding), each with transparent space around it as wide as its filters can spread.
+    let used_extent = |entry: &FilterTogetherEntry| -> (u32, u32) {
+        (
+            entry.used_size.0.min(entry.texture.width()).max(1),
+            entry.used_size.1.min(entry.texture.height()).max(1),
+        )
+    };
     let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(entries[i].texture.height()));
+    order.sort_by_key(|&i| std::cmp::Reverse(used_extent(&entries[i]).1));
     let mut batches: Vec<Batch> = vec![];
     let mut batch = vec![];
     let mut skipped = vec![];
@@ -417,8 +525,9 @@ pub fn apply_together(
         .fold(0.0f64, f64::max)
         .ceil() as u32;
         let gutter = (reach + 2).next_multiple_of(ALIGN);
-        let width = entry.texture.width().next_multiple_of(ALIGN);
-        let height = entry.texture.height().next_multiple_of(ALIGN);
+        let (uw, uh) = used_extent(entry);
+        let width = uw.next_multiple_of(ALIGN);
+        let height = uh.next_multiple_of(ALIGN);
         let (w, h) = (width + gutter * 2, height + gutter * 2);
         if w > max_size || h > max_size {
             skipped.push(index);
@@ -449,30 +558,32 @@ pub fn apply_together(
     let nearest = descriptors.bitmap_samplers.get_sampler(false, false);
     let linear = descriptors.bitmap_samplers.get_sampler(false, true);
     for (batch, width, height) in batches {
+        let batch_len = batch.len() as u64;
         let size = (
             width.next_multiple_of(256).min(max_size),
             height.next_multiple_of(256).min(max_size),
         );
-        let mut current = atlas_texture(descriptors, texture_pool, size);
+        let current_init = atlas_texture(descriptors, texture_pool, size);
 
         let mut direct_layers = vec![];
         let mut copy_in = vec![];
         for &(index, region, _) in &batch {
+            let (uw, uh) = used_extent(&entries[index]);
             if let Some(commands) = entries[index].direct_commands.take() {
-                let texture = &entries[index].texture;
                 direct_layers.push((
                     commands,
                     (region.x as i32, region.y as i32),
-                    (region.x, region.y, texture.width(), texture.height()),
+                    (region.x, region.y, uw, uh),
                 ));
             } else {
-                copy_in.push((index, region));
+                copy_in.push((index, region, uw, uh));
             }
         }
         if !direct_layers.is_empty() {
+            let prior_atlas = (!direct_out.slots.is_empty()).then_some(&*direct_out);
             layer_atlas::render_into_atlas(
                 direct_layers.into_iter(),
-                &current.texture.0,
+                &current_init.texture.0,
                 descriptors,
                 meshes,
                 staging_belt,
@@ -480,16 +591,17 @@ pub fn apply_together(
                 encoder,
                 texture_pool,
                 quality,
+                prior_atlas,
             );
         } else {
-            drop(clear_pass(encoder, &current.texture.1));
+            drop(clear_pass(encoder, &current_init.texture.1));
         }
-        for (index, region) in copy_in {
+        for (index, region, uw, uh) in copy_in {
             let texture = &entries[index].texture;
             encoder.copy_texture_to_texture(
                 texture.as_image_copy(),
                 wgpu::TexelCopyTextureInfo {
-                    texture: &current.texture.0,
+                    texture: &current_init.texture.0,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
                         x: region.x,
@@ -498,7 +610,11 @@ pub fn apply_together(
                     },
                     aspect: Default::default(),
                 },
-                texture.size(),
+                wgpu::Extent3d {
+                    width: uw,
+                    height: uh,
+                    depth_or_array_layers: 1,
+                },
             );
         }
 
@@ -507,10 +623,19 @@ pub fn apply_together(
             .map(|&(index, _, _)| entries[index].filters.len())
             .max()
             .unwrap_or(0);
+        let mut current_owned: Option<AtlasTexture> = Some(current_init);
+        let mut current_direct: Option<(usize, (u32, u32))> = None;
+        let mut active = batch;
         for step in 0..steps {
+            let (current_view, current_size) = match (&current_owned, current_direct) {
+                (Some(cur), _) => (&cur.texture.1, cur.size),
+                (None, Some((idx, sz))) => (&direct_out.textures[idx].1, sz),
+                _ => unreachable!("current atlas is always live"),
+            };
+
             // Collect all blurs (including those of glows) for this step.
             let mut blur_items: Vec<BlurItem> = vec![];
-            for (batch_index, &(index, region, gutter)) in batch.iter().enumerate() {
+            for (batch_index, &(index, region, gutter)) in active.iter().enumerate() {
                 let blur = match entries[index].filters.get(step) {
                     Some(Filter::BlurFilter(filter)) => filter.clone(),
                     Some(Filter::GlowFilter(filter)) => filter.inner_blur_filter(),
@@ -527,55 +652,93 @@ pub fn apply_together(
 
             // The blurred (scaled-down) result of each bitmap blurred in this step:
             // index into `blurred_textures`, and its slot in that tightly-packed atlas.
-            let mut blurred: Vec<Option<(usize, Region)>> = vec![None; batch.len()];
+            let mut blurred: Vec<Option<(usize, Region)>> = vec![None; active.len()];
             let mut blurred_textures: Vec<AtlasTexture> = vec![];
 
             if !blur_items.is_empty() {
-                // 1. Shared downscale pyramid: compute each needed intermediate scale once
-                //    for all bitmaps that use it (or a deeper scale descended from it).
-                let mut scale_regions: HashMap<(u32, u32), Vec<(usize, Region)>> = HashMap::new();
+                // 1. Tightly-packed shared downscale pyramid: only allocate space for the
+                //    bitmaps that actually need each intermediate scale, instead of scaling
+                //    down the entire full-resolution atlas.
+                let mut scale_regions: HashMap<(u32, u32), Vec<(usize, Region, u32)>> =
+                    HashMap::new();
                 for item in &blur_items {
                     let mut s = item.plan.factors;
                     while s != (1, 1) {
-                        scale_regions
-                            .entry(s)
-                            .or_default()
-                            .push((item.batch_index, item.region));
+                        scale_regions.entry(s).or_default().push((
+                            item.batch_index,
+                            item.region,
+                            item.gutter,
+                        ));
                         s = parent_scale(s);
                     }
                 }
                 let mut scales: Vec<(u32, u32)> = scale_regions.keys().copied().collect();
                 scales.sort_by_key(|&(sx, sy)| (sx.max(sy), sx * sy, sx, sy));
 
-                let mut downscaled: HashMap<(u32, u32), AtlasTexture> = HashMap::new();
+                let mut downscaled: HashMap<(u32, u32), (AtlasTexture, HashMap<usize, Region>)> =
+                    HashMap::new();
                 for scale in scales {
                     let parent = parent_scale(scale);
                     let mut regions = scale_regions.remove(&scale).unwrap_or_default();
-                    regions.sort_by_key(|&(bi, _)| bi);
-                    regions.dedup_by_key(|(bi, _)| *bi);
+                    regions.sort_by_key(|&(bi, _, _)| bi);
+                    regions.dedup_by_key(|(bi, _, _)| *bi);
+                    regions.sort_by_key(|&(_, region, gutter)| {
+                        let pad_y = (gutter / scale.1).max(2);
+                        std::cmp::Reverse(region.height / scale.1 + pad_y * 2)
+                    });
 
-                    let target = atlas_texture(
-                        descriptors,
-                        texture_pool,
-                        (size.0 / scale.0, size.1 / scale.1),
+                    let mut packed: Vec<(usize, Region, Region)> =
+                        Vec::with_capacity(regions.len());
+                    let mut packed_map: HashMap<usize, Region> =
+                        HashMap::with_capacity(regions.len());
+                    let (mut dx, mut dy, mut d_row_h, mut d_used_w) = (0u32, 0u32, 0u32, 0u32);
+                    for (bi, region, gutter) in regions {
+                        let sw = (region.width / scale.0).max(1);
+                        let sh = (region.height / scale.1).max(1);
+                        let pad_x = (gutter / scale.0).max(2);
+                        let pad_y = (gutter / scale.1).max(2);
+                        let (pw, ph) = (sw + pad_x * 2, sh + pad_y * 2);
+                        if dx + pw > max_size {
+                            (dx, dy, d_row_h) = (0, dy + d_row_h, 0);
+                        }
+                        let slot = Region {
+                            x: dx + pad_x,
+                            y: dy + pad_y,
+                            width: sw,
+                            height: sh,
+                        };
+                        packed.push((bi, region, slot));
+                        packed_map.insert(bi, slot);
+                        dx += pw;
+                        d_used_w = d_used_w.max(dx);
+                        d_row_h = d_row_h.max(ph);
+                    }
+                    let ds_size = (
+                        d_used_w.next_multiple_of(128).max(128).min(max_size),
+                        (dy + d_row_h).next_multiple_of(128).max(128).min(max_size),
                     );
-                    let (source_view, source_size) = if parent == (1, 1) {
-                        (&current.texture.1, current.size)
+                    let target = atlas_texture(descriptors, texture_pool, ds_size);
+                    let (source_view, source_size, parent_map) = if parent == (1, 1) {
+                        (current_view, current_size, None)
                     } else {
-                        let src = &downscaled[&parent];
-                        (&src.texture.1, src.size)
+                        let (src, map) = &downscaled[&parent];
+                        (&src.texture.1, src.size, Some(map))
                     };
                     let mut uniforms = Uniforms::new(descriptors);
                     let copy = uniforms.push(
                         &kernel_uniform([0.0, 0.0], &[[0.0, 1.0]]),
                         KERNEL_UNIFORM_SIZE as usize,
                     );
-                    let vertices: Vec<_> = regions
+                    let vertices: Vec<_> = packed
                         .iter()
-                        .flat_map(|&(_, region)| {
+                        .flat_map(|&(bi, orig_region, dst_slot)| {
+                            let src_region = match parent_map {
+                                Some(map) => map[&bi],
+                                None => orig_region,
+                            };
                             quad(
-                                region.scaled(scale).normalized(target.size),
-                                region.scaled(parent).normalized(source_size),
+                                dst_slot.normalized(target.size),
+                                src_region.normalized(source_size),
                             )
                         })
                         .collect();
@@ -589,10 +752,10 @@ pub fn apply_together(
                         linear,
                         &uniforms,
                         &vertices,
-                        &vec![copy; regions.len()],
+                        &vec![copy; packed.len()],
                     );
                     drop(render_pass);
-                    downscaled.insert(scale, target);
+                    downscaled.insert(scale, (target, packed_map));
                 }
 
                 // 2. Pack all blurred items across all downscale factors into tightly-packed
@@ -611,8 +774,8 @@ pub fn apply_together(
                 for item_idx in blur_order {
                     let item = &blur_items[item_idx];
                     let (fx, fy) = item.plan.factors;
-                    let sw = item.region.width / fx;
-                    let sh = item.region.height / fy;
+                    let sw = (item.region.width / fx).max(1);
+                    let sh = (item.region.height / fy).max(1);
                     let pad_x = 2u32;
                     let pad_y = (item.gutter / fy).max(2);
                     let (pw, ph) = (sw + pad_x * 2, sh + pad_y * 2);
@@ -643,7 +806,8 @@ pub fn apply_together(
                         bw.next_multiple_of(128).max(128).min(max_size),
                         bh.next_multiple_of(128).max(128).min(max_size),
                     );
-                    // Horizontal pass: group by source scale so all scales share 1 pass.
+                    // Horizontal pass: group by source scale and sort by kernel offset so
+                    // identical blur kernels draw in a single `draw_indexed` call.
                     let mut h_by_scale: BTreeMap<(u32, u32), Vec<(usize, Region)>> = BTreeMap::new();
                     for &(item_idx, slot) in &b_batch {
                         h_by_scale
@@ -653,30 +817,37 @@ pub fn apply_together(
                     }
                     let mut h_draws = vec![];
                     for (factors, items) in h_by_scale {
-                        let source_size = if factors == (1, 1) {
-                            current.size
+                        let (source_size, ds_map) = if factors == (1, 1) {
+                            (current_size, None)
                         } else {
-                            downscaled[&factors].size
+                            let (src, map) = &downscaled[&factors];
+                            (src.size, Some(map))
                         };
                         let texel = [1.0 / source_size.0 as f32, 0.0];
                         let mut uniforms = Uniforms::new(descriptors);
-                        let offsets: Vec<u32> = items
+                        let mut sorted: Vec<(u32, usize, Region)> = items
                             .iter()
-                            .map(|&(item_idx, _)| {
-                                uniforms.push(
+                            .map(|&(item_idx, slot)| {
+                                let off = uniforms.push(
                                     &kernel_uniform(texel, &blur_items[item_idx].plan.kernels[0]),
                                     KERNEL_UNIFORM_SIZE as usize,
-                                )
+                                );
+                                (off, item_idx, slot)
                             })
                             .collect();
-                        let vertices: Vec<_> = items
+                        sorted.sort_by_key(|&(off, _, _)| off);
+                        let offsets: Vec<u32> = sorted.iter().map(|&(off, _, _)| off).collect();
+                        let vertices: Vec<_> = sorted
                             .iter()
-                            .flat_map(|&(item_idx, slot)| {
-                                let src = blur_items[item_idx]
-                                    .region
-                                    .scaled(factors)
-                                    .normalized(source_size);
-                                quad(slot.normalized(blur_size), src)
+                            .flat_map(|&(_, item_idx, slot)| {
+                                let src_region = match ds_map {
+                                    Some(map) => map[&blur_items[item_idx].batch_index],
+                                    None => blur_items[item_idx].region,
+                                };
+                                quad(
+                                    slot.normalized(blur_size),
+                                    src_region.normalized(source_size),
+                                )
                             })
                             .collect();
                         let u_buf = uniforms.buffer(&mut scratch, encoder, staging_belt);
@@ -689,9 +860,9 @@ pub fn apply_together(
                         let mut render_pass = clear_pass(encoder, &blur_h.texture.1);
                         for (factors, u_buf, v_buf, offsets) in &h_draws {
                             let source_view = if *factors == (1, 1) {
-                                &current.texture.1
+                                current_view
                             } else {
-                                &downscaled[factors].texture.1
+                                &downscaled[factors].0.texture.1
                             };
                             draw_kernel_quads(
                                 descriptors,
@@ -705,20 +876,23 @@ pub fn apply_together(
                         }
                     }
 
-                    // Vertical pass: all items live in `blur_h`, so 1 bind group & 1 pass.
+                    // Vertical pass: all items live in `blur_h`, sorted by kernel offset.
                     let blur_v = atlas_texture(descriptors, texture_pool, blur_size);
                     let texel = [0.0, 1.0 / blur_size.1 as f32];
                     let mut v_uniforms = Uniforms::new(descriptors);
-                    let v_offsets: Vec<u32> = b_batch
+                    let mut v_sorted: Vec<(u32, Region)> = b_batch
                         .iter()
-                        .map(|&(item_idx, _)| {
-                            v_uniforms.push(
+                        .map(|&(item_idx, slot)| {
+                            let off = v_uniforms.push(
                                 &kernel_uniform(texel, &blur_items[item_idx].plan.kernels[1]),
                                 KERNEL_UNIFORM_SIZE as usize,
-                            )
+                            );
+                            (off, slot)
                         })
                         .collect();
-                    let v_vertices: Vec<_> = b_batch
+                    v_sorted.sort_by_key(|&(off, _)| off);
+                    let v_offsets: Vec<u32> = v_sorted.iter().map(|&(off, _)| off).collect();
+                    let v_vertices: Vec<_> = v_sorted
                         .iter()
                         .flat_map(|&(_, slot)| {
                             let norm = slot.normalized(blur_size);
@@ -748,27 +922,65 @@ pub fn apply_together(
                 }
             }
 
-            // The step's results: blurs scaled back up, glows, color matrices, and
-            // bitmaps without a filter in this step copied.
-            let target = atlas_texture(descriptors, texture_pool, size);
+            // On step 0 all entries are still active and reuse the initial layout. On
+            // step > 0, repack only the remaining multi-filter entries tightly so we never
+            // allocate a giant atlas or copy-through already-finished 1-filter CABs.
+            let (dst_regions, target_size): (Vec<Region>, (u32, u32)) = if step == 0 {
+                (active.iter().map(|&(_, r, _)| r).collect(), current_size)
+            } else {
+                let mut order: Vec<usize> = (0..active.len()).collect();
+                order.sort_by_key(|&i| std::cmp::Reverse(active[i].1.height + active[i].2 * 2));
+                let mut regions_out = vec![
+                    Region {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    };
+                    active.len()
+                ];
+                let (mut rx, mut ry, mut r_row_h, mut r_used_w) = (0u32, 0u32, 0u32, 0u32);
+                for ai in order {
+                    let (_, src_region, gutter) = active[ai];
+                    let (w, h) = (src_region.width + gutter * 2, src_region.height + gutter * 2);
+                    if rx + w > max_size {
+                        (rx, ry, r_row_h) = (0, ry + r_row_h, 0);
+                    }
+                    regions_out[ai] = Region {
+                        x: rx + gutter,
+                        y: ry + gutter,
+                        width: src_region.width,
+                        height: src_region.height,
+                    };
+                    rx += w;
+                    r_used_w = r_used_w.max(rx);
+                    r_row_h = r_row_h.max(h);
+                }
+                let sz = (
+                    r_used_w.next_multiple_of(128).max(128).min(max_size),
+                    (ry + r_row_h).next_multiple_of(128).max(128).min(max_size),
+                );
+                (regions_out, sz)
+            };
+
+            // The step's results: blurs scaled back up, glows, and color matrices.
+            let target = atlas_texture(descriptors, texture_pool, target_size);
             let mut kernel_uniforms = Uniforms::new(descriptors);
             let mut other_uniforms = Uniforms::new(descriptors);
-            // Quads drawn with the kernel pipeline, by source texture (None: `current`).
-            let mut kernel_quads: BTreeMap<Option<usize>, Vec<[FilterVertex; 4]>> = BTreeMap::new();
-            // Glow quads grouped by `blurred_textures` index (usually just 0), with dynamic offset.
-            let mut glow_by_tex: BTreeMap<usize, (Vec<u32>, Vec<[FilterVertexWithBlur; 4]>)> =
+            let mut kernel_quads: BTreeMap<usize, Vec<[FilterVertex; 4]>> = BTreeMap::new();
+            let mut glow_by_tex: BTreeMap<usize, Vec<(u32, [FilterVertexWithBlur; 4])>> =
                 BTreeMap::new();
-            let mut color_matrix_offsets: Vec<u32> = vec![];
-            let mut color_matrix_quads: Vec<[FilterVertex; 4]> = vec![];
-            for (batch_index, &(index, region, _)) in batch.iter().enumerate() {
-                let corners = region.normalized(size);
+            let mut color_matrix_items: Vec<(u32, [FilterVertex; 4])> = vec![];
+            for (batch_index, &(index, src_region, _)) in active.iter().enumerate() {
+                let dst_corners = dst_regions[batch_index].normalized(target_size);
+                let src_corners = src_region.normalized(current_size);
                 match (entries[index].filters.get(step), blurred[batch_index]) {
                     (Some(Filter::BlurFilter(_)), Some((texture, small))) => {
                         let small_size = blurred_textures[texture].size;
                         kernel_quads
-                            .entry(Some(texture))
+                            .entry(texture)
                             .or_default()
-                            .push(quad(corners, small.normalized(small_size)));
+                            .push(quad(dst_corners, small.normalized(small_size)));
                     }
                     (Some(Filter::GlowFilter(filter)), Some((texture, small))) => {
                         let small_corners = small.normalized(blurred_textures[texture].size);
@@ -786,27 +998,21 @@ pub fn apply_together(
                         };
                         let offset = other_uniforms
                             .push(bytemuck::bytes_of(&uniform), size_of::<GlowUniform>());
-                        let entry = glow_by_tex.entry(texture).or_default();
-                        entry.0.push(offset);
-                        entry.1.push(std::array::from_fn(|i| FilterVertexWithBlur {
-                            position: corners[i],
-                            source_uv: corners[i],
-                            blur_uv: small_corners[i],
-                        }));
+                        glow_by_tex.entry(texture).or_default().push((
+                            offset,
+                            std::array::from_fn(|i| FilterVertexWithBlur {
+                                position: dst_corners[i],
+                                source_uv: src_corners[i],
+                                blur_uv: small_corners[i],
+                            }),
+                        ));
                     }
                     (Some(Filter::ColorMatrixFilter(filter)), _) => {
                         let offset = other_uniforms
                             .push(bytemuck::cast_slice(&filter.matrix), size_of::<[f32; 20]>());
-                        color_matrix_offsets.push(offset);
-                        color_matrix_quads.push(quad(corners, corners));
+                        color_matrix_items.push((offset, quad(dst_corners, src_corners)));
                     }
-                    (None, _) => {
-                        kernel_quads
-                            .entry(None)
-                            .or_default()
-                            .push(quad(corners, corners));
-                    }
-                    _ => unreachable!("only supported filters are batched"),
+                    _ => unreachable!("active entries always have a supported filter at step"),
                 }
             }
 
@@ -839,7 +1045,11 @@ pub fn apply_together(
             let glow_draws: Vec<_> = if let Some(ref u_buf) = other_uniforms_buf {
                 glow_by_tex
                     .into_iter()
-                    .map(|(texture, (offsets, quads))| {
+                    .map(|(texture, mut items)| {
+                        items.sort_by_key(|&(off, _)| off);
+                        let offsets: Vec<u32> = items.iter().map(|&(off, _)| off).collect();
+                        let quads: Vec<[FilterVertexWithBlur; 4]> =
+                            items.into_iter().map(|(_, q)| q).collect();
                         let v_buf = scratch.vertices(encoder, staging_belt, &quads);
                         let bind_group =
                             descriptors
@@ -852,7 +1062,7 @@ pub fn apply_together(
                                         wgpu::BindGroupEntry {
                                             binding: 0,
                                             resource: wgpu::BindingResource::TextureView(
-                                                &current.texture.1,
+                                                current_view,
                                             ),
                                         },
                                         wgpu::BindGroupEntry {
@@ -887,10 +1097,14 @@ pub fn apply_together(
             };
 
             let color_matrix = &descriptors.filters.color_matrix;
-            let cm_draw = if !color_matrix_quads.is_empty()
+            let cm_draw = if !color_matrix_items.is_empty()
                 && let Some(ref u_buf) = other_uniforms_buf
             {
-                let v_buf = scratch.vertices(encoder, staging_belt, &color_matrix_quads);
+                color_matrix_items.sort_by_key(|&(off, _)| off);
+                let offsets: Vec<u32> = color_matrix_items.iter().map(|&(off, _)| off).collect();
+                let quads: Vec<[FilterVertex; 4]> =
+                    color_matrix_items.into_iter().map(|(_, q)| q).collect();
+                let v_buf = scratch.vertices(encoder, staging_belt, &quads);
                 let bind_group = descriptors
                     .device
                     .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -899,7 +1113,7 @@ pub fn apply_together(
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&current.texture.1),
+                                resource: wgpu::BindingResource::TextureView(current_view),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
@@ -915,7 +1129,7 @@ pub fn apply_together(
                             },
                         ],
                     });
-                Some((bind_group, v_buf, color_matrix_offsets))
+                Some((bind_group, v_buf, offsets))
             } else {
                 None
             };
@@ -924,15 +1138,11 @@ pub fn apply_together(
                 let mut render_pass = clear_pass(encoder, &target.texture.1);
                 if let Some((copy, ref u_buf, ref verts)) = kernel_draws {
                     for (texture, count, vertices) in verts {
-                        let (source, sampler) = match texture {
-                            Some(texture) => (&blurred_textures[*texture].texture.1, linear),
-                            None => (&current.texture.1, nearest),
-                        };
                         draw_kernel_quads(
                             descriptors,
                             &mut render_pass,
-                            source,
-                            sampler,
+                            &blurred_textures[*texture].texture.1,
+                            linear,
                             u_buf,
                             vertices,
                             &vec![copy; *count],
@@ -940,49 +1150,114 @@ pub fn apply_together(
                     }
                 }
                 render_pass.set_index_buffer(
-                    descriptors.quad.indices.slice(..),
+                    descriptors.quad.batch_quad_indices.slice(..),
                     wgpu::IndexFormat::Uint32,
                 );
                 if !glow_draws.is_empty() {
                     render_pass.set_pipeline(glow.linear_pipeline(descriptors));
                     for (bind_group, v_buf, offsets) in &glow_draws {
                         render_pass.set_vertex_buffer(0, v_buf.slice(..));
-                        for (index, offset) in offsets.iter().enumerate() {
-                            render_pass.set_bind_group(0, bind_group, &[*offset]);
-                            render_pass.draw_indexed(0..6, index as i32 * 4, 0..1);
-                        }
+                        draw_batched_quads(&mut render_pass, bind_group, offsets);
                     }
                 }
                 if let Some((bind_group, v_buf, offsets)) = &cm_draw {
                     render_pass.set_pipeline(color_matrix.dynamic_pipeline(descriptors));
                     render_pass.set_vertex_buffer(0, v_buf.slice(..));
-                    for (index, offset) in offsets.iter().enumerate() {
-                        render_pass.set_bind_group(0, bind_group, &[*offset]);
-                        render_pass.draw_indexed(0..6, index as i32 * 4, 0..1);
-                    }
+                    draw_batched_quads(&mut render_pass, bind_group, offsets);
                 }
             }
-            current = target;
-        }
 
-        for &(index, region, _) in &batch {
-            let texture = &entries[index].texture;
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &current.texture.0,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: region.x,
-                        y: region.y,
-                        z: 0,
-                    },
-                    aspect: Default::default(),
-                },
-                texture.as_image_copy(),
-                texture.size(),
-            );
+            // Finalize entries whose last filter was `step`, and carry only multi-filter
+            // entries into `step + 1`.
+            let mut next_active = vec![];
+            let mut direct_count = 0u64;
+            let atlas_idx = direct_out.bind_groups.len();
+            for (batch_index, &(index, _, gutter)) in active.iter().enumerate() {
+                let dst_region = dst_regions[batch_index];
+                if entries[index].filters.len() == step + 1 {
+                    match entries[index].volatility {
+                        CacheVolatility::Subframe | CacheVolatility::Tick(_) => {
+                            let ptr = entries[index].handle_ptr;
+                            direct_out.slots.insert(
+                                ptr,
+                                (
+                                    atlas_idx,
+                                    dst_region.x,
+                                    dst_region.y,
+                                    target_size.0,
+                                    target_size.1,
+                                ),
+                            );
+                            direct_out.handles.insert(ptr, entries[index].handle.clone());
+                            if matches!(entries[index].volatility, CacheVolatility::Subframe) {
+                                direct_out.subframe_keys.push(ptr);
+                            }
+                            direct_count += 1;
+                        }
+                        CacheVolatility::Persistent => {
+                            let (uw, uh) = used_extent(&entries[index]);
+                            encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &target.texture.0,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d {
+                                        x: dst_region.x,
+                                        y: dst_region.y,
+                                        z: 0,
+                                    },
+                                    aspect: Default::default(),
+                                },
+                                entries[index].texture.as_image_copy(),
+                                wgpu::Extent3d {
+                                    width: uw,
+                                    height: uh,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    next_active.push((index, dst_region, gutter));
+                }
+            }
+
+            if direct_count > 0 {
+                let bind_group =
+                    descriptors
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            layout: &descriptors.bind_layouts.bitmap,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&target.texture.1),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(linear),
+                                },
+                            ],
+                            label: create_debug_label!("Filter atlas direct bind group").as_deref(),
+                        });
+                direct_out.textures.push(target.texture);
+                direct_out.bind_groups.push(bind_group);
+                crate::perf_counters::count_named_n("filter-atlas-direct", direct_count);
+                if next_active.is_empty() {
+                    break;
+                }
+                current_owned = None;
+                current_direct = Some((atlas_idx, target_size));
+                active = next_active;
+            } else {
+                if next_active.is_empty() {
+                    break;
+                }
+                current_owned = Some(target);
+                current_direct = None;
+                active = next_active;
+            }
         }
-        crate::perf_counters::count_named_n("filter-together", batch.len() as u64);
+        crate::perf_counters::count_named_n("filter-together", batch_len);
     }
     skipped
 }

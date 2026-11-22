@@ -2157,7 +2157,7 @@ impl Player {
     /// they're drawn again (see `Graphic::get_or_retessellate_handle`).
     fn evict_unused_tessellations(&mut self) {
         /// How long a tessellation is kept without being drawn.
-        const UNUSED_SECONDS: u32 = 120;
+        const UNUSED_SECONDS: u32 = 600;
         /// How often unused tessellations are looked for.
         const SWEEP_SECONDS: u32 = 5;
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -2259,6 +2259,7 @@ impl Player {
             view_matrix.a.abs().min(view_matrix.d.abs())
         });
         ruffle_render::filters::set_view_scale(Some(view_scale));
+        ruffle_render::filters::set_render_tick(crate::display_object::interpolation::tick());
         self.renderer
             .submit_frame(background_color, commands, cache_draws);
         ruffle_render::filters::set_view_scale(None);
