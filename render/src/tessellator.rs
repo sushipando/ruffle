@@ -57,6 +57,8 @@ impl ShapeTessellator {
         self.mesh = Vec::new();
         self.gradients = IndexSet::new();
         self.lyon_mesh = VertexBuffers::new();
+        let mut has_stroke = false;
+        let mut fill_aabbs: Vec<[f32; 4]> = Vec::new();
 
         for path in shape.paths {
             let (fill_style, lyon_path, next_is_stroke) = match &path {
@@ -162,8 +164,12 @@ impl ShapeTessellator {
                 self.mask_index_count = Some(self.lyon_mesh.indices.len() as u32);
             }
             self.is_stroke = next_is_stroke;
+            if next_is_stroke {
+                has_stroke = true;
+            }
             self.paths += 1;
 
+            let start_vertex = self.lyon_mesh.vertices.len();
             let mut buffers_builder =
                 BuffersBuilder::new(&mut self.lyon_mesh, RuffleVertexCtor { color });
             let result = match path {
@@ -229,6 +235,19 @@ impl ShapeTessellator {
             };
             match result {
                 Ok(_) => {
+                    if !next_is_stroke && !has_stroke {
+                        let new_verts = &self.lyon_mesh.vertices[start_vertex..];
+                        if let Some(first) = new_verts.first() {
+                            let mut aabb = [first.x, first.y, first.x, first.y];
+                            for v in &new_verts[1..] {
+                                aabb[0] = aabb[0].min(v.x);
+                                aabb[1] = aabb[1].min(v.y);
+                                aabb[2] = aabb[2].max(v.x);
+                                aabb[3] = aabb[3].max(v.y);
+                            }
+                            fill_aabbs.push(aabb);
+                        }
+                    }
                     if needs_flush {
                         // Non-solid color fills are isolated draw calls; flush immediately.
                         self.flush_draw(draw);
@@ -244,10 +263,32 @@ impl ShapeTessellator {
         // Flush the final pending draw.
         self.flush_draw(DrawType::Color);
 
+        let non_overlapping = if has_stroke {
+            false
+        } else if fill_aabbs.len() <= 1 {
+            true
+        } else if fill_aabbs.len() <= 32 {
+            // Multiple fills with disjoint bounding boxes cannot overlap any pixel.
+            let mut disjoint = true;
+            'pairs: for i in 0..fill_aabbs.len() {
+                let a = fill_aabbs[i];
+                for b in &fill_aabbs[i + 1..] {
+                    if a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3] {
+                        disjoint = false;
+                        break 'pairs;
+                    }
+                }
+            }
+            disjoint
+        } else {
+            false
+        };
+
         self.lyon_mesh = VertexBuffers::new();
         Mesh {
             draws: std::mem::take(&mut self.mesh),
             gradients: std::mem::take(&mut self.gradients).into_iter().collect(),
+            non_overlapping,
         }
     }
 
@@ -284,6 +325,9 @@ impl Default for ShapeTessellator {
 pub struct Mesh {
     pub draws: Vec<Draw>,
     pub gradients: Vec<Gradient>,
+    /// Whether this mesh contains no strokes and no two fill paths can overlap any pixel,
+    /// allowing it to be drawn directly with any blend mode without an offscreen layer.
+    pub non_overlapping: bool,
 }
 
 pub struct Draw {

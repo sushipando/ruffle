@@ -28,6 +28,8 @@ pub struct MeshData {
     pub buffer: wgpu::Buffer,
     /// The bounds of all vertices, as `(x_min, y_min, x_max, y_max)` in local pixels.
     pub bounds: Option<(f32, f32, f32, f32)>,
+    /// See `ruffle_render::tessellator::Mesh::non_overlapping`.
+    pub non_overlapping: bool,
 }
 
 /// A shape's mesh. With `PerfFlag::ParallelTessellation`, it's pending at first:
@@ -365,6 +367,7 @@ pub fn build_mesh(
         });
     }
 
+    let non_overlapping = lyon_mesh.non_overlapping;
     for draw in lyon_mesh.draws {
         let draw_id = draws.len();
         if let Some(draw) =
@@ -393,7 +396,7 @@ pub fn build_mesh(
         .map(|d| d.finish(descriptors, uniform_buffer.as_ref(), &gradients))
         .collect();
 
-    MeshData::new(draws, buffer, bounds)
+    MeshData::new(draws, buffer, bounds, non_overlapping)
 }
 
 /// The number of meshes and the size of their buffers (for `RUFFLE_PERF`).
@@ -405,6 +408,7 @@ impl MeshData {
         draws: Vec<Draw>,
         buffer: wgpu::Buffer,
         bounds: Option<(f32, f32, f32, f32)>,
+        non_overlapping: bool,
     ) -> Self {
         use std::sync::atomic::Ordering;
         MESH_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -413,6 +417,7 @@ impl MeshData {
             draws,
             buffer,
             bounds,
+            non_overlapping,
         }
     }
 }

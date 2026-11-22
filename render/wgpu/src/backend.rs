@@ -642,14 +642,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 )
                 && ruffle_render::filters::rendering_for_display();
 
-        // Cache entries whose contents are simple enough are all drawn together in an
-        // atlas, and copied into their textures (or drawn straight into the filter atlas
-        // when they're filtered together). They mustn't use other cache entries'
-        // textures, as those may not be drawn yet.
+        // Cache entries whose contents are simple enough are drawn together in an atlas
+        // per topological dependency level (so level-N entries can sample completed
+        // level-<N cache entries), and copied into their textures (or drawn straight into
+        // the filter atlas when they're filtered together).
         let is_atlased: Vec<bool> = cache_entries
             .iter()
-            .enumerate()
-            .map(|(index, entry)| {
+            .map(|entry| {
                 use ruffle_render::commands::Command;
                 let texture = as_texture(&entry.handle);
                 let (width, height) = (texture.texture.width(), texture.texture.height());
@@ -685,8 +684,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             "commands"
                         },
                     )
-                } else if !references[index].is_empty() {
-                    Some("nested")
                 } else {
                     None
                 };
@@ -714,41 +711,41 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             })
             .collect();
         let mut cache_entries: Vec<_> = cache_entries.into_iter().map(Some).collect();
-        let atlased: Vec<_> = cache_entries
-            .iter_mut()
-            .enumerate()
-            .filter(|&(index, _)| is_atlased[index] && !direct_to_filter_atlas[index])
-            .filter_map(|(_, entry)| {
-                let entry = entry.as_mut()?;
-                let texture = as_texture(&entry.handle);
-                Some(crate::surface::layer_atlas::LeafLayer {
-                    commands: std::mem::take(&mut entry.commands),
-                    origin: (0, 0),
-                    width: texture.texture.width(),
-                    height: texture.texture.height(),
-                    destination: Some(texture.texture.clone()),
-                })
-            })
-            .collect();
-        if !atlased.is_empty() {
-            drop(crate::surface::layer_atlas::render_leaf_layers(
-                atlased,
-                &self.descriptors,
-                &self.meshes,
-                &mut self.active_frame.staging_belt,
-                &self.active_frame.dynamic_transforms,
-                &mut self
-                    .profiler
-                    .scope("Draw to CABs", &mut self.active_frame.command_encoder),
-                &mut self.offscreen_texture_pool,
-                self.surface.quality(),
-            ));
-        }
 
         for level in 0..=max_level {
             let members: Vec<usize> = (0..levels.len())
                 .filter(|&index| levels[index] == level)
                 .collect();
+            let atlased: Vec<_> = members
+                .iter()
+                .copied()
+                .filter(|&index| is_atlased[index] && !direct_to_filter_atlas[index])
+                .filter_map(|index| {
+                    let entry = cache_entries[index].as_mut()?;
+                    let texture = as_texture(&entry.handle);
+                    Some(crate::surface::layer_atlas::LeafLayer {
+                        commands: std::mem::take(&mut entry.commands),
+                        origin: (0, 0),
+                        width: texture.texture.width(),
+                        height: texture.texture.height(),
+                        destination: Some(texture.texture.clone()),
+                    })
+                })
+                .collect();
+            if !atlased.is_empty() {
+                drop(crate::surface::layer_atlas::render_leaf_layers(
+                    atlased,
+                    &self.descriptors,
+                    &self.meshes,
+                    &mut self.active_frame.staging_belt,
+                    &self.active_frame.dynamic_transforms,
+                    &mut self
+                        .profiler
+                        .scope("Draw to CABs", &mut self.active_frame.command_encoder),
+                    &mut self.offscreen_texture_pool,
+                    self.surface.quality(),
+                ));
+            }
             let mut filter_groups: Vec<(Vec<Filter>, Vec<usize>)> = vec![];
             // Entries whose filters are applied together, whatever they are.
             let mut filtered_together: Vec<usize> = vec![];
@@ -1785,6 +1782,23 @@ impl AsyncSubmitter {
         std::thread::Builder::new()
             .name("ruffle-wgpu-submit".to_string())
             .spawn(move || {
+                // On Apple Silicon, default-QoS threads are often scheduled on E-cores
+                // and preempted by background work, turning ~2ms `encoder.finish()` into
+                // 6-14ms stalls that block the main thread. Request USER_INTERACTIVE QoS
+                // so submission stays on P-cores alongside the main render loop.
+                #[cfg(target_os = "macos")]
+                {
+                    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+                    unsafe extern "C" {
+                        fn pthread_set_qos_class_self_np(
+                            qos_class: u32,
+                            relative_priority: i32,
+                        ) -> i32;
+                    }
+                    unsafe {
+                        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                    }
+                }
                 for job in job_receiver {
                     match job {
                         SubmitJob::Frame(encoder, queue) => {

@@ -1134,6 +1134,48 @@ impl WgpuCommandHandler<'_, '_> {
 /// The blend mode to draw `commands` with directly, without a layer, if that gives the
 /// same result: when they're a single bitmap, or a single shape with a single fill,
 /// which affect each pixel at most once.
+fn command_screen_aabb(command: &Command) -> Option<[f32; 4]> {
+    let (local, matrix) = match command {
+        Command::RenderShape { shape, transform } => {
+            let mesh = as_mesh(shape);
+            if !(mesh.non_overlapping || (mesh.draws.len() == 1 && mesh.draws[0].single_fill)) {
+                return None;
+            }
+            let (x0, y0, x1, y1) = mesh.bounds?;
+            ((x0, y0, x1, y1), &transform.matrix)
+        }
+        Command::RenderBitmap {
+            transform, region, ..
+        } => {
+            let w = region.width() as f32;
+            let h = region.height() as f32;
+            ((0.0, 0.0, w, h), &transform.matrix)
+        }
+        _ => return None,
+    };
+    let (x0, y0, x1, y1) = local;
+    let tx = matrix.tx.to_pixels() as f32;
+    let ty = matrix.ty.to_pixels() as f32;
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        let sx = matrix.a * x + matrix.c * y + tx;
+        let sy = matrix.b * x + matrix.d * y + ty;
+        min_x = min_x.min(sx);
+        min_y = min_y.min(sy);
+        max_x = max_x.max(sx);
+        max_y = max_y.max(sy);
+    }
+    if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+        return None;
+    }
+    // Pad by 1px so adjacent shapes can't share an MSAA or bilinear-filtered pixel.
+    Some([min_x - 1.0, min_y - 1.0, max_x + 1.0, max_y + 1.0])
+}
+
 pub(crate) fn direct_blend_mode_for(
     descriptors: &Descriptors,
     commands: &CommandList,
@@ -1143,15 +1185,41 @@ pub(crate) fn direct_blend_mode_for(
     if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::DirectBlends) {
         return None;
     }
-    let [command] = commands.commands.as_slice() else {
-        return None;
-    };
-    let single_fill = match command {
-        Command::RenderShape { shape, .. } => {
-            let mesh = as_mesh(shape);
-            mesh.draws.len() == 1 && mesh.draws[0].single_fill
+    let single_fill = match commands.commands.as_slice() {
+        [command] => match command {
+            Command::RenderShape { shape, .. } => {
+                let mesh = as_mesh(shape);
+                mesh.non_overlapping || (mesh.draws.len() == 1 && mesh.draws[0].single_fill)
+            }
+            Command::RenderBitmap { .. } => true,
+            _ => false,
+        },
+        cmds if cmds.len() >= 2 && cmds.len() <= 16 => {
+            let mut aabbs = [[0.0f32; 4]; 16];
+            let mut ok = true;
+            for (i, cmd) in cmds.iter().enumerate() {
+                if let Some(aabb) = command_screen_aabb(cmd) {
+                    for prev in &aabbs[..i] {
+                        if aabb[0] < prev[2]
+                            && prev[0] < aabb[2]
+                            && aabb[1] < prev[3]
+                            && prev[1] < aabb[3]
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    aabbs[i] = aabb;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
         }
-        Command::RenderBitmap { .. } => true,
         _ => false,
     };
     if !single_fill {
