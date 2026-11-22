@@ -36,6 +36,9 @@ pub struct Surface {
     format: wgpu::TextureFormat,
     /// The pixel coordinate that maps to the top-left of this surface.
     origin: (i32, i32),
+    /// Optional scissor rectangle applied to draw passes (e.g. letterbox clipping when
+    /// resolving directly into the full-window swapchain texture).
+    scissor: Option<(u32, u32, u32, u32)>,
 }
 
 impl Surface {
@@ -65,6 +68,7 @@ impl Surface {
             pipelines,
             format: frame_buffer_format,
             origin: (0, 0),
+            scissor: None,
         }
     }
 
@@ -73,6 +77,12 @@ impl Surface {
     pub fn with_origin(mut self, origin: (i32, i32)) -> Self {
         self.origin = origin;
         self
+    }
+
+    /// Restricts drawing on this surface to `scissor` (`(x, y, width, height)`), leaving
+    /// pixels outside the scissor at the clear color.
+    pub fn set_scissor(&mut self, scissor: Option<(u32, u32, u32, u32)>) {
+        self.scissor = scissor;
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -326,6 +336,9 @@ impl Surface {
                             ..Default::default()
                         },
                     );
+                    if let Some((sx, sy, sw, sh)) = self.scissor {
+                        render_pass.set_scissor_rect(sx, sy, sw, sh);
+                    }
                     for blend in pending_blends.drain(..) {
                         self.draw_pending_blend(&mut render_pass, &blend, &target, descriptors);
                     }

@@ -41,6 +41,9 @@ pub struct GuiController {
     repaint_after: Duration,
     /// Whether egui drew anything (menu bar, context menu, dialogs, debug tools) last time.
     shows_ui: bool,
+    /// True after a frame bypassed `MovieView` by resolving directly into the swapchain,
+    /// so the next frame that needs `MovieView` (e.g. when an egui menu opens) redraws it.
+    movie_view_stale: bool,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
     movie_view_renderer: Arc<MovieViewRenderer>,
@@ -210,6 +213,7 @@ impl GuiController {
             last_update: Instant::now(),
             repaint_after: Duration::ZERO,
             shows_ui: true,
+            movie_view_stale: false,
             surface,
             surface_format,
             movie_view_renderer,
@@ -376,20 +380,25 @@ impl GuiController {
         }
     }
 
-    /// Runs the GUI, and presents a frame showing it over the movie (`movie_drawn` says
-    /// whether the movie was just drawn again). Returns how long it waited for a surface
-    /// texture to draw into, which is how long the frames presented before were still
-    /// waiting to be shown.
+    /// Runs the GUI and presents the frame (calling `render_movie` when the movie needs
+    /// to be drawn). Returns `(acquire_wait, movie_drawn)`.
     ///
+    /// When no egui UI or menu bar is shown and `DirectFrame` + `AsyncPresent` are active
+    /// on a non-sRGB surface, the movie resolves directly into the acquired swapchain
+    /// texture, skipping `MovieView` and the fullscreen `egui_render` pass completely.
     /// When neither the movie nor the GUI has anything new to show, nothing is presented.
     /// The frame is shown at `present_time` if given (see `MainWindow::present_time`),
     /// otherwise as soon as possible.
-    pub fn render(
+    pub fn render<F>(
         &mut self,
         mut player: Option<MutexGuard<Player>>,
-        movie_drawn: bool,
+        want_movie: bool,
         present_time: Option<Instant>,
-    ) -> Duration {
+        render_movie: F,
+    ) -> (Duration, bool)
+    where
+        F: FnOnce(&mut Player),
+    {
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let show_menu = self.window.fullscreen().is_none() && !self.no_gui;
         let mut full_output = self.egui_winit.egui_ctx().run_ui(raw_input, |ui| {
@@ -427,7 +436,8 @@ impl GuiController {
             .egui_winit
             .egui_ctx()
             .tessellate(full_output.shapes, full_output.pixels_per_point);
-        let showed_ui = std::mem::replace(&mut self.shows_ui, !clipped_primitives.is_empty());
+        let has_egui = !clipped_primitives.is_empty();
+        let showed_ui = std::mem::replace(&mut self.shows_ui, has_egui);
         // Texture updates don't need a frame to be presented (nor do they wait for one).
         for (id, image_deltas) in full_output.textures_delta.set.drain() {
             for image_delta in &image_deltas {
@@ -439,10 +449,112 @@ impl GuiController {
                 );
             }
         }
-        if !movie_drawn && !showed_ui && !self.shows_ui {
-            self.flush_deferred_movie(&mut player);
+        let need_movie = player.is_some() && (want_movie || (has_egui && self.movie_view_stale));
+        if !need_movie && !showed_ui && !self.shows_ui {
             self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-            return Duration::ZERO;
+            return (Duration::ZERO, false);
+        }
+
+        let can_direct_swapchain = need_movie
+            && !has_egui
+            && !show_menu
+            && self.height_offset() == 0.0
+            && !self.surface_format.is_srgb()
+            && cfg!(not(feature = "tracy_images"))
+            && ruffle_render::perf_flags::enabled(
+                ruffle_render::perf_flags::PerfFlag::DirectFrame,
+            )
+            && ruffle_render::perf_flags::enabled(
+                ruffle_render::perf_flags::PerfFlag::AsyncPresent,
+            );
+
+        let mut render_movie = Some(render_movie);
+        let mut movie_drawn = false;
+
+        if can_direct_swapchain {
+            self.pending_presents.wait();
+            let acquire_start = Instant::now();
+            let surface_texture = match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                state @ (wgpu::CurrentSurfaceTexture::Lost
+                | wgpu::CurrentSurfaceTexture::Outdated) => {
+                    tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
+                    self.reconfigure_surface();
+                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                    return (acquire_start.elapsed(), false);
+                }
+                wgpu::CurrentSurfaceTexture::Timeout => {
+                    tracing::warn!("Surface acquisition timed out, skipping a frame");
+                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                    return (acquire_start.elapsed(), false);
+                }
+                wgpu::CurrentSurfaceTexture::Occluded => {
+                    tracing::trace!("Surface is occluded, skipping a frame");
+                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                    return (acquire_start.elapsed(), false);
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    panic!("wgpu: Acquiring a texture failed with a validation error");
+                }
+            };
+            let acquire_wait = acquire_start.elapsed();
+            if surface_texture.texture.width() == self.size.width
+                && surface_texture.texture.height() == self.size.height
+                && let Some(ref mut p) = player
+                && let Some(renderer) =
+                    <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(p.renderer_mut())
+            {
+                let defer = ruffle_render::perf_flags::enabled(
+                    ruffle_render::perf_flags::PerfFlag::AsyncSubmit,
+                );
+                renderer.set_defer_submit(defer);
+                renderer.set_direct_output(Some(surface_texture.texture.clone()));
+                if let Some(f) = render_movie.take() {
+                    f(p);
+                }
+                let renderer =
+                    <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(p.renderer_mut())
+                        .expect("checked above");
+                renderer.set_direct_output(None);
+                self.window.pre_present_notify();
+                let queue = self.descriptors.queue.clone();
+                if renderer.has_deferred_frame() {
+                    let guard = self.pending_presents.start();
+                    renderer.submit_deferred_frame(
+                        Vec::new(),
+                        Some(Box::new(move || {
+                            ruffle_render_wgpu::backend::set_present_time(present_time);
+                            queue.present(surface_texture);
+                            drop(guard);
+                        })),
+                    );
+                } else {
+                    let guard = self.pending_presents.start();
+                    renderer.run_after_submissions(Box::new(move || {
+                        ruffle_render_wgpu::backend::set_present_time(present_time);
+                        queue.present(surface_texture);
+                        drop(guard);
+                    }));
+                }
+                self.movie_view_stale = true;
+                self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                #[cfg(feature = "tracy")]
+                tracing_tracy::client::frame_mark();
+                return (acquire_wait, true);
+            }
+            // Mid-resize mismatch: drop the mismatched swapchain texture and fall through.
+            drop(surface_texture);
+        }
+
+        if need_movie
+            && let Some(ref mut p) = player
+            && let Some(f) = render_movie.take()
+        {
+            self.begin_movie_render(p);
+            f(p);
+            self.movie_view_stale = false;
+            movie_drawn = true;
         }
 
         self.pending_presents.wait();
@@ -470,7 +582,7 @@ impl GuiController {
                 self.flush_deferred_movie(&mut player);
                 self.reconfigure_surface();
                 self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-                return acquire_start.elapsed();
+                return (acquire_start.elapsed(), movie_drawn);
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
                 // Acquiring the frame took too long (a full second, as of wgpu 29).
@@ -478,7 +590,7 @@ impl GuiController {
                 tracing::warn!("Surface acquisition timed out, skipping a frame");
                 self.flush_deferred_movie(&mut player);
                 self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-                return acquire_start.elapsed();
+                return (acquire_start.elapsed(), movie_drawn);
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
                 // The window is occluded (e.g. minimized or fully covered by
@@ -491,7 +603,7 @@ impl GuiController {
                 tracing::trace!("Surface is occluded, skipping a frame");
                 self.flush_deferred_movie(&mut player);
                 self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-                return acquire_start.elapsed();
+                return (acquire_start.elapsed(), movie_drawn);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 // Generic error, not much we can do.
@@ -513,7 +625,6 @@ impl GuiController {
         };
         let window_size = (self.size.width, self.size.height);
         let menu_height = self.height_offset() as f32;
-        let has_egui = !clipped_primitives.is_empty();
         let surface_view = surface_texture.texture.create_view(&Default::default());
 
         // Fast path: append `egui_render` directly onto the movie's deferred
@@ -677,7 +788,7 @@ impl GuiController {
             self.tracy_frame_captures.finish_frame();
         }
 
-        acquire_wait
+        (acquire_wait, movie_drawn)
     }
 
     /// Frees textures the GUI no longer uses: only after submitting the command buffers

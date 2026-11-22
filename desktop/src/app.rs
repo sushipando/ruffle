@@ -165,23 +165,33 @@ impl MainWindow {
             // refuses to reconfigure it to a zero size.
             if !self.minimized && !self.occluded {
                 let start = Instant::now();
-                let mut player = self.player.get();
-                let mut movie_drawn = false;
-                let mut present_time = None;
-                if let Some(ref mut player) = player
-                    // Even if the movie is paused, user interaction with debug tools can change the render output
-                    && (self.movie_dirty || player.needs_render() || !player.is_playing())
-                {
-                    self.movie_dirty = false;
-                    let frame_duration = player.frame_duration_seconds();
-                    player.set_render_fraction(self.render_fraction(frame_duration));
-                    present_time = self.present_time(frame_duration);
-                    self.gui.begin_movie_render(player);
-                    player.render();
-                    movie_drawn = true;
-                }
+                let player = self.player.get();
+                let (want_movie, render_fraction, present_time) = match player.as_deref() {
+                    Some(player)
+                        // Even if the movie is paused, user interaction with debug tools can change the render output
+                        if self.movie_dirty || player.needs_render() || !player.is_playing() =>
+                    {
+                        self.movie_dirty = false;
+                        let frame_duration = player.frame_duration_seconds();
+                        (
+                            true,
+                            self.render_fraction(frame_duration),
+                            self.present_time(frame_duration),
+                        )
+                    }
+                    Some(player) => {
+                        let frame_duration = player.frame_duration_seconds();
+                        (false, self.render_fraction(frame_duration), None)
+                    }
+                    None => (false, None, None),
+                };
 
-                let waited = self.gui.render(player, movie_drawn, present_time);
+                let (waited, movie_drawn) =
+                    self.gui
+                        .render(player, want_movie, present_time, |player| {
+                            player.set_render_fraction(render_fraction);
+                            player.render();
+                        });
                 // A frame drawn after it was to be shown is shown late (and the ones around
                 // it for longer): for `adapt_interpolation`, that's as bad as skipping it.
                 // Not one that waited for a surface texture: the frames before it were

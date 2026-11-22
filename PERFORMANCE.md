@@ -1724,6 +1724,23 @@ results:
   (−30%), reaches **130–137 fps** at **54–58% GPU** during 6× combat runs (and stays locked at
   72 fps with 0 dips to 48 fps even in extreme 494-`blend-trivial` combat cells).
 
+### 88. Direct-to-swapchain resolve skipping `egui_render` when no GUI is shown
+
+*Files: `desktop/src/gui/controller.rs`, `desktop/src/app.rs`, `render/wgpu/src/backend.rs` (`set_direct_output`), `render/wgpu/src/surface.rs` (`set_scissor`).*
+
+When fullscreen (no menu bar), no egui UI is visible (`clipped_primitives.is_empty()`), and the
+swapchain uses a non-sRGB format (`Bgra8Unorm` on macOS), `GuiController::render` now runs the
+egui UI check first, acquires the swapchain texture, and passes it via `set_direct_output` so
+`WgpuRenderBackend::submit_frame` resolves the main MSAA pass directly into the swapchain
+drawable (clearing letterbox bars to black and scissoring stage draws to `visible_region`),
+completely skipping both `MovieView` and the fullscreen `5120×1440` `egui_render` blit pass.
+A `movie_view_stale` flag ensures opening any menu/dialog redraws `MovieView` fresh behind it
+with zero stale frames, and rare top-level `ShaderBlend` frames fall back cleanly without
+requiring `TEXTURE_BINDING`/`COPY_SRC` on the swapchain (`framebufferOnly = YES` preserved on
+Metal). Cuts frame resolve/blit DRAM traffic in half (**58.5 MB → 29.5 MB/fr**) and removes one
+full-window render pass per frame (verified in 20p `yulgar-2` with exact letterbox and sRGB
+colors: ~0.35–0.5 ms/fr GPU saved over `MovieView` + `egui_render`, ~0.9 ms/fr vs `direct-frame 0`).
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
