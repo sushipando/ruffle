@@ -103,3 +103,27 @@ fn kernel_fragment(in: filter__VertexOutput) -> @location(0) vec4<f32> {
     // This rounding imitates the fixed-point computations of FP, improving emulation accuracy.
     return floor(total * 255.0) / 255.0;
 }
+
+@fragment
+fn kernel_fragment_alpha_from_rgba(in: filter__VertexOutput) -> @location(0) f32 {
+    let direction = vec2<f32>(kernel.dir_x, kernel.dir_y);
+    var total = 0.0;
+    for (var i = 0u; i < kernel.count; i += 2u) {
+        let pair = kernel.taps[i / 2u];
+        total += textureSample(texture, texture_sampler, in.uv + direction * pair.x).a * pair.y;
+        total += textureSample(texture, texture_sampler, in.uv + direction * pair.z).a * pair.w;
+    }
+    return floor(total * 255.0) / 255.0;
+}
+
+@fragment
+fn kernel_fragment_alpha_from_r(in: filter__VertexOutput) -> @location(0) f32 {
+    let direction = vec2<f32>(kernel.dir_x, kernel.dir_y);
+    var total = 0.0;
+    for (var i = 0u; i < kernel.count; i += 2u) {
+        let pair = kernel.taps[i / 2u];
+        total += textureSample(texture, texture_sampler, in.uv + direction * pair.x).r * pair.y;
+        total += textureSample(texture, texture_sampler, in.uv + direction * pair.z).r * pair.w;
+    }
+    return floor(total * 255.0) / 255.0;
+}

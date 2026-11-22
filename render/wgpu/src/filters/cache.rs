@@ -19,28 +19,31 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use swf::Color;
 
-/// Maximum VRAM retained by the small/medium tier (<= 384x384 px = <= 576 KB/frame).
-/// Isolated from large entries so giant full-avatar/wings loops can never starve dozens
-/// of smaller glowing weapons, flames, eyes, and runes that save far more passes per MB.
-const SMALL_MAX_BYTES: usize = 192 * 1024 * 1024;
+/// Maximum VRAM retained by the small/medium keyframe tier (<= 384x384 px = <= 576 KB/frame).
+/// Isolated from both large entries and interpolated subframes so giant wings or 6x-volume
+/// subframe animations can never starve dozens of smaller glowing weapons, flames, and runes.
+const SMALL_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// Pixel area threshold separating the small/medium tier from the large tier (384x384).
 const SMALL_MAX_PIXELS: u64 = 384 * 384;
-/// Maximum VRAM retained by the large tier (384x384 < pixels <= 1024x1024).
-const LARGE_MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Maximum VRAM retained by the large keyframe tier (384x384 < pixels <= 1024x1024).
+const LARGE_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Dedicated VRAM tier for interpolated subframe CABs (<= 384x384 px), isolated from the
+/// keyframe tiers so 5x-per-tick subframe volume never evicts or blocks keyframe promotions.
+const SUBFRAME_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum single CAB pixel area eligible for caching (1024x1024 = 4 MB).
 const MAX_ENTRY_PIXELS: u64 = 1024 * 1024;
 /// Maximum single CAB pixel area eligible for promoting interpolated subframes (384x384,
-/// matching the isolated small/medium tier so large animations are never affected).
+/// matching the dedicated subframe tier).
 pub const SUBFRAME_PROMOTE_MAX_PIXELS: u64 = SMALL_MAX_PIXELS;
 /// Maximum command count per CAB eligible for canonical key serialization.
-const MAX_COMMANDS: usize = 128;
+const MAX_COMMANDS: usize = 256;
 /// Evict cached textures unused for this many submitted frames (~12-25 s).
 const MAX_IDLE_FRAMES: u64 = 1800;
 /// Refuse to evict a cached entry used within this many frames (~3-5 s) so active loops
 /// stay pinned at 100% hit rate instead of thrashing when a room exceeds the tier budget.
 const HOT_WINDOW_FRAMES: u64 = 360;
 /// Size of the 2-hit admission filter (only promote keys seen at least twice).
-const SEEN_CAPACITY: usize = 8192;
+const SEEN_CAPACITY: usize = 16384;
 
 /// Exact canonical content key for a pure-vector filtered CAB.
 /// Comparing `payload` byte-for-byte eliminates hash-collision bugs completely.
@@ -399,6 +402,7 @@ pub struct FilteredCabCache {
     seen: LruCache<u64, ()>,
     small: CabTier,
     large: CabTier,
+    subframe: CabTier,
     frame: u64,
 }
 
@@ -414,6 +418,7 @@ impl FilteredCabCache {
             seen: LruCache::new(NonZeroUsize::new(SEEN_CAPACITY).unwrap()),
             small: CabTier::new(SMALL_MAX_BYTES),
             large: CabTier::new(LARGE_MAX_BYTES),
+            subframe: CabTier::new(SUBFRAME_MAX_BYTES),
             frame: 0,
         }
     }
@@ -427,6 +432,7 @@ impl FilteredCabCache {
         self.seen.clear();
         self.small.clear();
         self.large.clear();
+        self.subframe.clear();
     }
 
     pub fn begin_frame(&mut self) {
@@ -434,22 +440,28 @@ impl FilteredCabCache {
         // Evict up to 8 stale entries per tier per frame so room-hopping frees VRAM smoothly.
         self.small.expire_stale(self.frame, &mut self.seen);
         self.large.expire_stale(self.frame, &mut self.seen);
+        self.subframe.expire_stale(self.frame, &mut self.seen);
     }
 
     pub fn get(&mut self, key: &CabContentKey) -> Option<&CachedCabTexture> {
         let frame = self.frame;
         if Self::is_small(key.used_size) {
-            self.small.get(key, frame)
+            if let Some(hit) = self.small.get(key, frame) {
+                return Some(hit);
+            }
+            self.subframe.get(key, frame)
         } else {
             self.large.get(key, frame)
         }
     }
 
-    /// Returns whether there is room in the entry's size tier to promote `used_size`
+    /// Returns whether there is room in the entry's tier to promote `used_size`
     /// without evicting any currently-hot looping entry (used within `HOT_WINDOW_FRAMES`).
-    pub fn can_promote(&self, used_size: (u32, u32)) -> bool {
+    pub fn can_promote(&self, used_size: (u32, u32), is_subframe: bool) -> bool {
         let bytes = used_size.0 as usize * used_size.1 as usize * 4;
-        if Self::is_small(used_size) {
+        if is_subframe {
+            Self::is_small(used_size) && self.subframe.can_promote(bytes, self.frame)
+        } else if Self::is_small(used_size) {
             self.small.can_promote(bytes, self.frame)
         } else {
             self.large.can_promote(bytes, self.frame)
@@ -458,10 +470,26 @@ impl FilteredCabCache {
 
     /// 2-hit admission filter: returns `true` if this key's hash was already seen before
     /// AND the entry's tier has cold space to promote it without thrashing hot entries.
-    pub fn should_promote(&mut self, key: &CabContentKey, used_size: (u32, u32)) -> bool {
+    pub fn should_promote(
+        &mut self,
+        key: &CabContentKey,
+        used_size: (u32, u32),
+        is_subframe: bool,
+    ) -> bool {
         let h = key.fast_hash();
         if self.seen.get(&h).is_some() {
-            self.can_promote(used_size)
+            let ok = self.can_promote(used_size, is_subframe);
+            if !ok {
+                let counter = if is_subframe {
+                    "cab-miss/subframe-full"
+                } else if Self::is_small(used_size) {
+                    "cab-miss/small-full"
+                } else {
+                    "cab-miss/large-full"
+                };
+                crate::perf_counters::count_named(counter);
+            }
+            ok
         } else {
             self.seen.put(h, ());
             false
@@ -515,8 +543,20 @@ impl FilteredCabCache {
         texture: wgpu::Texture,
         bind_group: wgpu::BindGroup,
         used_size: (u32, u32),
+        is_subframe: bool,
     ) {
-        if Self::is_small(used_size) {
+        if is_subframe {
+            if Self::is_small(used_size) {
+                self.subframe.insert(
+                    key,
+                    texture,
+                    bind_group,
+                    used_size,
+                    self.frame,
+                    &mut self.seen,
+                );
+            }
+        } else if Self::is_small(used_size) {
             self.small
                 .insert(key, texture, bind_group, used_size, self.frame, &mut self.seen);
         } else {

@@ -44,10 +44,9 @@ const MAX_KERNEL_TAPS: usize = 256;
 /// The size of `struct Kernel` in `blur.wgsl`.
 pub(super) const KERNEL_UNIFORM_SIZE: u64 = 16 + 16 * (MAX_KERNEL_TAPS as u64 / 2);
 
-/// Combines `passes` box blurs of `strength` (as `BlurFilter::apply_full` does them, one
-/// after the other) into one kernel. Returns its taps as `(offset, weight)`, each sampling
-/// between two neighboring texels with bilinear filtering, or `None` if there are too many.
-pub(super) fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> {
+/// Builds the raw 1D convolved kernel of `passes` box blurs of `strength`.
+/// Always has odd length `2 * R + 1` centered at `kernel.len() / 2`.
+fn raw_kernel(strength: f32, passes: u8) -> Vec<f64> {
     // See `apply_full` for what these mean.
     let full_size = strength.min(255.0);
     let radius = (full_size - 1.0) / 2.0;
@@ -68,6 +67,14 @@ pub(super) fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> 
         }
         kernel = next;
     }
+    kernel
+}
+
+/// Combines `passes` box blurs of `strength` (as `BlurFilter::apply_full` does them, one
+/// after the other) into one kernel. Returns its taps as `(offset, weight)`, each sampling
+/// between two neighboring texels with bilinear filtering, or `None` if there are too many.
+pub(super) fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> {
+    let kernel = raw_kernel(strength, passes);
     if kernel.len().div_ceil(2) > MAX_KERNEL_TAPS {
         return None;
     }
@@ -85,6 +92,30 @@ pub(super) fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> 
                         weight as f32,
                     ]
                 })
+            })
+            .collect(),
+    )
+}
+
+/// Like `merged_kernel`, but keeps every tap at an exact integer offset (unpaired) so that
+/// sampling a 2×2-higher-resolution source with a bilinear sampler at `2 * k + 1` computes
+/// the exact 2×2 box average in hardware without a separate `(2, 2)` downscale pass.
+pub(super) fn unpaired_kernel(
+    strength: f32,
+    passes: u8,
+    max_taps: usize,
+) -> Option<Vec<[f32; 2]>> {
+    let kernel = raw_kernel(strength, passes);
+    if kernel.len() > max_taps.min(MAX_KERNEL_TAPS) {
+        return None;
+    }
+    let center = (kernel.len() / 2) as f64;
+    Some(
+        kernel
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, weight)| {
+                (weight > 0.0).then(|| [(index as f64 - center) as f32, weight as f32])
             })
             .collect(),
     )
@@ -130,6 +161,8 @@ pub struct BlurFilter {
     pub(super) dynamic_kernel_bind_group_layout: wgpu::BindGroupLayout,
     dynamic_kernel_pipeline_layout: wgpu::PipelineLayout,
     dynamic_kernel_pipeline: OnceLock<wgpu::RenderPipeline>,
+    dynamic_kernel_r8_from_rgba_pipeline: OnceLock<wgpu::RenderPipeline>,
+    dynamic_kernel_r8_from_r_pipeline: OnceLock<wgpu::RenderPipeline>,
 }
 
 impl BlurFilter {
@@ -253,6 +286,8 @@ impl BlurFilter {
             dynamic_kernel_bind_group_layout,
             dynamic_kernel_pipeline_layout,
             dynamic_kernel_pipeline: Default::default(),
+            dynamic_kernel_r8_from_rgba_pipeline: Default::default(),
+            dynamic_kernel_r8_from_r_pipeline: Default::default(),
             pipelines: Default::default(),
             pipeline_layout,
             vertex_buffer,
@@ -275,30 +310,77 @@ impl BlurFilter {
         descriptors: &Descriptors,
     ) -> &wgpu::RenderPipeline {
         self.dynamic_kernel_pipeline.get_or_init(|| {
-            descriptors
-                .device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: create_debug_label!("Blur Filter (dynamic kernel)").as_deref(),
-                    layout: Some(&self.dynamic_kernel_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &descriptors.shaders.blur_filter,
-                        entry_point: Some("kernel_vertex"),
-                        buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS,
-                        compilation_options: Default::default(),
-                    },
-                    primitive: Default::default(),
-                    depth_stencil: None,
-                    multisample: Default::default(),
-                    fragment: Some(wgpu::FragmentState {
-                        module: &descriptors.shaders.blur_filter,
-                        entry_point: Some("kernel_fragment"),
-                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
-                        compilation_options: Default::default(),
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
+            self.create_dynamic_kernel_pipeline(
+                descriptors,
+                "Blur Filter (dynamic kernel)",
+                "kernel_fragment",
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
         })
+    }
+
+    /// Alpha-only dynamic kernel pipeline: samples `.a` from an `Rgba8Unorm` source and
+    /// writes blurred alpha to an `R8Unorm` target.
+    pub(super) fn dynamic_kernel_r8_from_rgba_pipeline(
+        &self,
+        descriptors: &Descriptors,
+    ) -> &wgpu::RenderPipeline {
+        self.dynamic_kernel_r8_from_rgba_pipeline.get_or_init(|| {
+            self.create_dynamic_kernel_pipeline(
+                descriptors,
+                "Blur Filter (dynamic kernel R8 from RGBA)",
+                "kernel_fragment_alpha_from_rgba",
+                wgpu::TextureFormat::R8Unorm,
+            )
+        })
+    }
+
+    /// Alpha-only dynamic kernel pipeline: samples `.r` from an `R8Unorm` source and
+    /// writes blurred alpha to an `R8Unorm` target.
+    pub(super) fn dynamic_kernel_r8_from_r_pipeline(
+        &self,
+        descriptors: &Descriptors,
+    ) -> &wgpu::RenderPipeline {
+        self.dynamic_kernel_r8_from_r_pipeline.get_or_init(|| {
+            self.create_dynamic_kernel_pipeline(
+                descriptors,
+                "Blur Filter (dynamic kernel R8 from R8)",
+                "kernel_fragment_alpha_from_r",
+                wgpu::TextureFormat::R8Unorm,
+            )
+        })
+    }
+
+    fn create_dynamic_kernel_pipeline(
+        &self,
+        descriptors: &Descriptors,
+        label: &str,
+        fragment_entry: &str,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        descriptors
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: create_debug_label!("{}", label).as_deref(),
+                layout: Some(&self.dynamic_kernel_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &descriptors.shaders.blur_filter,
+                    entry_point: Some("kernel_vertex"),
+                    buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS,
+                    compilation_options: Default::default(),
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &descriptors.shaders.blur_filter,
+                    entry_point: Some(fragment_entry),
+                    targets: &[Some(format.into())],
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
     }
 
     fn kernel_pipeline(

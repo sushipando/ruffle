@@ -978,6 +978,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 wgpu::Texture,
                 wgpu::BindGroup,
                 (u32, u32),
+                bool,
             )> = Vec::new();
             let mut pending_persistent_keys: Vec<(usize, crate::filters::CabContentKey)> =
                 Vec::new();
@@ -1054,7 +1055,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 {
                     let leader_persistent = filtered_together_entries[leader_ft_idx].volatility
                         == CacheVolatility::Persistent;
-                    if leader_persistent == is_persistent {
+                    // Same-volatility duplicates always share; a Persistent follower can also
+                    // copy directly from a Tick/Subframe leader's finished atlas slot.
+                    if leader_persistent == is_persistent || is_persistent {
                         entry.commands.commands.clear();
                         dedup_followers.push((
                             leader_ft_idx,
@@ -1072,16 +1075,26 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 let ft_idx = filtered_together_entries.len();
                 let mut promote_copy = None;
                 if let Some(key) = content_key {
-                    let promote_eligible = entry.volatility != CacheVolatility::Subframe
+                    let is_subframe = entry.volatility == CacheVolatility::Subframe;
+                    let promote_eligible = !is_subframe
                         || u64::from(used_size.0) * u64::from(used_size.1)
                             <= crate::filters::SUBFRAME_PROMOTE_MAX_PIXELS;
-                    if promote_eligible && self.cab_cache.should_promote(&key, used_size) {
+                    if promote_eligible
+                        && self.cab_cache.should_promote(&key, used_size, is_subframe)
+                    {
                         let (tex, bg) = crate::filters::FilteredCabCache::allocate_texture(
                             &self.descriptors,
                             used_size,
                         );
                         promote_copy = Some(tex.clone());
-                        pending_promotions.push((ft_idx, key.clone(), tex, bg, used_size));
+                        pending_promotions.push((
+                            ft_idx,
+                            key.clone(),
+                            tex,
+                            bg,
+                            used_size,
+                            is_subframe,
+                        ));
                     }
                     if is_persistent {
                         pending_persistent_keys.push((ft_idx, key.clone()));
@@ -1300,9 +1313,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             .borrow_mut() = Some(key);
                     }
                 }
-                for (ft_idx, key, tex, bg, used_size) in pending_promotions {
+                for (ft_idx, key, tex, bg, used_size, is_subframe) in pending_promotions {
                     if !skipped.contains(&ft_idx) {
-                        self.cab_cache.insert(key, tex, bg, used_size);
+                        self.cab_cache.insert(key, tex, bg, used_size, is_subframe);
                         crate::perf_counters::count_named("cab-lru/promote");
                     }
                 }
@@ -1310,9 +1323,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     dedup_followers
                 {
                     let leader = &filtered_together[leader_ft_idx];
-                    if volatility != CacheVolatility::Persistent
-                        && !skipped.contains(&leader_ft_idx)
-                    {
+                    let leader_skipped = skipped.contains(&leader_ft_idx);
+                    if volatility != CacheVolatility::Persistent && !leader_skipped {
                         let aliased = self.filter_atlas.alias_slot(
                             leader.handle_ptr,
                             handle,
@@ -1321,18 +1333,28 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         );
                         debug_assert!(aliased);
                     } else {
-                        self.active_frame.command_encoder.copy_texture_to_texture(
-                            leader.texture.as_image_copy(),
-                            tex.as_image_copy(),
-                            wgpu::Extent3d {
-                                width: used_size.0,
-                                height: used_size.1,
-                                depth_or_array_layers: 1,
-                            },
-                        );
+                        let copied_from_atlas = !leader_skipped
+                            && leader.volatility != CacheVolatility::Persistent
+                            && self.filter_atlas.copy_slot_to_texture(
+                                &mut self.active_frame.command_encoder,
+                                leader.handle_ptr,
+                                &tex,
+                                used_size,
+                            );
+                        if !copied_from_atlas {
+                            self.active_frame.command_encoder.copy_texture_to_texture(
+                                leader.texture.as_image_copy(),
+                                tex.as_image_copy(),
+                                wgpu::Extent3d {
+                                    width: used_size.0,
+                                    height: used_size.1,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                        }
                         if volatility == CacheVolatility::Persistent {
                             *as_texture(&handle).last_cab_key.borrow_mut() =
-                                (!skipped.contains(&leader_ft_idx)).then_some(key);
+                                (!leader_skipped).then_some(key);
                         }
                     }
                 }
