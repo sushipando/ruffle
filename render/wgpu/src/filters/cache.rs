@@ -19,23 +19,31 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use swf::Color;
 
-/// Maximum VRAM retained by cached filtered CAB textures (192 MB).
-const MAX_CACHE_BYTES: usize = 192 * 1024 * 1024;
+/// Maximum VRAM retained by the small/medium tier (<= 384x384 px = <= 576 KB/frame).
+/// Isolated from large entries so giant full-avatar/wings loops can never starve dozens
+/// of smaller glowing weapons, flames, eyes, and runes that save far more passes per MB.
+const SMALL_MAX_BYTES: usize = 192 * 1024 * 1024;
+/// Pixel area threshold separating the small/medium tier from the large tier (384x384).
+const SMALL_MAX_PIXELS: u64 = 384 * 384;
+/// Maximum VRAM retained by the large tier (384x384 < pixels <= 1024x1024).
+const LARGE_MAX_BYTES: usize = 128 * 1024 * 1024;
 /// Maximum single CAB pixel area eligible for caching (1024x1024 = 4 MB).
 const MAX_ENTRY_PIXELS: u64 = 1024 * 1024;
+/// Maximum single CAB pixel area eligible for promoting interpolated subframes (256x256).
+pub const SUBFRAME_PROMOTE_MAX_PIXELS: u64 = 256 * 256;
 /// Maximum command count per CAB eligible for canonical key serialization.
 const MAX_COMMANDS: usize = 128;
 /// Evict cached textures unused for this many submitted frames (~12-25 s).
 const MAX_IDLE_FRAMES: u64 = 1800;
 /// Refuse to evict a cached entry used within this many frames (~3-5 s) so active loops
-/// stay pinned at 100% hit rate instead of thrashing when a room exceeds `MAX_CACHE_BYTES`.
+/// stay pinned at 100% hit rate instead of thrashing when a room exceeds the tier budget.
 const HOT_WINDOW_FRAMES: u64 = 360;
 /// Size of the 2-hit admission filter (only promote keys seen at least twice).
-const SEEN_CAPACITY: usize = 4096;
+const SEEN_CAPACITY: usize = 8192;
 
 /// Exact canonical content key for a pure-vector filtered CAB.
 /// Comparing `payload` byte-for-byte eliminates hash-collision bugs completely.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct CabContentKey {
     used_size: (u32, u32),
     quality: u8,
@@ -265,10 +273,106 @@ pub struct CachedCabTexture {
     last_used_frame: u64,
 }
 
-pub struct FilteredCabCache {
-    seen: LruCache<u64, ()>,
+struct CabTier {
     entries: LruCache<CabContentKey, CachedCabTexture>,
     total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl CabTier {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+
+    fn expire_stale(&mut self, frame: u64, seen: &mut LruCache<u64, ()>) {
+        for _ in 0..8 {
+            let expired = self.entries.peek_lru().is_some_and(|(_, entry)| {
+                frame.saturating_sub(entry.last_used_frame) > MAX_IDLE_FRAMES
+            });
+            if expired {
+                if let Some((evicted_key, evicted)) = self.entries.pop_lru() {
+                    seen.pop(&evicted_key.fast_hash());
+                    self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn get(&mut self, key: &CabContentKey, frame: u64) -> Option<&CachedCabTexture> {
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used_frame = frame;
+        Some(entry)
+    }
+
+    fn can_promote(&self, bytes: usize, frame: u64) -> bool {
+        if bytes > self.max_bytes {
+            return false;
+        }
+        if self.total_bytes + bytes <= self.max_bytes {
+            return true;
+        }
+        self.entries.peek_lru().is_some_and(|(_, oldest)| {
+            frame.saturating_sub(oldest.last_used_frame) > HOT_WINDOW_FRAMES
+        })
+    }
+
+    fn insert(
+        &mut self,
+        key: CabContentKey,
+        texture: wgpu::Texture,
+        bind_group: wgpu::BindGroup,
+        used_size: (u32, u32),
+        frame: u64,
+        seen: &mut LruCache<u64, ()>,
+    ) {
+        let bytes = used_size.0 as usize * used_size.1 as usize * 4;
+        if bytes > self.max_bytes {
+            return;
+        }
+        while self.total_bytes + bytes > self.max_bytes {
+            let can_evict = self.entries.peek_lru().is_some_and(|(_, oldest)| {
+                frame.saturating_sub(oldest.last_used_frame) > HOT_WINDOW_FRAMES
+            });
+            if !can_evict {
+                return;
+            }
+            let Some((evicted_key, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            seen.pop(&evicted_key.fast_hash());
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes);
+        }
+        if let Some(old) = self.entries.put(
+            key,
+            CachedCabTexture {
+                texture,
+                bind_group,
+                used_size,
+                bytes,
+                last_used_frame: frame,
+            },
+        ) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.bytes);
+        }
+        self.total_bytes += bytes;
+    }
+}
+
+pub struct FilteredCabCache {
+    seen: LruCache<u64, ()>,
+    small: CabTier,
+    large: CabTier,
     frame: u64,
 }
 
@@ -282,61 +386,52 @@ impl FilteredCabCache {
     pub fn new() -> Self {
         Self {
             seen: LruCache::new(NonZeroUsize::new(SEEN_CAPACITY).unwrap()),
-            entries: LruCache::unbounded(),
-            total_bytes: 0,
+            small: CabTier::new(SMALL_MAX_BYTES),
+            large: CabTier::new(LARGE_MAX_BYTES),
             frame: 0,
         }
     }
 
+    #[inline]
+    fn is_small(used_size: (u32, u32)) -> bool {
+        u64::from(used_size.0) * u64::from(used_size.1) <= SMALL_MAX_PIXELS
+    }
+
     pub fn clear(&mut self) {
         self.seen.clear();
-        self.entries.clear();
-        self.total_bytes = 0;
+        self.small.clear();
+        self.large.clear();
     }
 
     pub fn begin_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
-        // Evict up to 16 stale entries per frame so room-hopping frees VRAM smoothly.
-        for _ in 0..16 {
-            let expired = self
-                .entries
-                .peek_lru()
-                .is_some_and(|(_, entry)| self.frame.saturating_sub(entry.last_used_frame) > MAX_IDLE_FRAMES);
-            if expired {
-                if let Some((evicted_key, evicted)) = self.entries.pop_lru() {
-                    self.seen.pop(&evicted_key.fast_hash());
-                    self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes);
-                }
-            } else {
-                break;
-            }
-        }
+        // Evict up to 8 stale entries per tier per frame so room-hopping frees VRAM smoothly.
+        self.small.expire_stale(self.frame, &mut self.seen);
+        self.large.expire_stale(self.frame, &mut self.seen);
     }
 
     pub fn get(&mut self, key: &CabContentKey) -> Option<&CachedCabTexture> {
         let frame = self.frame;
-        let entry = self.entries.get_mut(key)?;
-        entry.last_used_frame = frame;
-        Some(entry)
+        if Self::is_small(key.used_size) {
+            self.small.get(key, frame)
+        } else {
+            self.large.get(key, frame)
+        }
     }
 
-    /// Returns whether there is room to promote an entry of `used_size` without evicting
-    /// any currently-hot looping entry (used within `HOT_WINDOW_FRAMES`).
+    /// Returns whether there is room in the entry's size tier to promote `used_size`
+    /// without evicting any currently-hot looping entry (used within `HOT_WINDOW_FRAMES`).
     pub fn can_promote(&self, used_size: (u32, u32)) -> bool {
         let bytes = used_size.0 as usize * used_size.1 as usize * 4;
-        if bytes > MAX_CACHE_BYTES {
-            return false;
+        if Self::is_small(used_size) {
+            self.small.can_promote(bytes, self.frame)
+        } else {
+            self.large.can_promote(bytes, self.frame)
         }
-        if self.total_bytes + bytes <= MAX_CACHE_BYTES {
-            return true;
-        }
-        self.entries
-            .peek_lru()
-            .is_some_and(|(_, oldest)| self.frame.saturating_sub(oldest.last_used_frame) > HOT_WINDOW_FRAMES)
     }
 
     /// 2-hit admission filter: returns `true` if this key's hash was already seen before
-    /// AND the cache has cold space to promote it without thrashing hot entries.
+    /// AND the entry's tier has cold space to promote it without thrashing hot entries.
     pub fn should_promote(&mut self, key: &CabContentKey, used_size: (u32, u32)) -> bool {
         let h = key.fast_hash();
         if self.seen.get(&h).is_some() {
@@ -395,35 +490,12 @@ impl FilteredCabCache {
         bind_group: wgpu::BindGroup,
         used_size: (u32, u32),
     ) {
-        let bytes = used_size.0 as usize * used_size.1 as usize * 4;
-        if bytes > MAX_CACHE_BYTES {
-            return;
+        if Self::is_small(used_size) {
+            self.small
+                .insert(key, texture, bind_group, used_size, self.frame, &mut self.seen);
+        } else {
+            self.large
+                .insert(key, texture, bind_group, used_size, self.frame, &mut self.seen);
         }
-        while self.total_bytes + bytes > MAX_CACHE_BYTES {
-            let can_evict = self.entries.peek_lru().is_some_and(|(_, oldest)| {
-                self.frame.saturating_sub(oldest.last_used_frame) > HOT_WINDOW_FRAMES
-            });
-            if !can_evict {
-                return;
-            }
-            let Some((evicted_key, evicted)) = self.entries.pop_lru() else {
-                break;
-            };
-            self.seen.pop(&evicted_key.fast_hash());
-            self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes);
-        }
-        if let Some(old) = self.entries.put(
-            key,
-            CachedCabTexture {
-                texture,
-                bind_group,
-                used_size,
-                bytes,
-                last_used_frame: self.frame,
-            },
-        ) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.bytes);
-        }
-        self.total_bytes += bytes;
     }
 }

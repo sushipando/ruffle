@@ -473,6 +473,10 @@ pub struct DisplayObjectBase<'gc> {
 
     /// Movie tick when this object's own matrix or color transform last changed.
     last_transform_tick: Cell<u32>,
+
+    /// Movie tick when this object's linear matrix (`a, b, c, d`), `tz`, or color transform
+    /// last changed (pure `(tx, ty)` translation does not bump this).
+    last_linear_transform_tick: Cell<u32>,
 }
 
 /// Total GPU texture bytes currently allocated to automatic static-subtree caches.
@@ -494,6 +498,8 @@ struct AutoCache {
     viewport_bounds: Rectangle<Twips>,
     /// Stage background color if cached as bottom-most backdrop, else `None`.
     backdrop_clear: Option<Color>,
+    /// True if the cached bounds were clipped against `viewport_bounds` (disables translation reuse).
+    clipped: bool,
     bytes: usize,
 }
 
@@ -521,6 +527,10 @@ struct CachedChildRun {
     children: Vec<RunChildKey>,
     bitmap: BitmapInfo,
     origin: Point<i32>,
+    /// Container world translation `(tx, ty)` when this run was rasterized.
+    parent_tx: Point<Twips>,
+    /// True if any child in the run was clipped against `viewport_bounds`.
+    clipped: bool,
     bytes: usize,
 }
 
@@ -548,7 +558,8 @@ pub(crate) struct ActiveChildRun {
     pub(crate) start_idx: usize,
     pub(crate) end_idx: usize,
     pub(crate) bitmap: BitmapInfo,
-    pub(crate) origin: Point<i32>,
+    pub(crate) draw_pos: Point<Twips>,
+    pub(crate) subpixel_shifted: bool,
 }
 
 struct DisplayObjectBaseMut {
@@ -628,6 +639,7 @@ impl Default for DisplayObjectBase<'_> {
             scaling_grid: Default::default(),
             last_invalidated_tick: Cell::new(interpolation::tick()),
             last_transform_tick: Cell::new(interpolation::tick()),
+            last_linear_transform_tick: Cell::new(interpolation::tick()),
         }
     }
 }
@@ -650,6 +662,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let tick = interpolation::tick();
         self.last_invalidated_tick.set(tick);
         self.last_transform_tick.set(tick);
+        self.last_linear_transform_tick.set(tick);
         self.clear_auto_cache();
     }
 
@@ -702,8 +715,13 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_matrix(&self, matrix: Matrix) {
-        if self.matrix.get() != matrix {
-            self.last_transform_tick.set(interpolation::tick());
+        let old = self.matrix.get();
+        if old != matrix {
+            let tick = interpolation::tick();
+            self.last_transform_tick.set(tick);
+            if old.a != matrix.a || old.b != matrix.b || old.c != matrix.c || old.d != matrix.d {
+                self.last_linear_transform_tick.set(tick);
+            }
         }
         self.before_transform_change();
         self.matrix.set(matrix);
@@ -717,7 +735,9 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     pub fn set_color_transform(&self, color_transform: ColorTransform) {
         if self.color_transform.get() != color_transform {
-            self.last_transform_tick.set(interpolation::tick());
+            let tick = interpolation::tick();
+            self.last_transform_tick.set(tick);
+            self.last_linear_transform_tick.set(tick);
         }
         self.before_transform_change();
         self.color_transform.set(color_transform);
@@ -775,6 +795,11 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_z(&self, tz: f64) -> bool {
         let changed = self.tz.get() != tz;
+        if changed {
+            let tick = interpolation::tick();
+            self.last_transform_tick.set(tick);
+            self.last_linear_transform_tick.set(tick);
+        }
         self.set_transformed_by_script(true);
         self.tz.set(tz);
         changed
@@ -853,7 +878,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.c = (scale_y * -sin_y) as f32;
         matrix.d = (scale_y * cos_y) as f32;
         if changed {
-            self.last_transform_tick.set(interpolation::tick());
+            let tick = interpolation::tick();
+            self.last_transform_tick.set(tick);
+            self.last_linear_transform_tick.set(tick);
         }
         self.before_transform_change();
         self.matrix.set(matrix);
@@ -869,7 +896,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_scale_x(&self, mut value: Percent) -> bool {
         let changed = self.scale_x.get() != value;
         if changed {
-            self.last_transform_tick.set(interpolation::tick());
+            let tick = interpolation::tick();
+            self.last_transform_tick.set(tick);
+            self.last_linear_transform_tick.set(tick);
         }
         self.set_transformed_by_script(true);
         self.cache_scale_rotation();
@@ -908,7 +937,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_scale_y(&self, mut value: Percent) -> bool {
         let changed = self.scale_y.get() != value;
         if changed {
-            self.last_transform_tick.set(interpolation::tick());
+            let tick = interpolation::tick();
+            self.last_transform_tick.set(tick);
+            self.last_linear_transform_tick.set(tick);
         }
         self.set_transformed_by_script(true);
         self.cache_scale_rotation();
@@ -973,7 +1004,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut tf = self.color_transform.get();
         let changed = tf.a_multiply != value;
         if changed {
-            self.last_transform_tick.set(interpolation::tick());
+            let tick = interpolation::tick();
+            self.last_transform_tick.set(tick);
+            self.last_linear_transform_tick.set(tick);
         }
         tf.a_multiply = value;
         self.before_transform_change();
@@ -1317,6 +1350,8 @@ struct AutoCacheDraw {
     base_matrix: Matrix,
     color_transform: ColorTransform,
     origin: Point<i32>,
+    draw_pos: Point<Twips>,
+    subpixel_shifted: bool,
     clear: Color,
 }
 
@@ -1485,6 +1520,21 @@ fn ancestors_transform_stable<'gc>(
     true
 }
 
+fn ancestors_linear_transform_stable<'gc>(
+    obj: DisplayObject<'gc>,
+    tick: u32,
+    required_ticks: u32,
+) -> bool {
+    let mut anc = obj.parent();
+    while let Some(p) = anc {
+        if tick.wrapping_sub(p.base().last_linear_transform_tick.get()) < required_ticks {
+            return false;
+        }
+        anc = p.parent();
+    }
+    true
+}
+
 fn try_auto_cache<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -1539,27 +1589,44 @@ fn try_auto_cache<'gc>(
         && this.scroll_rect().is_none()
         && stage_bg.is_some();
 
-    // Fast path: check existing auto-cache hit.
+    // Fast path: check existing auto-cache hit (allowing pure-translation reuse when the
+    // cached bitmap was not viewport-clipped and does not bake the stage backdrop).
     {
         let base = this.base();
         let mut cell = base.cell.borrow_mut();
         if let Some(auto) = &cell.auto_cache {
-            let valid = auto.matrix == base_transform.matrix
+            let linear_same = auto.matrix.a == base_transform.matrix.a
+                && auto.matrix.b == base_transform.matrix.b
+                && auto.matrix.c == base_transform.matrix.c
+                && auto.matrix.d == base_transform.matrix.d;
+            let dx = base_transform.matrix.tx - auto.matrix.tx;
+            let dy = base_transform.matrix.ty - auto.matrix.ty;
+            let exact_tx = dx == Twips::ZERO && dy == Twips::ZERO;
+            let matrix_ok =
+                linear_same && (exact_tx || (!auto.clipped && auto.backdrop_clear.is_none()));
+            let valid = matrix_ok
                 && auto.color_transform == base_transform.color_transform
                 && auto.viewport_bounds == viewport_bounds
                 && (auto.backdrop_clear.is_none()
                     || (is_backdrop && auto.backdrop_clear == stage_bg));
             if valid {
+                let draw_pos = Point::new(
+                    Twips::from_pixels_i32(auto.origin.x) + dx,
+                    Twips::from_pixels_i32(auto.origin.y) + dy,
+                );
+                let subpixel_shifted = dx.get() % 20 != 0 || dy.get() % 20 != 0;
                 return Some(AutoCacheDraw {
                     bitmap: auto.bitmap.clone(),
                     dirty: false,
                     base_matrix: base_transform.matrix,
                     color_transform: base_transform.color_transform,
                     origin: auto.origin,
+                    draw_pos,
+                    subpixel_shifted,
                     clear: auto.backdrop_clear.unwrap_or(Color::TRANSPARENT),
                 });
             }
-            // Matrix, color, viewport, or backdrop changed: evict and wait for stability again.
+            // Linear matrix, color, viewport, or backdrop changed: evict and wait for stability again.
             cell.auto_cache = None;
             cell.auto_cache_evictions = cell.auto_cache_evictions.saturating_add(1);
             cell.auto_cache_rejected = false;
@@ -1584,12 +1651,12 @@ fn try_auto_cache<'gc>(
 
     let tick = interpolation::tick();
     let last_inv = this.base().last_invalidated_tick.get();
-    let last_tx = this.base().last_transform_tick.get();
+    let last_lin = this.base().last_linear_transform_tick.get();
     let evictions = this.base().cell.borrow().auto_cache_evictions.min(3);
     let required_ticks = AUTO_CACHE_STABLE_TICKS << evictions;
     if tick.wrapping_sub(last_inv) < required_ticks
-        || tick.wrapping_sub(last_tx) < required_ticks
-        || !ancestors_transform_stable(this, tick, required_ticks)
+        || tick.wrapping_sub(last_lin) < required_ticks
+        || !ancestors_linear_transform_stable(this, tick, required_ticks)
     {
         return None;
     }
@@ -1656,15 +1723,35 @@ fn try_auto_cache<'gc>(
     let vp_y0 = viewport_bounds.y_min.to_pixels().floor() as i32;
     let vp_x1 = viewport_bounds.x_max.to_pixels().ceil() as i32;
     let vp_y1 = viewport_bounds.y_max.to_pixels().ceil() as i32;
-    let x0 = (bounds.x_min.to_pixels().floor() as i32 - 2).max(vp_x0);
-    let y0 = (bounds.y_min.to_pixels().floor() as i32 - 2).max(vp_y0);
-    let x1 = (bounds.x_max.to_pixels().ceil() as i32 + 2).min(vp_x1);
-    let y1 = (bounds.y_max.to_pixels().ceil() as i32 + 2).min(vp_y1);
+    let raw_x0 = bounds.x_min.to_pixels().floor() as i32 - 2;
+    let raw_y0 = bounds.y_min.to_pixels().floor() as i32 - 2;
+    let raw_x1 = bounds.x_max.to_pixels().ceil() as i32 + 2;
+    let raw_y1 = bounds.y_max.to_pixels().ceil() as i32 + 2;
+    let x0 = raw_x0.max(vp_x0);
+    let y0 = raw_y0.max(vp_y0);
+    let x1 = raw_x1.min(vp_x1);
+    let y1 = raw_y1.min(vp_y1);
+    let clipped = raw_x0 < vp_x0 || raw_y0 < vp_y0 || raw_x1 > vp_x1 || raw_y1 > vp_y1;
     if x1 <= x0 || y1 <= y0 {
         // Off-screen right now: back off for another stability window so we don't re-walk
         // this subtree on every single frame while it stays off-screen.
         this.base().last_invalidated_tick.set(tick);
         return None;
+    }
+    let backdrop_clear = if has_non_normal_blend && is_backdrop {
+        stage_bg
+    } else {
+        None
+    };
+    // Clipped or backdrop-baked caches cannot be reused across translation, so don't
+    // promote them while the object or an ancestor is actively translating.
+    if clipped || backdrop_clear.is_some() {
+        let translation_stable =
+            tick.wrapping_sub(this.base().last_transform_tick.get()) >= required_ticks
+                && ancestors_transform_stable(this, tick, required_ticks);
+        if !translation_stable {
+            return None;
+        }
     }
     let width = (x1 - x0) as u32;
     let height = (y1 - y0) as u32;
@@ -1690,11 +1777,6 @@ fn try_auto_cache<'gc>(
         height,
     };
     let origin = Point::new(x0, y0);
-    let backdrop_clear = if has_non_normal_blend && is_backdrop {
-        stage_bg
-    } else {
-        None
-    };
     this.base().cell.borrow_mut().auto_cache = Some(AutoCache {
         bitmap: bitmap.clone(),
         matrix: base_transform.matrix,
@@ -1702,6 +1784,7 @@ fn try_auto_cache<'gc>(
         origin,
         viewport_bounds,
         backdrop_clear,
+        clipped,
         bytes,
     });
     Some(AutoCacheDraw {
@@ -1710,6 +1793,8 @@ fn try_auto_cache<'gc>(
         base_matrix: base_transform.matrix,
         color_transform: base_transform.color_transform,
         origin,
+        draw_pos: Point::new(Twips::from_pixels_i32(x0), Twips::from_pixels_i32(y0)),
+        subpixel_shifted: false,
         clear: backdrop_clear.unwrap_or(Color::TRANSPARENT),
     })
 }
@@ -1781,8 +1866,10 @@ pub(crate) fn prepare_child_runs<'gc>(
     let viewport_bounds = context.stage.viewport_view_bounds();
     let tick = interpolation::tick();
 
-    // Fast path: validate existing runs without cloning child lists.
+    // Fast path: validate existing runs without cloning child lists (allowing pure-translation
+    // reuse of unclipped runs when the container translates smoothly).
     let mut should_scan = false;
+    let mut parent_translation_stable = true;
     let mut active = Vec::new();
     {
         let base = container_obj.base();
@@ -1796,11 +1883,14 @@ pub(crate) fn prepare_child_runs<'gc>(
             last_scan_tick: tick,
             evictions: 0,
         });
-        let parent_unchanged = cr.parent_matrix == parent_tx.matrix
+        let parent_linear_same = cr.parent_matrix.a == parent_tx.matrix.a
+            && cr.parent_matrix.b == parent_tx.matrix.b
+            && cr.parent_matrix.c == parent_tx.matrix.c
+            && cr.parent_matrix.d == parent_tx.matrix.d
             && cr.parent_ct == parent_tx.color_transform
             && cr.viewport_bounds == viewport_bounds
             && cr.num_children == num_children;
-        if !parent_unchanged {
+        if !parent_linear_same {
             if !cr.runs.is_empty() {
                 cr.runs.clear();
                 cr.evictions = cr.evictions.saturating_add(1);
@@ -1814,7 +1904,10 @@ pub(crate) fn prepare_child_runs<'gc>(
             let raw = container.raw_container();
             let mut any_evicted = false;
             cr.runs.retain(|run| {
-                let valid = run.end_idx <= num_children
+                let exact_tx = run.parent_tx.x == parent_tx.matrix.tx
+                    && run.parent_tx.y == parent_tx.matrix.ty;
+                let valid = (!run.clipped || exact_tx)
+                    && run.end_idx <= num_children
                     && (run.start_idx..run.end_idx)
                         .zip(run.children.iter())
                         .all(|(i, key)| {
@@ -1830,11 +1923,17 @@ pub(crate) fn prepare_child_runs<'gc>(
                 cr.last_scan_tick = tick;
             }
             for run in &cr.runs {
+                let dx = parent_tx.matrix.tx - run.parent_tx.x;
+                let dy = parent_tx.matrix.ty - run.parent_tx.y;
                 active.push(ActiveChildRun {
                     start_idx: run.start_idx,
                     end_idx: run.end_idx,
                     bitmap: run.bitmap.clone(),
-                    origin: run.origin,
+                    draw_pos: Point::new(
+                        Twips::from_pixels_i32(run.origin.x) + dx,
+                        Twips::from_pixels_i32(run.origin.y) + dy,
+                    ),
+                    subpixel_shifted: dx.get() % 20 != 0 || dy.get() % 20 != 0,
                 });
             }
         }
@@ -1843,9 +1942,12 @@ pub(crate) fn prepare_child_runs<'gc>(
         {
             let required_ticks = AUTO_CACHE_STABLE_TICKS << cr.evictions.min(3);
             if tick.wrapping_sub(cr.last_scan_tick) >= required_ticks
-                && tick.wrapping_sub(base.last_transform_tick.get()) >= required_ticks
-                && ancestors_transform_stable(container_obj, tick, required_ticks)
+                && tick.wrapping_sub(base.last_linear_transform_tick.get()) >= required_ticks
+                && ancestors_linear_transform_stable(container_obj, tick, required_ticks)
             {
+                parent_translation_stable =
+                    tick.wrapping_sub(base.last_transform_tick.get()) >= required_ticks
+                        && ancestors_transform_stable(container_obj, tick, required_ticks);
                 cr.last_scan_tick = tick;
                 should_scan = true;
             }
@@ -1884,6 +1986,7 @@ pub(crate) fn prepare_child_runs<'gc>(
         y0: i32,
         x1: i32,
         y1: i32,
+        clipped: bool,
         sum_area: u64,
     }
     let mut open: Option<OpenRun> = None;
@@ -1898,6 +2001,7 @@ pub(crate) fn prepare_child_runs<'gc>(
             || run.cost < AUTO_CACHE_MIN_COST
             || run.x1 <= run.x0
             || run.y1 <= run.y0
+            || (run.clipped && !parent_translation_stable)
         {
             return;
         }
@@ -1971,6 +2075,8 @@ pub(crate) fn prepare_child_runs<'gc>(
                 height,
             },
             origin,
+            parent_tx: Point::new(parent_tx.matrix.tx, parent_tx.matrix.ty),
+            clipped: run.clipped,
             bytes,
         });
     };
@@ -2047,19 +2153,24 @@ pub(crate) fn prepare_child_runs<'gc>(
         let child_tx = base.transform(true);
         let child_world = parent_tx.matrix * child_tx.matrix;
         let bounds = child.render_bounds_with_transform(&child_world, true, &stage_view);
-        let (cx0, cy0, cx1, cy1, carea) = if bounds.is_valid() {
-            let x0 = (bounds.x_min.to_pixels().floor() as i32 - 2).max(vp_x0);
-            let y0 = (bounds.y_min.to_pixels().floor() as i32 - 2).max(vp_y0);
-            let x1 = (bounds.x_max.to_pixels().ceil() as i32 + 2).min(vp_x1);
-            let y1 = (bounds.y_max.to_pixels().ceil() as i32 + 2).min(vp_y1);
+        let (cx0, cy0, cx1, cy1, cclipped, carea) = if bounds.is_valid() {
+            let raw_x0 = bounds.x_min.to_pixels().floor() as i32 - 2;
+            let raw_y0 = bounds.y_min.to_pixels().floor() as i32 - 2;
+            let raw_x1 = bounds.x_max.to_pixels().ceil() as i32 + 2;
+            let raw_y1 = bounds.y_max.to_pixels().ceil() as i32 + 2;
+            let x0 = raw_x0.max(vp_x0);
+            let y0 = raw_y0.max(vp_y0);
+            let x1 = raw_x1.min(vp_x1);
+            let y1 = raw_y1.min(vp_y1);
+            let clipped = raw_x0 < vp_x0 || raw_y0 < vp_y0 || raw_x1 > vp_x1 || raw_y1 > vp_y1;
             if x1 > x0 && y1 > y0 {
                 let a = (x1 - x0) as u64 * (y1 - y0) as u64;
-                (x0, y0, x1, y1, a)
+                (x0, y0, x1, y1, clipped, a)
             } else {
-                (0, 0, 0, 0, 0)
+                (0, 0, 0, 0, clipped, 0)
             }
         } else {
-            (0, 0, 0, 0, 0)
+            (0, 0, 0, 0, false, 0)
         };
 
         if let Some(run) = &mut open {
@@ -2067,6 +2178,7 @@ pub(crate) fn prepare_child_runs<'gc>(
                 run.end_idx = idx + 1;
                 run.visible_count += 1;
                 run.cost += child_cost;
+                run.clipped |= cclipped;
             } else {
                 let (ux0, uy0, ux1, uy1) = if run.x1 > run.x0 && run.y1 > run.y0 {
                     (
@@ -2091,6 +2203,7 @@ pub(crate) fn prepare_child_runs<'gc>(
                     run.y0 = uy0;
                     run.x1 = ux1;
                     run.y1 = uy1;
+                    run.clipped |= cclipped;
                     run.sum_area = new_sum;
                 } else {
                     flush_run(&mut open, &mut new_runs, context);
@@ -2103,6 +2216,7 @@ pub(crate) fn prepare_child_runs<'gc>(
                         y0: cy0,
                         x1: cx1,
                         y1: cy1,
+                        clipped: cclipped,
                         sum_area: carea,
                     });
                 }
@@ -2117,6 +2231,7 @@ pub(crate) fn prepare_child_runs<'gc>(
                 y0: cy0,
                 x1: cx1,
                 y1: cy1,
+                clipped: cclipped,
                 sum_area: carea,
             });
         }
@@ -2132,7 +2247,11 @@ pub(crate) fn prepare_child_runs<'gc>(
                     start_idx: run.start_idx,
                     end_idx: run.end_idx,
                     bitmap: run.bitmap.clone(),
-                    origin: run.origin,
+                    draw_pos: Point::new(
+                        Twips::from_pixels_i32(run.origin.x),
+                        Twips::from_pixels_i32(run.origin.y),
+                    ),
+                    subpixel_shifted: false,
                 });
                 cr.runs.push(run);
             }
@@ -2898,16 +3017,17 @@ pub fn render_base<'gc>(
                 context.commands.render_bitmap(
                     auto_draw.bitmap.handle,
                     Transform {
-                        matrix: Matrix::translate(
-                            Twips::from_pixels_i32(auto_draw.origin.x),
-                            Twips::from_pixels_i32(auto_draw.origin.y),
-                        ),
+                        matrix: Matrix::translate(auto_draw.draw_pos.x, auto_draw.draw_pos.y),
                         color_transform: Default::default(),
                         perspective_projection: None,
                         tz: 0.0,
                     },
-                    false,
-                    PixelSnapping::Always,
+                    auto_draw.subpixel_shifted,
+                    if auto_draw.subpixel_shifted {
+                        PixelSnapping::Never
+                    } else {
+                        PixelSnapping::Always
+                    },
                     region,
                 );
             },

@@ -610,15 +610,19 @@ pub trait TDisplayObjectContainer<'gc>:
                         run.bitmap.handle.clone(),
                         ruffle_render::transform::Transform {
                             matrix: ruffle_render::matrix::Matrix::translate(
-                                swf::Twips::from_pixels_i32(run.origin.x),
-                                swf::Twips::from_pixels_i32(run.origin.y),
+                                run.draw_pos.x,
+                                run.draw_pos.y,
                             ),
                             color_transform: Default::default(),
                             perspective_projection: None,
                             tz: 0.0,
                         },
-                        false,
-                        ruffle_render::bitmap::PixelSnapping::Always,
+                        run.subpixel_shifted,
+                        if run.subpixel_shifted {
+                            ruffle_render::bitmap::PixelSnapping::Never
+                        } else {
+                            ruffle_render::bitmap::PixelSnapping::Always
+                        },
                         region,
                     );
                     skip_until = run.end_idx;

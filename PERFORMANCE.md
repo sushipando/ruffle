@@ -1848,6 +1848,59 @@ CPU preparation and the next swapchain slot.
   `yulgar` held **72.0 fps** at **56–63% GPU** (`2.31–2.81 ms` CPU render) and stepped up to
   **108.9 fps** (`62%` GPU, `10.0` passes). All 151 Metal `visual/` regression tests pass.
 
+### 93. Two-tier `FilteredCabCache`, `Subframe` lookup/promotion, and same-handle skip
+
+*Files: `render/wgpu/src/filters/cache.rs`, `render/wgpu/src/filters.rs`,
+`render/wgpu/src/lib.rs`, `render/wgpu/src/backend.rs`, `render/wgpu/src/pixel_bender.rs`,
+`render/wgpu/src/context3d/mod.rs`.*
+
+Diagnostic miss counters in live 20p `yulgar` showed that **50–60%** of remaining
+`filter-together` misses (`cab-miss/full = 5.1–9.7/fr`) happened because one or two large
+(`512×512–1024×1024`) looping glow/wing animations consumed most of the single 192 MB
+`FilteredCabCache` and stayed pinned under `HOT_WINDOW_FRAMES`, starving 10+ smaller
+(`<= 384×384`) glowing cosmetics that save ~20× more filter passes per MB. Another
+`1.9–2.8/fr` missed because `CacheVolatility::Subframe` entries skipped `cab_cache` lookup
+and promotion completely.
+
+* Split `FilteredCabCache` into two isolated LRU tiers: a **192 MB small/medium tier**
+  (`<= 384×384` px) that large animations can never evict, and a **128 MB large tier**
+  (`384×384 < pixels <= 1024×1024`), and raised the 2-hit admission filter (`SEEN_CAPACITY`)
+  from `4096` to `8192`.
+* Enabled `cab_cache.get(key)` for all volatilities including `CacheVolatility::Subframe`,
+  and allowed repeating small `Subframe` entries (`<= 256×256`) to promote via the 2-hit
+  admission filter into the small tier.
+* Stored `last_cab_key: RefCell<Option<CabContentKey>>` directly on `Texture` (100% ABA-safe
+  and cleared on any non-keyed texture write), letting `Persistent` CABs whose inputs match
+  their existing GPU texture skip `filter_together`, `cab_cache`, and texture copies with
+  zero GPU work (`cab-same/hit`).
+* Live Artix: in 20p `yulgar`, `cab-lru/hit` rose from **8.8–10.6 → 14.8–16.2/fr** and
+  `filter-together` fell to **10.5–11.3/fr**; in heavy 7-player `icestormunder` room 2
+  combat, `cab-lru/hit` reached **15.5–19.6/fr** (+`1–3` dedup, ~70% hit rate on 32.4
+  filtered CABs/fr), cutting 72 fps GPU busy to **34–36%**.
+
+### 94. Translation-invariant `AutoCache` and `ChildRunCache`
+
+*Files: `core/src/display_object.rs`, `core/src/display_object/container.rs`.*
+
+`AutoCache` (90–91) and `ChildRunCache` previously required exact `matrix` equality
+(including `tx, ty`) and gated promotion on `last_transform_tick`, so walking, bobbing, or
+breathing avatars and floating pets evicted or never promoted static sub-parts and their
+non-`Normal` (`Multiply`/`Overlay`/`Add`) shading layers.
+
+* Added `last_linear_transform_tick` to `DisplayObjectBase` (updated only on linear
+  `a, b, c, d`, `tz`, or color-transform changes, not pure `(tx, ty)` translation) and
+  `ancestors_linear_transform_stable`.
+* Recorded `clipped: bool` on `AutoCache` and `CachedChildRun` (plus `parent_tx` per run),
+  allowing unclipped non-backdrop caches to reuse their texture across pure `(tx, ty)`
+  translations (keeping pixel-exact nearest sampling at integer offsets and switching to
+  bilinear `PixelSnapping::Never` on fractional/interpolated offsets, while gating clipped
+  or backdrop-baked promotions on full translation stability).
+* Live Artix 20p `yulgar`: `blend-trivial` dropped **26.5–39.3 → 6.9–11.8/fr**
+  (`Multiply/small/1cmd` **5–10 → 0.0**, `Multiply/medium/1cmd` **18–26 → 4.5–6.0**),
+  render `targets` fell **5.5–5.6 → 3.9–4.5**, 72 fps GPU busy fell **56–63% → 48–54%**
+  (`3.18–3.68 → 2.80–3.15 ms/cmdbuf`), and CPU render dropped **2.31–2.81 → 1.93–2.30 ms**
+  (`18–21%` CPU busy). All 151 Metal `visual/` regression tests pass.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

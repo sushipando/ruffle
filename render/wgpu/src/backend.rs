@@ -922,6 +922,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 );
             }
             let mut filter_batched = vec![false; levels.len()];
+            let mut in_filtered_together = vec![false; levels.len()];
             for (_, group) in &filter_groups {
                 for &index in group {
                     filter_batched[index] = true;
@@ -929,6 +930,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             }
             for &index in &filtered_together {
                 filter_batched[index] = true;
+                in_filtered_together[index] = true;
             }
             let quality = self.surface.quality();
             let mut filtered_together_entries: Vec<crate::filters::FilterTogetherEntry> =
@@ -940,6 +942,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 wgpu::BindGroup,
                 (u32, u32),
             )> = Vec::new();
+            let mut pending_persistent_keys: Vec<(usize, crate::filters::CabContentKey)> =
+                Vec::new();
             let mut dedup_leaders: std::collections::HashMap<
                 crate::filters::CabContentKey,
                 usize,
@@ -951,6 +955,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 wgpu::Texture,
                 (u32, u32),
                 CacheVolatility,
+                crate::filters::CabContentKey,
             )> = Vec::new();
             for index in filtered_together {
                 let entry = cache_entries[index]
@@ -958,6 +963,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     .expect("entries are only taken once");
                 let handle_ptr = Arc::as_ptr(&entry.handle.0) as *const () as usize;
                 let used_size = used_sizes[index];
+                let is_persistent = entry.volatility == CacheVolatility::Persistent;
                 let content_key = if direct_to_filter_atlas[index] && entry.clear.a == 0 {
                     crate::filters::CabContentKey::try_from_entry(
                         used_size,
@@ -969,13 +975,21 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 } else {
                     None
                 };
-                let lru_eligible = entry.volatility != CacheVolatility::Subframe;
-                if lru_eligible
+                // Same-handle content-hash skip: if this Persistent CAB's GPU texture
+                // already holds the exact filtered result for `key`, skip all GPU work.
+                if is_persistent
                     && let Some(ref key) = content_key
+                    && as_texture(&entry.handle).last_cab_key.borrow().as_ref() == Some(key)
+                {
+                    entry.commands.commands.clear();
+                    crate::perf_counters::count_named("cab-same/hit");
+                    continue;
+                }
+                if let Some(ref key) = content_key
                     && let Some(cached) = self.cab_cache.get(key)
                 {
                     entry.commands.commands.clear();
-                    if entry.volatility != CacheVolatility::Persistent {
+                    if !is_persistent {
                         self.filter_atlas.insert_external_slot(
                             entry.handle.clone(),
                             handle_ptr,
@@ -993,6 +1007,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                                 depth_or_array_layers: 1,
                             },
                         );
+                        *as_texture(&entry.handle).last_cab_key.borrow_mut() = Some(key.clone());
                     }
                     crate::perf_counters::count_named("cab-lru/hit");
                     continue;
@@ -1002,8 +1017,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 {
                     let leader_persistent = filtered_together_entries[leader_ft_idx].volatility
                         == CacheVolatility::Persistent;
-                    let follower_persistent = entry.volatility == CacheVolatility::Persistent;
-                    if leader_persistent == follower_persistent {
+                    if leader_persistent == is_persistent {
                         entry.commands.commands.clear();
                         dedup_followers.push((
                             leader_ft_idx,
@@ -1012,6 +1026,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             cache_textures[index].clone(),
                             used_size,
                             entry.volatility,
+                            key.clone(),
                         ));
                         crate::perf_counters::count_named("cab-lru/dedup");
                         continue;
@@ -1020,7 +1035,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 let ft_idx = filtered_together_entries.len();
                 let mut promote_copy = None;
                 if let Some(key) = content_key {
-                    if lru_eligible && self.cab_cache.should_promote(&key, used_size) {
+                    let promote_eligible = entry.volatility != CacheVolatility::Subframe
+                        || u64::from(used_size.0) * u64::from(used_size.1)
+                            <= crate::filters::SUBFRAME_PROMOTE_MAX_PIXELS;
+                    if promote_eligible && self.cab_cache.should_promote(&key, used_size) {
                         let (tex, bg) = crate::filters::FilteredCabCache::allocate_texture(
                             &self.descriptors,
                             used_size,
@@ -1028,7 +1046,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         promote_copy = Some(tex.clone());
                         pending_promotions.push((ft_idx, key.clone(), tex, bg, used_size));
                     }
+                    if is_persistent {
+                        pending_persistent_keys.push((ft_idx, key.clone()));
+                    }
                     dedup_leaders.insert(key, ft_idx);
+                } else if is_persistent {
+                    *as_texture(&entry.handle).last_cab_key.borrow_mut() = None;
                 }
                 let direct_commands = direct_to_filter_atlas[index]
                     .then(|| std::mem::take(&mut entry.commands));
@@ -1055,6 +1078,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     crate::perf_counters::count(crate::perf_counters::Counter::CacheEntryFiltered);
                 }
                 let texture = as_texture(&entry.handle);
+                if !in_filtered_together[index] {
+                    *texture.last_cab_key.borrow_mut() = None;
+                }
                 let surface = Surface::new(
                     &self.descriptors,
                     self.surface.quality(),
@@ -1192,6 +1218,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 );
                 for &index in &skipped {
                     let entry = &mut filtered_together[index];
+                    *as_texture(&entry.handle).last_cab_key.borrow_mut() = None;
                     if let Some(commands) = entry.direct_commands.take() {
                         let surface = Surface::new(
                             &self.descriptors,
@@ -1229,13 +1256,20 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         &entry.filters,
                     );
                 }
+                for (ft_idx, key) in pending_persistent_keys {
+                    if !skipped.contains(&ft_idx) {
+                        *as_texture(&filtered_together[ft_idx].handle)
+                            .last_cab_key
+                            .borrow_mut() = Some(key);
+                    }
+                }
                 for (ft_idx, key, tex, bg, used_size) in pending_promotions {
                     if !skipped.contains(&ft_idx) {
                         self.cab_cache.insert(key, tex, bg, used_size);
                         crate::perf_counters::count_named("cab-lru/promote");
                     }
                 }
-                for (leader_ft_idx, handle, handle_ptr, tex, used_size, volatility) in
+                for (leader_ft_idx, handle, handle_ptr, tex, used_size, volatility, key) in
                     dedup_followers
                 {
                     let leader = &filtered_together[leader_ft_idx];
@@ -1259,6 +1293,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                                 depth_or_array_layers: 1,
                             },
                         );
+                        if volatility == CacheVolatility::Persistent {
+                            *as_texture(&handle).last_cab_key.borrow_mut() =
+                                (!skipped.contains(&leader_ft_idx)).then_some(key);
+                        }
                     }
                 }
             }
@@ -1572,6 +1610,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
             copy_count: Cell::new(0),
+            last_cab_key: Default::default(),
         }));
 
         Ok(handle)
@@ -1591,6 +1630,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
 
         let texture = as_texture(handle);
+        *texture.last_cab_key.borrow_mut() = None;
 
         let mut bitmap = bitmap.to_rgba();
         if self.clamp_bitmap(&mut bitmap) {
@@ -1640,6 +1680,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) -> Option<Box<dyn SyncHandle>> {
         self.finish_pending_shapes();
         let texture = as_texture(&handle);
+        *texture.last_cab_key.borrow_mut() = None;
 
         let extent = wgpu::Extent3d {
             width: texture.texture.width(),
@@ -1855,11 +1896,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     clamped_linear: Default::default(),
                     clamped_nearest: Default::default(),
                     copy_count: Cell::new(0),
+                    last_cab_key: Default::default(),
                 }))
             }
         };
 
         let target_texture = as_texture(&target_handle);
+        *target_texture.last_cab_key.borrow_mut() = None;
 
         let extent = wgpu::Extent3d {
             width: target_texture.texture.width(),
@@ -2015,6 +2058,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
             copy_count: Cell::new(0),
+            last_cab_key: Default::default(),
         })))
     }
 

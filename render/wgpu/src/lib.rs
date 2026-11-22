@@ -18,7 +18,7 @@ use ruffle_render::bitmap::{BitmapHandle, BitmapHandleImpl, PixelRegion, SyncHan
 use ruffle_render::shape_utils::GradientType;
 use ruffle_render::tessellator::{Gradient as TessGradient, Vertex as TessVertex};
 use std::any::Any;
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 use swf::GradientSpread;
 pub use wgpu;
@@ -277,6 +277,9 @@ pub struct Texture {
     clamped_linear: OnceCell<BitmapBinds>,
     clamped_nearest: OnceCell<BitmapBinds>,
     copy_count: Cell<u8>,
+    /// Canonical content key of the last filtered `Persistent` CAB rendered directly
+    /// into `texture`, enabling zero-cost skips when the same handle rebuilds identically.
+    pub(crate) last_cab_key: RefCell<Option<crate::filters::CabContentKey>>,
 }
 
 impl Texture {

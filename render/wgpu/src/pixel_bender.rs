@@ -488,6 +488,7 @@ pub(super) fn run_pixelbender_shader_impl(
                             clamped_linear: Default::default(),
                             clamped_nearest: Default::default(),
                             copy_count: Cell::new(0),
+                            last_cab_key: Default::default(),
                         }))
                     });
                     *texture = Some(cached_fresh_handle.clone().into());
