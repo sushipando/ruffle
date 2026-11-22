@@ -41,6 +41,9 @@ pub struct LeafLayer {
     /// If `Some`, the rendered layer is copied out into this texture; if `None`, the
     /// caller samples it directly from the atlas via `AtlasLayers`.
     pub destination: Option<wgpu::Texture>,
+    /// Whether this leaf is a `BlendMode::Layer` target (so direct-blended `Alpha`/`Erase`
+    /// children inside it blend against the layer's pixels in the atlas).
+    pub is_layer: bool,
 }
 
 /// Rendered layer atlases kept alive for direct sampling by the parent pass (avoiding
@@ -80,6 +83,7 @@ fn check_leaf_commands(
     width: u32,
     height: u32,
     allow_nested_blend: bool,
+    in_current_layer: bool,
 ) -> bool {
     if !fits(width, height) {
         return false;
@@ -118,14 +122,35 @@ fn check_leaf_commands(
                 if mask_defining != 0 {
                     return false;
                 }
-                if crate::surface::commands::direct_blend_mode_for(descriptors, inner, mode, false)
-                    .is_some()
+                if !in_current_layer
+                    && matches!(
+                        mode,
+                        ruffle_render::commands::RenderBlendMode::Builtin(
+                            swf::BlendMode::Alpha | swf::BlendMode::Erase
+                        )
+                    )
+                {
+                    // With no enclosing Layer, Alpha/Erase is a no-op.
+                    continue;
+                }
+                if crate::surface::commands::direct_blend_mode_for(
+                    descriptors,
+                    inner,
+                    mode,
+                    false,
+                    in_current_layer,
+                )
+                .is_some()
                 {
                     continue;
                 }
+                let child_is_layer = matches!(
+                    mode,
+                    ruffle_render::commands::RenderBlendMode::Builtin(swf::BlendMode::Layer)
+                );
                 if allow_nested_blend
                     && inline_blend_supported(descriptors, mode)
-                    && check_leaf_commands(descriptors, inner, width, height, false)
+                    && check_leaf_commands(descriptors, inner, width, height, false, child_is_layer)
                 {
                     continue;
                 }
@@ -139,8 +164,14 @@ fn check_leaf_commands(
 
 /// Whether a layer with these commands can be rendered in the atlas: it must only
 /// contain plain draws, balanced stencil masks, or direct blends, and be reasonably small.
-pub fn is_leaf(descriptors: &Descriptors, commands: &CommandList, width: u32, height: u32) -> bool {
-    check_leaf_commands(descriptors, commands, width, height, false)
+pub fn is_leaf(
+    descriptors: &Descriptors,
+    commands: &CommandList,
+    width: u32,
+    height: u32,
+    is_layer: bool,
+) -> bool {
+    check_leaf_commands(descriptors, commands, width, height, false, is_layer)
 }
 
 /// Whether a CAB with these commands can be rendered in the CAB/filter atlas: like
@@ -152,7 +183,7 @@ pub fn is_cab_leaf(
     width: u32,
     height: u32,
 ) -> bool {
-    check_leaf_commands(descriptors, commands, width, height, true)
+    check_leaf_commands(descriptors, commands, width, height, true, false)
 }
 
 /// Where a layer was placed in an atlas.
@@ -252,6 +283,7 @@ pub fn render_leaf_layers(
                         slot.y as i32 - layer.origin.1,
                     ),
                     (slot.x, slot.y, layer.width, layer.height),
+                    layer.is_layer,
                 )
             }),
             descriptors,
@@ -503,7 +535,7 @@ pub fn render_into_atlas(
     );
 
     let (mut chunks, inner_leaf_layers) = chunk_leaf_layers(
-        layers,
+        layers.map(|(cmds, offset, scissor)| (cmds, offset, scissor, false)),
         descriptors,
         staging_belt,
         dynamic_transforms,

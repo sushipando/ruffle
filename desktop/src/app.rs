@@ -197,13 +197,27 @@ impl MainWindow {
                 // work.
                 self.adaptation
                     .add_busy(start.elapsed().saturating_sub(waited));
-                // After submitting an interpolated frame, spend a small bounded slice
-                // draining any GC debt deferred from movie ticks while the GPU renders.
+                // After submitting an interpolated frame, spend any idle slack before the
+                // next due subframe/tick draining GC debt deferred from movie ticks while
+                // the GPU renders, without delaying an already-due subframe.
                 if movie_drawn
                     && self.max_interpolate > 1
                     && let Some(mut player) = self.player.get()
                 {
-                    player.collect_gc_slice(Duration::from_micros(1200));
+                    let now = Instant::now();
+                    let next_event = match (self.next_due, self.next_tick_time) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    let slack = next_event
+                        .map(|due| due.saturating_duration_since(now))
+                        .unwrap_or(Duration::from_millis(2));
+                    if slack >= Duration::from_micros(1500) {
+                        let budget = slack
+                            .saturating_sub(Duration::from_millis(1))
+                            .min(Duration::from_micros(1200));
+                        player.collect_gc_slice(budget);
+                    }
                 }
             }
 
@@ -772,10 +786,32 @@ impl MainWindow {
             return;
         }
         let total = drawn + skipped;
-        let behind = total > 0 && skipped * 10 > total;
+        // At 1-frame-per-refresh (e.g. 144 Hz, 6.9 ms/frame), dropping a level halves the
+        // frame rate (144 -> 72). When both GPU and CPU have clear headroom (<70% load),
+        // occasional single-subframe skips right behind heavy 24 fps game ticks still look
+        // much smoother at ~125-144 fps than halving to 72 fps; only treat >16.7% skipped
+        // as behind in that case (keeping the strict 10% threshold whenever load >= 70%).
+        let behind = if total == 0 {
+            false
+        } else if self.every == *range.start() && load < 0.70 {
+            skipped * 6 > total
+        } else {
+            skipped * 10 > total
+        };
+        let severely_behind = total > 0 && skipped * 4 > total;
         let was_behind = std::mem::replace(&mut adaptation.behind, behind);
         let on_trial = adaptation.since_raise.is_some();
-        if behind && (was_behind || on_trial) {
+        let abort_trial = match adaptation.since_raise {
+            // The first second after raising often spans the rate transition; only abort
+            // immediately if severely behind (>25% skipped).
+            Some(0) => severely_behind,
+            // During the rest of the trial, abort immediately if load is high (>=75%) or
+            // severely behind; otherwise tolerate a single 1s transient blip (e.g. a combat
+            // tick or spell load) and require 2 consecutive behind seconds like steady-state.
+            Some(_) => behind && (was_behind || severely_behind || load >= 0.75),
+            None => false,
+        };
+        if (behind && was_behind) || abort_trial {
             // Less often: every one more refresh.
             let fewer = (self.every < *range.end()).then(|| self.every + 1);
             if let Some(fewer) = fewer {
@@ -804,7 +840,10 @@ impl MainWindow {
                 adaptation.failed_load = None;
             }
         }
-        if skipped == 0 {
+        // Treat <=2% transient skips (e.g. 1 late frame out of 72) as clean when load has
+        // clear headroom, so isolated combat hitches don't pin interpolation down forever.
+        let clean = skipped == 0 || (total > 0 && skipped * 50 <= total && load < 0.80);
+        if clean {
             adaptation.clean_windows += 1;
             let lighter = adaptation
                 .failed_load

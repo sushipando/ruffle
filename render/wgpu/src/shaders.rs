@@ -179,10 +179,13 @@ fn make_fetch_blend_shaders(
         ComplexBlend::Darken => make("Darken", "#define BLEND_FUNC(s, d) min(s, d)"),
         ComplexBlend::Difference => make("Difference", "#define BLEND_FUNC(s, d) abs((d) - (s))"),
         ComplexBlend::Invert => make("Invert", "#define BLEND_FUNC(s, d) (1.0 - (d))"),
-        ComplexBlend::Alpha => make("Alpha", "#define COMPOSITE float4(dst.rgb * src.a, src.a * dst.a)"),
+        ComplexBlend::Alpha => make(
+            "Alpha",
+            "#define COMPOSITE (src.a < (0.5 / 255.0) ? dst : float4(dst.rgb * src.a, src.a * dst.a))",
+        ),
         ComplexBlend::Erase => make(
             "Erase",
-            "#define COMPOSITE float4(dst.rgb * (1.0 - src.a), (1.0 - src.a) * dst.a)",
+            "#define COMPOSITE (src.a < (0.5 / 255.0) ? dst : float4(dst.rgb * (1.0 - src.a), (1.0 - src.a) * dst.a))",
         ),
         ComplexBlend::Overlay => make(
             "Overlay",

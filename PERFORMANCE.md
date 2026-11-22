@@ -1644,6 +1644,86 @@ All 151 Metal `visual/` image regression tests and 177 unit tests pass. Live Art
   targets **3.7–4.1** (down from 14–21), combat `frame max` **6.97–9.00 ms** (down from
   12.9–17.3 ms), GPU **48–54%**, **2.2 cmdbufs/fr**.
 
+### 82. Smarter `adapt_interpolation` hysteresis and slack-aware subframe GC
+
+*File: `desktop/src/app.rs` (`adapt_interpolation`, `RedrawRequested`).*
+
+* `collect_gc_slice` now only runs after submitting an interpolated subframe when idle slack
+  remains before the next due subframe/tick (`slack >= 1.5 ms`), so deferred GC never pushes an
+  already-due subframe late behind a heavy movie tick.
+* `adapt_interpolation` now allows `<= 2%` transient skips in `clean_windows` when `load < 80%`,
+  tolerates a single 1-second transient blip during trials when `load < 75%` (matching
+  steady-state hysteresis), and uses a `16.7%` skip threshold at 1-frame-per-refresh when
+  `load < 70%` so occasional combat tick hitches don't halve 130–144 fps down to 72 fps.
+
+### 83. Render-pass state caching and dependency-preserving pipeline grouping
+
+*Files: `render/wgpu/src/surface/commands.rs` (`CommandRenderer`), `render/wgpu/src/surface/wave_schedule.rs` (`group_pipelines`), `render/wgpu/src/surface.rs`.*
+
+* `CommandRenderer` now caches the last bound `RenderPipeline`, group-2 `BindGroup`, stencil
+  reference, vertex buffer slice, and index buffer slice across each chunk, eliminating redundant
+  `set_pipeline` / `set_bind_group(2)` / `set_stencil_reference` / buffer-bind calls into
+  `wgpu-core` and Metal (`AGX::encodeAndEmitRenderState`, `Binder::change_pipeline_layout`).
+* `wave_schedule::group_pipelines` reorders only **non-overlapping** draw units (using the
+  padded 32px dependency grid, zero-allocation `Grid::require`) by pipeline bucket when Metal
+  framebuffer-fetch blends are active, grouping identical fill and blend pipelines back-to-back
+  with bit-exact output.
+
+### 84. Inline Metal framebuffer-fetch `Alpha`/`Erase` and early-skip orphan `Alpha`/`Erase`
+
+*Files: `render/wgpu/src/surface/commands.rs`, `render/wgpu/src/surface/layer_atlas.rs`, `render/wgpu/src/shaders.rs`, `render/wgpu/src/backend.rs`.*
+
+* `BlendMode::Alpha` and `BlendMode::Erase` with `nearest_layer == LayerRef::None` now return
+  early in `blend_impl` instead of allocating a full-screen 4× MSAA target and splitting the main
+  render pass only to be discarded in `Surface::draw_commands`.
+* When `nearest_layer == LayerRef::Current` (inside a `BlendMode::Layer` target, including
+  `Layer` leaves in `LayerAtlas`), `Alpha` and `Erase` now use Metal framebuffer-fetch shaders
+  directly (with an 8-bit `src.a < 0.5/255.0` threshold matching `Rgba8Unorm` `alpha.wgsl` /
+  `erase.wgsl` quantization). Eliminates `Alpha/full/1cmd` and `Layer/medium` pass splits and
+  extra targets (`blend-complex`: **2.5 → 0.0** in `yulgar`, **1.3 → 0.0** in `icestormunder`).
+
+### 85. Faster mouse picking (`global_matrix_cache`, `mouse_pick_avm2`, and redundant tick-pick skip)
+
+*Files: `core/src/display_object.rs` (`global_matrix_cache`), `core/src/display_object/movie_clip.rs` (`mouse_pick_avm2`), `core/src/player.rs` (`tick`), `core/src/timer.rs`, `core/src/socket.rs`, `core/src/net_connection.rs`, `core/src/streams.rs`.*
+
+* `global_matrix_cache` reuses its thread-local `FnvHashMap` across picks (clearing instead of
+  reallocating) and computes ancestor chains inside a single `RefCell::borrow_mut()`.
+* `MovieClip::mouse_pick_avm2` rejects maskees and empty clips without drawings before
+  computing `global_to_local_matrix()` and skips building the `clip_layers` iterator when no
+  child has `clip_depth > 0`.
+* `Player::tick` skips the post-`StreamManager::tick` `self.update()` mouse pick when sockets,
+  net connections, timers, and streams all had zero work.
+
+### 86. Avoid per-frame `try_auto_cache` subtree re-walks
+
+*File: `core/src/display_object.rs` (`try_auto_cache`).*
+
+* Only evaluates new auto-cache candidates on movie-tick frames (`!interpolation::is_inter_frame()`)
+  while existing hits still take the fast path on every subframe; short-circuits before
+  `subtree_allows_auto_cache` when the auto-cache memory budget is full; backs off off-screen
+  candidates for one stability window instead of re-walking every frame.
+
+### 87. `DropShadowFilter` and `BevelFilter` support in `FilteredCabCache`
+
+*File: `render/wgpu/src/filters/cache.rs` (`encode_filter`).*
+
+* Extended canonical filter key serialization to cover `DropShadowFilter` and `BevelFilter`.
+
+### Measured impact of 82–87 (5120x1440 144 Hz, Apple M1, zero visual loss)
+
+All 177 unit tests, 151 Metal `visual/` image regression tests (including `layer_alpha`,
+`layer_erase`, `alpha_no_layer`, `erase_no_layer`), and 8 `mouse_pick` tests pass. Live Artix
+results:
+
+* **`yulgar` (crowded)**: `blend-complex` **2.5 → 0.0**, passes **16.8–18.1 → 12.6–13.9**,
+  targets **8.0–8.7 → 5.0–5.3**, CPU render **3.7–3.8 ms → 2.78–2.93 ms** (−25%), CPU frame
+  logic **1.9–2.1 ms → 1.08–1.47 ms** (−35%), GPU **68–75% → 64–65%**.
+* **`icestormunder-5` room 2 (6 players combat)**: `blend-complex` **1.3 → 0.0**, passes
+  **12.6–14.7 → 6.9–8.5** (**3.3–5.7** at 6×), targets **5.9–7.2 → 2.8–3.0** (**2.2–2.8** at
+  6×), `tick-other` **1.1–1.9 ms → 0.37–0.66 ms** (−65%), CPU render **2.4–2.8 ms → 1.53–2.07 ms**
+  (−30%), reaches **130–137 fps** at **54–58% GPU** during 6× combat runs (and stays locked at
+  72 fps with 0 dips to 48 fps even in extreme 494-`blend-trivial` combat cells).
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

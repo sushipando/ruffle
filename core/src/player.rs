@@ -615,12 +615,22 @@ impl Player {
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
         let other_start = Instant::now();
-        self.update_sockets();
-        self.update_net_connections();
-        self.update_timers(dt);
-        self.update(|context| {
-            StreamManager::tick(context, dt);
-        });
+        let mut did_work = false;
+        did_work |= self.update_sockets_inner();
+        did_work |= self.update_net_connections_inner();
+        did_work |= self.update_timers_inner(dt);
+        if did_work {
+            self.update(|context| {
+                StreamManager::tick(context, dt);
+            });
+        } else {
+            let streams_ran = self.mutate_with_update_context(|context| {
+                StreamManager::tick(context, dt)
+            });
+            if streams_ran {
+                self.update(|_| {});
+            }
+        }
         self.audio.tick();
         if let Some(stats) = &mut self.perf_stats {
             stats.record_tick_other(other_start.elapsed());
@@ -2778,22 +2788,32 @@ impl Player {
     /// Update all AVM-based timers (such as created via setInterval).
     /// Returns the approximate amount of time until the next timer tick.
     pub fn update_timers(&mut self, dt: FloatDuration) {
-        self.time_til_next_timer =
+        self.update_timers_inner(dt);
+    }
+
+    fn update_timers_inner(&mut self, dt: FloatDuration) -> bool {
+        let (next, ran) =
             self.mutate_with_update_context(|context| Timers::update_timers(context, dt));
+        self.time_til_next_timer = next;
+        ran
     }
 
     /// Update connected Sockets.
     pub fn update_sockets(&mut self) {
-        self.mutate_with_update_context(|context| {
-            Sockets::update_sockets(context);
-        })
+        self.update_sockets_inner();
+    }
+
+    fn update_sockets_inner(&mut self) -> bool {
+        self.mutate_with_update_context(|context| Sockets::update_sockets(context))
     }
 
     /// Update connected NetConnections.
     pub fn update_net_connections(&mut self) {
-        self.mutate_with_update_context(|context| {
-            NetConnections::update_connections(context);
-        })
+        self.update_net_connections_inner();
+    }
+
+    fn update_net_connections_inner(&mut self) -> bool {
+        self.mutate_with_update_context(|context| NetConnections::update_connections(context))
     }
 
     /// Returns whether this player consumes mouse wheel events.

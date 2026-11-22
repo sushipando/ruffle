@@ -34,6 +34,11 @@ pub struct CommandRenderer<'encoder> {
     dynamic_vertex_base: wgpu::BufferAddress,
     atlas_bind_groups: &'encoder [wgpu::BindGroup],
     filter_atlas_bind_groups: &'encoder [wgpu::BindGroup],
+    last_pipeline: Option<*const wgpu::RenderPipeline>,
+    last_bind_group_2: Option<*const wgpu::BindGroup>,
+    last_stencil_ref: Option<u32>,
+    last_vertex_buffer: Option<(*const wgpu::Buffer, u64, u64)>,
+    last_index_buffer: Option<(*const wgpu::Buffer, u64, u64)>,
 }
 
 impl<'encoder> CommandRenderer<'encoder> {
@@ -59,6 +64,46 @@ impl<'encoder> CommandRenderer<'encoder> {
             dynamic_vertex_buffer,
             atlas_bind_groups,
             filter_atlas_bind_groups,
+            last_pipeline: None,
+            last_bind_group_2: None,
+            last_stencil_ref: None,
+            last_vertex_buffer: None,
+            last_index_buffer: None,
+        }
+    }
+
+    #[inline]
+    fn set_pipeline(
+        &mut self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        pipeline: &'encoder wgpu::RenderPipeline,
+    ) {
+        let ptr = pipeline as *const wgpu::RenderPipeline;
+        if self.last_pipeline != Some(ptr) {
+            self.last_pipeline = Some(ptr);
+            self.last_bind_group_2 = None;
+            render_pass.set_pipeline(pipeline);
+        }
+    }
+
+    #[inline]
+    fn set_bind_group_2(
+        &mut self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        bind_group: &'encoder wgpu::BindGroup,
+    ) {
+        let ptr = bind_group as *const wgpu::BindGroup;
+        if self.last_bind_group_2 != Some(ptr) {
+            self.last_bind_group_2 = Some(ptr);
+            render_pass.set_bind_group(2, bind_group, &[]);
+        }
+    }
+
+    #[inline]
+    fn set_stencil_ref(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>, reference: u32) {
+        if self.last_stencil_ref != Some(reference) {
+            self.last_stencil_ref = Some(reference);
+            render_pass.set_stencil_reference(reference);
         }
     }
 
@@ -71,13 +116,13 @@ impl<'encoder> CommandRenderer<'encoder> {
             match self.mask_state {
                 MaskState::NoMask => {}
                 MaskState::DrawMaskStencil => {
-                    render_pass.set_stencil_reference(self.num_masks - 1);
+                    self.set_stencil_ref(render_pass, self.num_masks - 1);
                 }
                 MaskState::DrawMaskedContent => {
-                    render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil_ref(render_pass, self.num_masks);
                 }
                 MaskState::ClearMaskStencil => {
-                    render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil_ref(render_pass, self.num_masks);
                 }
             }
         }
@@ -166,93 +211,102 @@ impl<'encoder> CommandRenderer<'encoder> {
         }
     }
 
-    pub fn prep_color(&self, render_pass: &mut wgpu::RenderPass<'encoder>) {
-        if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.color.pipeline_for(self.mask_state));
+    pub fn prep_color(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
+        let pipeline = if self.needs_stencil {
+            self.pipelines.color.pipeline_for(self.mask_state)
         } else {
-            render_pass.set_pipeline(self.pipelines.color.stencilless_pipeline());
-        }
+            self.pipelines.color.stencilless_pipeline()
+        };
+        self.set_pipeline(render_pass, pipeline);
     }
 
-    pub fn prep_lines(&self, render_pass: &mut wgpu::RenderPass<'encoder>) {
-        if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.lines.pipeline_for(self.mask_state));
+    pub fn prep_lines(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
+        let pipeline = if self.needs_stencil {
+            self.pipelines.lines.pipeline_for(self.mask_state)
         } else {
-            render_pass.set_pipeline(self.pipelines.lines.stencilless_pipeline());
-        }
+            self.pipelines.lines.stencilless_pipeline()
+        };
+        self.set_pipeline(render_pass, pipeline);
     }
 
     pub fn prep_gradient(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         bind_group: &'encoder wgpu::BindGroup,
     ) {
-        if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.gradients.pipeline_for(self.mask_state));
+        let pipeline = if self.needs_stencil {
+            self.pipelines.gradients.pipeline_for(self.mask_state)
         } else {
-            render_pass.set_pipeline(self.pipelines.gradients.stencilless_pipeline());
-        }
-
-        render_pass.set_bind_group(2, bind_group, &[]);
+            self.pipelines.gradients.stencilless_pipeline()
+        };
+        self.set_pipeline(render_pass, pipeline);
+        self.set_bind_group_2(render_pass, bind_group);
     }
 
     pub fn prep_bitmap(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         bind_group: &'encoder wgpu::BindGroup,
         blend_mode: TrivialBlend,
         render_stage3d: bool,
     ) {
-        match (self.needs_stencil, render_stage3d) {
-            (true, true) => {
-                render_pass.set_pipeline(&self.pipelines.bitmap_opaque_dummy_stencil);
-            }
-            (true, false) => {
-                render_pass
-                    .set_pipeline(self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state));
-            }
-            (false, true) => {
-                render_pass.set_pipeline(&self.pipelines.bitmap_opaque);
-            }
-            (false, false) => {
-                render_pass.set_pipeline(self.pipelines.bitmap[blend_mode].stencilless_pipeline());
-            }
-        }
-
-        render_pass.set_bind_group(2, bind_group, &[]);
+        let pipeline = match (self.needs_stencil, render_stage3d) {
+            (true, true) => &self.pipelines.bitmap_opaque_dummy_stencil,
+            (true, false) => self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state),
+            (false, true) => &self.pipelines.bitmap_opaque,
+            (false, false) => self.pipelines.bitmap[blend_mode].stencilless_pipeline(),
+        };
+        self.set_pipeline(render_pass, pipeline);
+        self.set_bind_group_2(render_pass, bind_group);
     }
 
     pub fn prep_alpha_mask(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         bind_group: &'encoder wgpu::BindGroup,
     ) {
-        if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.alpha_mask.pipeline_for(self.mask_state));
+        let pipeline = if self.needs_stencil {
+            self.pipelines.alpha_mask.pipeline_for(self.mask_state)
         } else {
-            render_pass.set_pipeline(self.pipelines.alpha_mask.stencilless_pipeline());
-        }
-
-        render_pass.set_bind_group(2, bind_group, &[]);
+            self.pipelines.alpha_mask.stencilless_pipeline()
+        };
+        self.set_pipeline(render_pass, pipeline);
+        self.set_bind_group_2(render_pass, bind_group);
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         vertices: wgpu::BufferSlice<'encoder>,
         indices: wgpu::BufferSlice<'encoder>,
         num_indices: u32,
         instance_index: u32,
     ) {
-        render_pass.set_vertex_buffer(0, vertices);
-        render_pass.set_index_buffer(indices, wgpu::IndexFormat::Uint32);
+        let vb_key = (
+            vertices.buffer() as *const wgpu::Buffer,
+            vertices.offset(),
+            vertices.size(),
+        );
+        if self.last_vertex_buffer != Some(vb_key) {
+            self.last_vertex_buffer = Some(vb_key);
+            render_pass.set_vertex_buffer(0, vertices);
+        }
+        let ib_key = (
+            indices.buffer() as *const wgpu::Buffer,
+            indices.offset(),
+            indices.size(),
+        );
+        if self.last_index_buffer != Some(ib_key) {
+            self.last_index_buffer = Some(ib_key);
+            render_pass.set_index_buffer(indices, wgpu::IndexFormat::Uint32);
+        }
 
         render_pass.draw_indexed(0..num_indices, 0, instance_index..(instance_index + 1));
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn render_bitmap(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         bitmap: &'encoder BitmapHandle,
         instance_index: u32,
@@ -283,12 +337,13 @@ impl<'encoder> CommandRenderer<'encoder> {
                     &descriptors.bind_layouts,
                     mode,
                 );
-                render_pass.set_pipeline(if self.needs_stencil {
+                let pipeline = if self.needs_stencil {
                     pipeline.pipeline_for(self.mask_state)
                 } else {
                     pipeline.stencilless_pipeline()
-                });
-                render_pass.set_bind_group(2, &bind.bind_group, &[]);
+                };
+                self.set_pipeline(render_pass, pipeline);
+                self.set_bind_group_2(render_pass, &bind.bind_group);
             }
         }
 
@@ -309,7 +364,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     }
 
     pub fn render_texture(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         instance_index: u32,
         bind_group: &'encoder wgpu::BindGroup,
@@ -327,7 +382,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     }
 
     pub fn render_fetch_blend(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         instance_index: u32,
         bind_group: &'encoder wgpu::BindGroup,
@@ -338,12 +393,13 @@ impl<'encoder> CommandRenderer<'encoder> {
             .fetch_blends
             .as_ref()
             .expect("fetch blends are only used where supported")[blend_mode];
-        if self.needs_stencil {
-            render_pass.set_pipeline(pipelines.pipeline_for(self.mask_state));
+        let pipeline = if self.needs_stencil {
+            pipelines.pipeline_for(self.mask_state)
         } else {
-            render_pass.set_pipeline(pipelines.stencilless_pipeline());
-        }
-        render_pass.set_bind_group(2, bind_group, &[]);
+            pipelines.stencilless_pipeline()
+        };
+        self.set_pipeline(render_pass, pipeline);
+        self.set_bind_group_2(render_pass, bind_group);
         self.draw(
             render_pass,
             self.descriptors.quad.vertices_pos_uv.slice(..),
@@ -354,7 +410,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     }
 
     pub fn render_atlas_layer(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         atlas_index: usize,
         instance_index: u32,
@@ -372,12 +428,13 @@ impl<'encoder> CommandRenderer<'encoder> {
                     .fetch_blends
                     .as_ref()
                     .expect("fetch blends are only used where supported")[mode];
-                if self.needs_stencil {
-                    render_pass.set_pipeline(pipelines.pipeline_for(self.mask_state));
+                let pipeline = if self.needs_stencil {
+                    pipelines.pipeline_for(self.mask_state)
                 } else {
-                    render_pass.set_pipeline(pipelines.stencilless_pipeline());
-                }
-                render_pass.set_bind_group(2, bind_group, &[]);
+                    pipelines.stencilless_pipeline()
+                };
+                self.set_pipeline(render_pass, pipeline);
+                self.set_bind_group_2(render_pass, bind_group);
             }
         }
         self.draw(
@@ -391,7 +448,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     }
 
     pub fn render_filter_atlas(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         atlas_index: usize,
         instance_index: u32,
@@ -410,12 +467,13 @@ impl<'encoder> CommandRenderer<'encoder> {
                     &self.descriptors.bind_layouts,
                     mode,
                 );
-                render_pass.set_pipeline(if self.needs_stencil {
+                let pipeline = if self.needs_stencil {
                     pipeline.pipeline_for(self.mask_state)
                 } else {
                     pipeline.stencilless_pipeline()
-                });
-                render_pass.set_bind_group(2, bind_group, &[]);
+                };
+                self.set_pipeline(render_pass, pipeline);
+                self.set_bind_group_2(render_pass, bind_group);
             }
         }
         self.draw(
@@ -429,7 +487,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     }
 
     pub fn render_shape(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         shape: &'encoder ShapeHandle,
         instance_index: u32,
@@ -469,21 +527,23 @@ impl<'encoder> CommandRenderer<'encoder> {
                         &self.descriptors.bind_layouts,
                         fetch.expect("checked above"),
                     );
-                    render_pass.set_pipeline(if self.needs_stencil {
+                    let pipeline = if self.needs_stencil {
                         pipeline.pipeline_for(self.mask_state)
                     } else {
                         pipeline.stencilless_pipeline()
-                    });
+                    };
+                    self.set_pipeline(render_pass, pipeline);
                 }
                 (DrawType::Color, None) => {
                     self.prep_color(render_pass);
                 }
                 (DrawType::Color, Some(blended)) => {
-                    render_pass.set_pipeline(if self.needs_stencil {
+                    let pipeline = if self.needs_stencil {
                         blended.color.pipeline_for(self.mask_state)
                     } else {
                         blended.color.stencilless_pipeline()
-                    });
+                    };
+                    self.set_pipeline(render_pass, pipeline);
                 }
                 (DrawType::Gradient { bind_group, .. }, None) if fetch.is_some() => {
                     let pipeline = self.pipelines.fetch_gradient_blend(
@@ -492,23 +552,25 @@ impl<'encoder> CommandRenderer<'encoder> {
                         &self.descriptors.bind_layouts,
                         fetch.expect("checked above"),
                     );
-                    render_pass.set_pipeline(if self.needs_stencil {
+                    let pipeline = if self.needs_stencil {
                         pipeline.pipeline_for(self.mask_state)
                     } else {
                         pipeline.stencilless_pipeline()
-                    });
-                    render_pass.set_bind_group(2, bind_group, &[]);
+                    };
+                    self.set_pipeline(render_pass, pipeline);
+                    self.set_bind_group_2(render_pass, bind_group);
                 }
                 (DrawType::Gradient { bind_group, .. }, None) => {
                     self.prep_gradient(render_pass, bind_group);
                 }
                 (DrawType::Gradient { bind_group, .. }, Some(blended)) => {
-                    render_pass.set_pipeline(if self.needs_stencil {
+                    let pipeline = if self.needs_stencil {
                         blended.gradient.pipeline_for(self.mask_state)
                     } else {
                         blended.gradient.stencilless_pipeline()
-                    });
-                    render_pass.set_bind_group(2, bind_group, &[]);
+                    };
+                    self.set_pipeline(render_pass, pipeline);
+                    self.set_bind_group_2(render_pass, bind_group);
                 }
                 (DrawType::Bitmap { binds, .. }, None) if fetch.is_some() => {
                     let pipeline = self.pipelines.fetch_bitmap_blend(
@@ -517,12 +579,13 @@ impl<'encoder> CommandRenderer<'encoder> {
                         &self.descriptors.bind_layouts,
                         fetch.expect("checked above"),
                     );
-                    render_pass.set_pipeline(if self.needs_stencil {
+                    let pipeline = if self.needs_stencil {
                         pipeline.pipeline_for(self.mask_state)
                     } else {
                         pipeline.stencilless_pipeline()
-                    });
-                    render_pass.set_bind_group(2, &binds.bind_group, &[]);
+                    };
+                    self.set_pipeline(render_pass, pipeline);
+                    self.set_bind_group_2(render_pass, &binds.bind_group);
                 }
                 (DrawType::Bitmap { binds, .. }, _) => {
                     self.prep_bitmap(render_pass, &binds.bind_group, blend_mode, false);
@@ -540,7 +603,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     }
 
     pub fn render_alpha_mask(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         _maskee: &PoolOrArcTexture,
         _mask: &PoolOrArcTexture,
@@ -566,7 +629,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         }
     }
 
-    pub fn draw_rect(&self, render_pass: &mut wgpu::RenderPass<'encoder>, instance_index: u32) {
+    pub fn draw_rect(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>, instance_index: u32) {
         self.prep_color(render_pass);
 
         self.draw(
@@ -579,7 +642,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     }
 
     pub fn draw_lines<const RECT: bool>(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
         instance_index: u32,
     ) {
@@ -604,25 +667,25 @@ impl<'encoder> CommandRenderer<'encoder> {
         );
         self.num_masks += 1;
         self.mask_state = MaskState::DrawMaskStencil;
-        render_pass.set_stencil_reference(self.num_masks - 1);
+        self.set_stencil_ref(render_pass, self.num_masks - 1);
     }
 
     pub fn activate_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskStencil);
         self.mask_state = MaskState::DrawMaskedContent;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil_ref(render_pass, self.num_masks);
     }
 
     pub fn deactivate_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskedContent);
         self.mask_state = MaskState::ClearMaskStencil;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil_ref(render_pass, self.num_masks);
     }
 
     pub fn pop_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::ClearMaskStencil);
         self.num_masks -= 1;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil_ref(render_pass, self.num_masks);
         if self.num_masks == 0 {
             self.mask_state = MaskState::NoMask;
         } else {
@@ -836,7 +899,7 @@ pub fn bind_atlas_layers(chunks: &mut [Chunk], atlas_layers: &layer_atlas::Atlas
 /// and the scissor rectangle `(x, y, width, height)` to clip them to.
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
-    layers: impl Iterator<Item = (CommandList, (i32, i32), (u32, u32, u32, u32))>,
+    layers: impl Iterator<Item = (CommandList, (i32, i32), (u32, u32, u32, u32), bool)>,
     descriptors: &'encoder Descriptors,
     staging_belt: &'encoder mut wgpu::util::StagingBelt,
     dynamic_transforms: &'encoder DynamicTransforms,
@@ -862,8 +925,13 @@ pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
         texture_pool,
         filter_atlas,
     );
-    for (commands, (dx, dy), scissor) in layers {
+    for (commands, (dx, dy), scissor, is_layer) in layers {
         handler.scissor = Some(scissor);
+        handler.nearest_layer = if is_layer {
+            LayerRef::Current
+        } else {
+            LayerRef::None
+        };
         handler.current.push(DrawCommand::SetScissor(scissor));
         handler.translation = (Twips::from_pixels_i32(dx), Twips::from_pixels_i32(dy));
         commands.execute(&mut handler);
@@ -1252,6 +1320,7 @@ pub(crate) fn direct_blend_mode_for(
     commands: &CommandList,
     blend_mode: &RenderBlendMode,
     opaque: bool,
+    in_current_layer: bool,
 ) -> Option<ShapeBlend> {
     if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::DirectBlends) {
         return None;
@@ -1307,10 +1376,10 @@ pub(crate) fn direct_blend_mode_for(
             Some(ShapeBlend::Trivial(TrivialBlend::MultiplyOpaque))
         }
         // Solid, gradient, and bitmap fills can read the backdrop themselves (see
-        // `fetch.metal`). Alpha and Erase blend with their layer, which may be another
-        // target.
+        // `fetch.metal`). Alpha and Erase blend against their enclosing Layer, so they
+        // can use framebuffer fetch directly when the current target IS that Layer.
         BlendType::Complex(mode)
-            if !matches!(mode, ComplexBlend::Alpha | ComplexBlend::Erase)
+            if (in_current_layer || !matches!(mode, ComplexBlend::Alpha | ComplexBlend::Erase))
                 && descriptors.shaders.fetch_color_shaders.is_some()
                 && ruffle_render::perf_flags::enabled(
                     ruffle_render::perf_flags::PerfFlag::FetchBlends,
@@ -1332,7 +1401,13 @@ impl WgpuCommandHandler<'_, '_> {
         if self.direct_blend.is_some() {
             return None;
         }
-        direct_blend_mode_for(self.descriptors, commands, blend_mode, self.opaque)
+        direct_blend_mode_for(
+            self.descriptors,
+            commands,
+            blend_mode,
+            self.opaque,
+            matches!(self.nearest_layer, LayerRef::Current),
+        )
     }
 
     fn blend_impl(
@@ -1341,6 +1416,16 @@ impl WgpuCommandHandler<'_, '_> {
         blend_mode: RenderBlendMode,
         rect: Option<(i32, i32, u32, u32)>,
     ) {
+        // An Alpha or Erase blend with no enclosing Layer is ignored in Flash (and would
+        // otherwise render into a full-screen offscreen target and split the main render
+        // pass only to be discarded in `Surface::draw_commands`).
+        if matches!(
+            blend_mode,
+            RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)
+        ) && matches!(self.nearest_layer, LayerRef::None)
+        {
+            return;
+        }
         if let Some(mode) = self.direct_blend_mode(&commands, &blend_mode) {
             crate::perf_counters::count_named("direct-blend");
             self.direct_blend = Some(mode);
@@ -1373,11 +1458,13 @@ impl WgpuCommandHandler<'_, '_> {
                 None => (self.origin, self.width, self.height),
             },
         };
-        let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
+        let is_layer = matches!(&blend_mode, RenderBlendMode::Builtin(BlendMode::Layer));
+        let target_layer = if is_layer {
             LayerRef::Current
         } else {
             self.nearest_layer
         };
+        let in_current_layer = matches!(self.nearest_layer, LayerRef::Current);
         let blend_type = BlendType::from(blend_mode);
         let clear_color = blend_type.default_color();
 
@@ -1418,7 +1505,8 @@ impl WgpuCommandHandler<'_, '_> {
 
         let inline_blend = match blend_type {
             BlendType::Complex(blend_mode)
-                if !matches!(blend_mode, ComplexBlend::Alpha | ComplexBlend::Erase)
+                if (in_current_layer
+                    || !matches!(blend_mode, ComplexBlend::Alpha | ComplexBlend::Erase))
                     && self.descriptors.shaders.fetch_blend_shaders.is_some()
                     && ruffle_render::perf_flags::enabled(
                         ruffle_render::perf_flags::PerfFlag::FetchBlends,
@@ -1432,7 +1520,7 @@ impl WgpuCommandHandler<'_, '_> {
 
         let use_leaf_atlas = (rect.is_some() || self.scissor.is_some())
             && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LayerAtlas)
-            && layer_atlas::is_leaf(self.descriptors, &commands, width, height);
+            && layer_atlas::is_leaf(self.descriptors, &commands, width, height, is_layer);
 
         if use_leaf_atlas && let Some(shape_blend) = inline_blend {
             // Sample directly from the layer atlas via UV sub-rect, avoiding a per-layer
@@ -1450,6 +1538,7 @@ impl WgpuCommandHandler<'_, '_> {
                 width,
                 height,
                 destination: None,
+                is_layer,
             });
             let placeholder = [PosUvVertex::new(0.0, 0.0, 0.0, 0.0, 1.0); 4];
             self.add_to_current_with_vertices(
@@ -1490,6 +1579,7 @@ impl WgpuCommandHandler<'_, '_> {
                 width,
                 height,
                 destination: Some(texture.0.clone()),
+                is_layer,
             });
             PoolOrArcTexture::Pool(texture)
         } else {

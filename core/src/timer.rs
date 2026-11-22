@@ -34,14 +34,14 @@ pub struct Timers<'gc> {
 
 impl<'gc> Timers<'gc> {
     /// Ticks all timers and runs necessary callbacks.
-    pub fn update_timers(context: &mut UpdateContext<'gc>, dt: FloatDuration) -> Option<f64> {
+    pub fn update_timers(context: &mut UpdateContext<'gc>, dt: FloatDuration) -> (Option<f64>, bool) {
         context.timers.cur_time = context
             .timers
             .cur_time
             .wrapping_add((dt.as_millis() * Self::TIMER_SCALE) as u64);
 
         if context.timers.is_empty() {
-            return None;
+            return (None, false);
         }
 
         let level0 = context.stage.root_clip();
@@ -204,10 +204,11 @@ impl<'gc> Timers<'gc> {
             }
         }
 
-        // Return estimated time until next timer tick.
-        context.timers.peek().map(|timer| {
+        // Return estimated time until next timer tick, and whether any timer ran.
+        let next = context.timers.peek().map(|timer| {
             (timer.tick_time.wrapping_sub(context.timers.cur_time)) as f64 / Self::TIMER_SCALE
-        })
+        });
+        (next, tick_count > 0)
     }
 
     /// The minimum interval we allow for timers.

@@ -154,15 +154,24 @@ impl Surface {
             && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::FetchBlends);
         let commands = if ruffle_render::perf_flags::enabled(
             ruffle_render::perf_flags::PerfFlag::WaveSchedule,
-        ) && !fetch_blends
-        {
-            wave_schedule::schedule(
-                commands,
-                self.origin,
-                self.size.width,
-                self.size.height,
-                opaque,
-            )
+        ) {
+            if fetch_blends {
+                wave_schedule::group_pipelines(
+                    commands,
+                    self.origin,
+                    self.size.width,
+                    self.size.height,
+                    opaque,
+                )
+            } else {
+                wave_schedule::schedule(
+                    commands,
+                    self.origin,
+                    self.size.width,
+                    self.size.height,
+                    opaque,
+                )
+            }
         } else {
             commands
         };

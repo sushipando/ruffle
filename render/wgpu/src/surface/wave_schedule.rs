@@ -80,23 +80,25 @@ impl Grid {
         }
     }
 
-    fn rows(&self, rect: Rect) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
-        (rect.y0..rect.y1).map(move |y| y * self.columns + rect.x0..y * self.columns + rect.x1)
-    }
-
     /// The earliest wave a command touching `rect` may be in.
+    #[inline]
     fn earliest_wave(&self, rect: Rect) -> u32 {
-        self.rows(rect)
-            .flat_map(|row| self.min_wave[row].iter().copied())
-            .max()
-            .unwrap_or(0)
+        let mut wave = 0;
+        for y in rect.y0..rect.y1 {
+            let row = y * self.columns;
+            for &cell in &self.min_wave[row + rect.x0..row + rect.x1] {
+                wave = wave.max(cell);
+            }
+        }
+        wave
     }
 
     /// Requires later commands touching `rect` to be in `wave` or later.
+    #[inline]
     fn require(&mut self, rect: Rect, wave: u32) {
-        let rows: Vec<_> = self.rows(rect).collect();
-        for row in rows {
-            for cell in &mut self.min_wave[row] {
+        for y in rect.y0..rect.y1 {
+            let row = y * self.columns;
+            for cell in &mut self.min_wave[row + rect.x0..row + rect.x1] {
                 *cell = (*cell).max(wave);
             }
         }
@@ -360,5 +362,106 @@ pub fn schedule(
         .flat_map(|(draws, blends)| draws.into_iter().chain(blends))
         .flat_map(|unit| unit.commands)
         .collect();
+    result
+}
+
+/// Coarse pipeline bucket for grouping non-overlapping draws when Metal framebuffer-fetch
+/// blends are active. Grouping identical blend & fill pipelines cuts redundant `set_pipeline`
+/// / `set_bind_group` switches and clusters Metal tile-fetch draws together.
+fn pipeline_bucket(unit: &Unit, opaque: bool) -> u8 {
+    if unit.commands.len() != 1 {
+        return 3;
+    }
+    match &unit.commands[0] {
+        Command::DrawRect { .. } => 0,
+        Command::RenderShape { shape, .. } => {
+            let mesh = as_mesh(shape);
+            match mesh.draws.first().map(|d| &d.draw_type) {
+                Some(crate::mesh::DrawType::Color) if mesh.draws.len() == 1 => 0,
+                Some(crate::mesh::DrawType::Gradient { .. }) if mesh.draws.len() == 1 => 1,
+                Some(crate::mesh::DrawType::Bitmap { .. }) if mesh.draws.len() == 1 => 2,
+                _ => 3,
+            }
+        }
+        Command::RenderBitmap { .. } => 2,
+        Command::DrawLine { .. } | Command::DrawLineRect { .. } => 4,
+        Command::BlendBounded(_, mode, _) => match BlendType::from(mode.clone()) {
+            BlendType::Trivial(t) => 10 + t as u8,
+            BlendType::Complex(ComplexBlend::Multiply)
+                if opaque
+                    && ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::OpaqueMultiply,
+                    ) =>
+            {
+                10 + crate::blend::TrivialBlend::MultiplyOpaque as u8
+            }
+            BlendType::Complex(c) => 20 + c as u8,
+            BlendType::Shader(_) => 30,
+        },
+        _ => 31,
+    }
+}
+
+/// Dependency-preserving pipeline grouping for targets with Metal framebuffer-fetch blends.
+///
+/// Assigns each unit to the earliest layer where it does not overlap any other unit in that
+/// layer (using the same padded 32px dependency grid as `schedule`), then stably sorts each
+/// independent layer by pipeline bucket. Since no two units in the same layer overlap, the
+/// rendered output is bit-for-bit identical while consecutive draws share pipelines.
+pub fn group_pipelines(
+    commands: CommandList,
+    origin: (i32, i32),
+    width: u32,
+    height: u32,
+    opaque: bool,
+) -> CommandList {
+    if commands.commands.len() < 16 {
+        return commands;
+    }
+    let mut grid = Grid::new(origin, width, height);
+    let units = units(commands.commands, &grid, opaque);
+    if units.len() < 16 {
+        let mut result = CommandList::new();
+        result.commands = units.into_iter().flat_map(|u| u.commands).collect();
+        return result;
+    }
+
+    let mut floor = 0u32;
+    let mut barrier_wave = 0u32;
+    let mut layers: Vec<Vec<(u8, Unit)>> = Vec::new();
+    for unit in units {
+        let (wave, bucket) = match unit.kind {
+            Kind::Draw(rect) | Kind::ComplexBlend(rect) => {
+                let wave = grid.earliest_wave(rect).max(floor);
+                // Require `wave + 1` so no two units in the same layer can overlap.
+                grid.require(rect, wave + 1);
+                barrier_wave = barrier_wave.max(wave + 1);
+                let bucket = pipeline_bucket(&unit, opaque);
+                (wave, bucket)
+            }
+            Kind::Barrier => {
+                let wave = barrier_wave;
+                barrier_wave += 1;
+                floor = barrier_wave;
+                (wave, 255)
+            }
+        };
+        let wave = wave as usize;
+        if layers.len() <= wave {
+            layers.resize_with(wave + 1, Vec::new);
+        }
+        layers[wave].push((bucket, unit));
+    }
+
+    let mut result = CommandList::new();
+    result.commands.reserve(layers.iter().map(Vec::len).sum());
+    for mut layer in layers {
+        if layer.len() > 1 {
+            layer.sort_by_key(|(bucket, _)| *bucket);
+        }
+        for (_, unit) in layer {
+            result.commands.extend(unit.commands);
+        }
+    }
     result
 }

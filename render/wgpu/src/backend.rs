@@ -822,6 +822,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         width: w,
                         height: h,
                         destination: Some(texture.texture.clone()),
+                        is_layer: false,
                     })
                 })
                 .collect();

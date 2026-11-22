@@ -199,11 +199,14 @@ impl<'gc> Sockets<'gc> {
         }
     }
 
-    pub fn update_sockets(context: &mut UpdateContext<'gc>) {
+    pub fn update_sockets(context: &mut UpdateContext<'gc>) -> bool {
         let mut actions = vec![];
 
         while let Ok(action) = context.sockets.receiver.try_recv() {
             actions.push(action)
+        }
+        if actions.is_empty() {
+            return false;
         }
 
         for action in actions {
@@ -395,6 +398,7 @@ impl<'gc> Sockets<'gc> {
                 }
             }
         }
+        true
     }
 }
 

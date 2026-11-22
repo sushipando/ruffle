@@ -1451,6 +1451,15 @@ fn try_auto_cache<'gc>(
         }
     }
 
+    // Only evaluate new auto-cache candidates on movie ticks (existing hits already
+    // returned above on every interpolated subframe), and skip the subtree walk if the
+    // auto-cache memory budget is already full.
+    if interpolation::is_inter_frame()
+        || AUTO_CACHE_BYTES.load(Ordering::Relaxed) >= MAX_AUTO_CACHE_BYTES
+    {
+        return None;
+    }
+
     let tick = interpolation::tick();
     let last_inv = this.base().last_invalidated_tick.get();
     let last_tx = this.base().last_transform_tick.get();
@@ -1496,6 +1505,9 @@ fn try_auto_cache<'gc>(
     let x1 = (bounds.x_max.to_pixels().ceil() as i32 + 2).min(vp_x1);
     let y1 = (bounds.y_max.to_pixels().ceil() as i32 + 2).min(vp_y1);
     if x1 <= x0 || y1 <= y0 {
+        // Off-screen right now: back off for another stability window so we don't re-walk
+        // this subtree on every single frame while it stays off-screen.
+        this.base().last_invalidated_tick.set(tick);
         return None;
     }
     let width = (x1 - x0) as u32;
@@ -4614,8 +4626,16 @@ pub mod global_matrix_cache {
     use fnv::FnvHashMap;
     use std::cell::RefCell;
 
+    struct CacheState {
+        enabled: bool,
+        map: FnvHashMap<usize, Matrix>,
+    }
+
     thread_local! {
-        static CACHE: RefCell<Option<FnvHashMap<usize, Matrix>>> = const { RefCell::new(None) };
+        static CACHE: RefCell<CacheState> = RefCell::new(CacheState {
+            enabled: false,
+            map: FnvHashMap::default(),
+        });
     }
 
     /// Enables the cache until the returned guard is dropped.
@@ -4623,9 +4643,10 @@ pub mod global_matrix_cache {
     pub fn enable() -> Guard {
         CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            let was_enabled = cache.is_some();
+            let was_enabled = cache.enabled;
             if !was_enabled {
-                *cache = Some(FnvHashMap::default());
+                cache.map.clear();
+                cache.enabled = true;
             }
             Guard { was_enabled }
         })
@@ -4638,7 +4659,11 @@ pub mod global_matrix_cache {
     impl Drop for Guard {
         fn drop(&mut self) {
             if !self.was_enabled {
-                CACHE.with(|cache| *cache.borrow_mut() = None);
+                CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    cache.enabled = false;
+                    cache.map.clear();
+                });
             }
         }
     }
@@ -4646,14 +4671,19 @@ pub mod global_matrix_cache {
     /// The matrix from `node`'s local space (after its `scrollRect`) to stage space,
     /// if the cache is enabled. `None` and the stage map to the identity.
     pub fn parent_matrix(node: Option<DisplayObject<'_>>) -> Option<Matrix> {
-        let enabled = CACHE.with(|cache| cache.borrow().is_some());
-        if !enabled {
-            return None;
-        }
-        Some(compute(node))
+        CACHE.with(|cache| {
+            let mut state = cache.borrow_mut();
+            if !state.enabled {
+                return None;
+            }
+            Some(compute_with_map(node, &mut state.map))
+        })
     }
 
-    fn compute(node: Option<DisplayObject<'_>>) -> Matrix {
+    fn compute_with_map(
+        node: Option<DisplayObject<'_>>,
+        map: &mut FnvHashMap<usize, Matrix>,
+    ) -> Matrix {
         let Some(node) = node else {
             return Matrix::IDENTITY;
         };
@@ -4663,20 +4693,14 @@ pub mod global_matrix_cache {
             return Matrix::IDENTITY;
         }
         let key = node.as_ptr() as usize;
-        if let Some(matrix) =
-            CACHE.with(|cache| cache.borrow().as_ref().and_then(|c| c.get(&key).copied()))
-        {
+        if let Some(&matrix) = map.get(&key) {
             return matrix;
         }
-        let mut matrix = compute(node.parent()) * node.base().matrix();
+        let mut matrix = compute_with_map(node.parent(), map) * node.base().matrix();
         if let Some(rect) = node.scroll_rect() {
             matrix *= Matrix::translate(-rect.x_min, -rect.y_min);
         }
-        CACHE.with(|cache| {
-            if let Some(cache) = cache.borrow_mut().as_mut() {
-                cache.insert(key, matrix);
-            }
-        });
+        map.insert(key, matrix);
         matrix
     }
 }

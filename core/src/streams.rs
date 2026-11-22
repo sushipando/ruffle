@@ -127,11 +127,15 @@ impl<'gc> StreamManager<'gc> {
     /// support video framerates separate from the Stage frame rate.
     ///
     /// This does not borrow `&mut self` as we need the `UpdateContext`, too.
-    pub fn tick(context: &mut UpdateContext<'gc>, dt: FloatDuration) {
+    pub fn tick(context: &mut UpdateContext<'gc>, dt: FloatDuration) -> bool {
+        if context.stream_manager.active_streams.is_empty() {
+            return false;
+        }
         let streams = context.stream_manager.active_streams.clone();
         for stream in streams {
             stream.tick(context, dt)
         }
+        true
     }
 }
 

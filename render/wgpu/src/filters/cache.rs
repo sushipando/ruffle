@@ -123,6 +123,37 @@ fn encode_filter(filter: &Filter, out: &mut Vec<u8>) -> bool {
             }
             true
         }
+        Filter::DropShadowFilter(d) => {
+            out.push(4);
+            out.extend_from_slice(&[d.color.r, d.color.g, d.color.b, d.color.a]);
+            out.extend_from_slice(&d.blur_x.get().to_le_bytes());
+            out.extend_from_slice(&d.blur_y.get().to_le_bytes());
+            out.extend_from_slice(&d.angle.get().to_le_bytes());
+            out.extend_from_slice(&d.distance.get().to_le_bytes());
+            out.extend_from_slice(&d.strength.get().to_le_bytes());
+            out.push(d.flags.bits());
+            true
+        }
+        Filter::BevelFilter(b) => {
+            out.push(5);
+            out.extend_from_slice(&[
+                b.shadow_color.r,
+                b.shadow_color.g,
+                b.shadow_color.b,
+                b.shadow_color.a,
+                b.highlight_color.r,
+                b.highlight_color.g,
+                b.highlight_color.b,
+                b.highlight_color.a,
+            ]);
+            out.extend_from_slice(&b.blur_x.get().to_le_bytes());
+            out.extend_from_slice(&b.blur_y.get().to_le_bytes());
+            out.extend_from_slice(&b.angle.get().to_le_bytes());
+            out.extend_from_slice(&b.distance.get().to_le_bytes());
+            out.extend_from_slice(&b.strength.get().to_le_bytes());
+            out.push(b.flags.bits());
+            true
+        }
         _ => false,
     }
 }

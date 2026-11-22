@@ -3281,6 +3281,17 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         }
 
         if self.visible() {
+            if self.maskee().is_some() {
+                // If we're masking another object, we can't be hit.
+                return Avm2MousePick::Miss;
+            }
+
+            let has_children = !self.is_empty();
+            let has_drawing = self.drawing().is_some();
+            if !has_children && !has_drawing {
+                return Avm2MousePick::Miss;
+            }
+
             let this: InteractiveObject<'gc> = self.into();
             let Some(local_matrix) = self.global_to_local_matrix() else {
                 return Avm2MousePick::Miss;
@@ -3292,11 +3303,6 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                 return Avm2MousePick::Miss;
             }
 
-            if self.maskee().is_some() {
-                // If we're masking another object, we can't be hit.
-                return Avm2MousePick::Miss;
-            }
-
             // Maybe we could skip recursing down at all if !world_bounds.contains(point),
             // but a child button can have an invisible hit area outside the parent's bounds.
             let mut options = HitTestOptions::SKIP_INVISIBLE;
@@ -3304,94 +3310,102 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
             let mut found_propagate = None;
 
-            let mut clip_layers = self
-                .iter_render_list()
-                .flat_map(|child| {
-                    if child.clip_depth() > 0 {
-                        // Note - we intentionally use 'child.depth()' here insteado
-                        // of the position in the render list - this matches Flash's
-                        // behavior. The 'depth' value comes from the PlaceObject tag
-                        Some((child, (child.depth() + 1)..=(child.clip_depth())))
-                    } else {
-                        None
-                    }
-                })
-                .rev()
-                .peekable();
+            if has_children {
+                let mut clip_layers = self
+                    .iter_render_list()
+                    .any(|child| child.clip_depth() > 0)
+                    .then(|| {
+                        self.iter_render_list()
+                            .flat_map(|child| {
+                                if child.clip_depth() > 0 {
+                                    // Note - we intentionally use 'child.depth()' here instead
+                                    // of the position in the render list - this matches Flash's
+                                    // behavior. The 'depth' value comes from the PlaceObject tag
+                                    Some((child, (child.depth() + 1)..=(child.clip_depth())))
+                                } else {
+                                    None
+                                }
+                            })
+                            .rev()
+                            .peekable()
+                    });
 
-            // Interactive children run first, followed by non-interactive children.
-            // Depth is considered within each group.
+                // Interactive children run first, followed by non-interactive children.
+                // Depth is considered within each group.
 
-            let interactive = self
-                .iter_render_list()
-                .rev()
-                .filter(|child| child.as_interactive().is_some());
-            let non_interactive = self
-                .iter_render_list()
-                .rev()
-                .filter(|child| child.as_interactive().is_none());
+                let interactive = self
+                    .iter_render_list()
+                    .rev()
+                    .filter(|child| child.as_interactive().is_some());
+                let non_interactive = self
+                    .iter_render_list()
+                    .rev()
+                    .filter(|child| child.as_interactive().is_none());
 
-            for child in interactive.into_iter().chain(non_interactive) {
-                // Mask children are not clickable
-                if child.clip_depth() > 0 || child.maskee().is_some() {
-                    continue;
-                }
-
-                let mut res = if let Some(child) = child.as_interactive() {
-                    if child.as_displayobject().movie().is_action_script_3() {
-                        child.mouse_pick_avm2(context, point, require_button_mode)
-                    } else {
-                        let avm1_result =
-                            child.mouse_pick_avm1(context, point, require_button_mode);
-                        if let Some(result) = avm1_result {
-                            Avm2MousePick::Hit(result)
-                        } else {
-                            Avm2MousePick::Miss
-                        }
-                    }
-                } else if child.hit_test_shape(context, point, options)
-                    && child
-                        .masker()
-                        .map(|mask| mask.hit_test_shape(context, point, options))
-                        .unwrap_or(true)
-                {
-                    if self.mouse_enabled() {
-                        Avm2MousePick::Hit(this)
-                    } else {
-                        Avm2MousePick::PropagateToParent
-                    }
-                } else {
-                    Avm2MousePick::Miss
-                };
-
-                while let Some((clip, clip_range)) = clip_layers.peek() {
-                    // This clip layer no longer applies to the remaining children (which all have lower depth values).
-                    // This is a rare case where we actually use 'child.depth()' in AVM2 - child.depth()
-                    // gets set from a PlaceObject tag, and may be *greater* than position in the render list.
-                    if *clip_range.start() > child.depth() {
-                        clip_layers.next();
+                for child in interactive.into_iter().chain(non_interactive) {
+                    // Mask children are not clickable
+                    if child.clip_depth() > 0 || child.maskee().is_some() {
                         continue;
                     }
 
-                    if clip_range.contains(&child.depth()) {
-                        // If the clip layer applies to the current child, check if the child is masked by the clip.
-                        // If the position isn't within the mask region, then treat this as a miss unconditionally.
-                        // We'll continue the outer loop over the children, as another child may be hit.
-                        if !clip.hit_test_shape(context, point, options) {
-                            res = Avm2MousePick::Miss;
+                    let mut res = if let Some(child) = child.as_interactive() {
+                        if child.as_displayobject().movie().is_action_script_3() {
+                            child.mouse_pick_avm2(context, point, require_button_mode)
+                        } else {
+                            let avm1_result =
+                                child.mouse_pick_avm1(context, point, require_button_mode);
+                            if let Some(result) = avm1_result {
+                                Avm2MousePick::Hit(result)
+                            } else {
+                                Avm2MousePick::Miss
+                            }
+                        }
+                    } else if child.hit_test_shape(context, point, options)
+                        && child
+                            .masker()
+                            .map(|mask| mask.hit_test_shape(context, point, options))
+                            .unwrap_or(true)
+                    {
+                        if self.mouse_enabled() {
+                            Avm2MousePick::Hit(this)
+                        } else {
+                            Avm2MousePick::PropagateToParent
+                        }
+                    } else {
+                        Avm2MousePick::Miss
+                    };
+
+                    if let Some(clip_layers) = clip_layers.as_mut() {
+                        while let Some((clip, clip_range)) = clip_layers.peek() {
+                            // This clip layer no longer applies to the remaining children (which all have lower depth values).
+                            // This is a rare case where we actually use 'child.depth()' in AVM2 - child.depth()
+                            // gets set from a PlaceObject tag, and may be *greater* than position in the render list.
+                            if *clip_range.start() > child.depth() {
+                                clip_layers.next();
+                                continue;
+                            }
+
+                            if clip_range.contains(&child.depth()) {
+                                // If the clip layer applies to the current child, check if the child is masked by the clip.
+                                // If the position isn't within the mask region, then treat this as a miss unconditionally.
+                                // We'll continue the outer loop over the children, as another child may be hit.
+                                if !clip.hit_test_shape(context, point, options) {
+                                    res = Avm2MousePick::Miss;
+                                }
+                            }
+                            break;
                         }
                     }
-                    break;
-                }
 
-                match res {
-                    Avm2MousePick::Hit(_) => {
-                        return res.combine_with_parent(self.into());
+                    match res {
+                        Avm2MousePick::Hit(_) => {
+                            return res.combine_with_parent(self.into());
+                        }
+                        Avm2MousePick::PropagateToParent => {
+                            found_propagate = Some(res);
+                        }
+                        Avm2MousePick::Miss => {}
                     }
-                    Avm2MousePick::PropagateToParent => {
-                        found_propagate = Some(res);
-                    }
-                    Avm2MousePick::Miss => {}
                 }
             }
 
@@ -3402,7 +3416,8 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
             // Check drawing, because this selects the current clip, it must have mouse enabled.
             // (Check for a drawing first, as computing the bounds involves all descendants.)
-            if let Some(drawing) = self.drawing()
+            if has_drawing
+                && let Some(drawing) = self.drawing()
                 && self.world_bounds(BoundsMode::Engine).contains(point)
                 && drawing.hit_test(local_matrix * point, &local_matrix)
             {

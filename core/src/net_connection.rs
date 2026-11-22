@@ -239,11 +239,15 @@ impl<'gc> NetConnections<'gc> {
         }
     }
 
-    pub fn update_connections(context: &mut UpdateContext<'gc>) {
+    pub fn update_connections(context: &mut UpdateContext<'gc>) -> bool {
+        if context.net_connections.connections.is_empty() {
+            return false;
+        }
         let player = context.player_handle();
         for (handle, connection) in context.net_connections.connections.iter_mut() {
             connection.update(handle, context.navigator, &player);
         }
+        true
     }
 
     pub fn send_without_response(
