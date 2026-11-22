@@ -1434,6 +1434,84 @@ measurements in busy Artix rooms:
 | `icestormunder` room 2 (6–7 players) | Shown FPS | 48–72 fps | **72 fps** steady (tries 144) |
 | `icestormunder` room 2 | Passes / cmdbufs per frame | 31–44 / ~66 | **10–13 / 3.0** |
 
+### 69. Automatic static-subtree and stage-backdrop caching (`AutoCache`, `BackdropCache`)
+
+*Files: `core/src/display_object.rs`, `core/src/display_object/stage.rs`,
+`core/src/display_object/container.rs`, `render/src/perf_flags.rs`.*
+
+Zero-visual-loss caching of static subtrees and static room map backdrops:
+
+* `BackdropCache` walks the stage in painter's order (descending through transparent
+  pass-through containers) to collect the longest leading prefix of static layers before
+  the first animated or ineligible sibling, rendering them once into an opaque viewport
+  texture (including all internal `Multiply`/`Overlay`/`Add`/`Screen` shadows over the
+  opaque stage background) and skipping those nodes in O(1) during `render_children`.
+* `AutoCache` caches individual static subtrees (with `color_transform` baked inside the
+  texture to avoid alpha-grouping differences) within a 64 MiB global budget.
+* Both track `last_invalidated_tick` and `last_transform_tick` on `DisplayObjectBase`
+  with exponential eviction backoff (`24 << evictions.min(3)` ticks), and `BackdropCache`
+  supports zero-rebuild prefix hits when trailing nodes briefly pause.
+* Flag: `auto-cache`.
+
+### 70. Disjoint multi-fill and multi-command direct blends
+
+*Files: `render/src/tessellator.rs`, `render/wgpu/src/mesh.rs`,
+`render/wgpu/src/surface/commands.rs`.*
+
+* During tessellation, per-fill-path 2D AABBs are checked for pairwise disjointness; shapes
+  with no strokes and ≤32 pairwise-disjoint fills set `Mesh::non_overlapping = true`,
+  allowing direct blending without an offscreen layer.
+* `direct_blend_mode_for` also accepts multi-command `Blend` groups (2–16 single-fill
+  shapes or bitmaps) whose 1 px-padded screen-space AABBs are pairwise disjoint, eliminating
+  offscreen blend passes and letting enclosing CABs stay in `LayerAtlas`.
+
+### 71. Per-level `cab-atlas` and `direct_to_filter_atlas` batching
+
+*Files: `render/wgpu/src/backend.rs`.*
+
+`cab-atlas` and `direct_to_filter_atlas` previously excluded any CAB referencing another
+CAB (`cab-atlas/nested`). Moving unfiltered atlas rendering inside the topological
+`for level in 0..=max_level` loop allows nested (`level >= 1`) CABs to batch cleanly into
+the layer and filter atlases once their `level < own_level` dependencies finish.
+
+### 72. O(1) `BitmapCache` clean-hit fast path and pause-safe inter-frame reuse
+
+*Files: `core/src/display_object.rs`.*
+
+When `!contents_changed`, no active `blends_in_tick`, and the stage view scale is
+unchanged, `render_base` now reuses the cached bitmap in O(1) before calling
+`render_bounds_with_transform` or cloning filters. This eliminates ~28k/s redundant bounds
+walks on clean CABs, stops spurious `source_width`/`source_height` rebuilds caused by ±1
+twip rounding jitter on pure subpixel translations (~264/s in Battleon), and removes the
+`cached_tick >= tick - 1` restriction that missed inter-frame delta hits after a pause.
+
+### 73. macOS `USER_INTERACTIVE` QoS for the async submit thread
+
+*Files: `render/wgpu/src/backend.rs` (`AsyncSubmitter::new`).*
+
+On Apple Silicon, `ruffle-wgpu-submit` spawned via `std::thread::Builder` inherited
+default QoS and was frequently scheduled on E-cores or preempted, turning ~2 ms
+`encoder.finish()` calls into 5–14 ms stalls (and 15–25 ms main-thread
+`wait_for_submission()` spikes that kicked `adapt_interpolation` out of 144 fps even at
+55–65% GPU). Calling `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)` on
+macOS pins submission onto P-cores alongside the main render loop, eliminating all >5 ms
+submit-thread stalls in steady state.
+
+### Measured impact of 69–73 (5120x1440 144 Hz, Apple M1, zero visual loss)
+
+All 151 Metal `visual/` image regression tests pass. Live measurements in Artix:
+
+* **`battleon-2` (quiet cell)**: locked **144.1 fps**, GPU **49–52%** (`3.4 ms/fr`, down from
+  `60%` / `4.2 ms/fr`), CPU render **0.83 ms** (`17%` busy).
+* **`battleon` (10 players in cell)**: CPU render **2.0–2.4 ms** (max **3.2–4.3 ms**, down
+  from 18–25 ms spikes), reaches 113–132 fps during 144 Hz trials with 0 submit stalls.
+* **`yulgar` (20 players in cell)**: CPU render **2.54–2.68 ms** avg / **3.22–4.04 ms** max
+  (down from 3.85 ms avg / 19.6 ms max, `23–25%` busy), GPU **56–60%** (`7.8–8.3 ms/fr`,
+  down from `67%` / `9.3 ms/fr`), passes **20.1** (down from 25.8), CAB rebuilds **31.3**
+  (down from 41.4), **0** submit-thread stalls >5 ms.
+* **`icestormunder` room 2 (6 players combat)**: GPU **51–58%** (`7.1–8.0 ms/fr`), CPU render
+  **2.4–2.8 ms** (max **3.1–5.0 ms**), **3.0** cmdbufs/fr.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
@@ -1804,7 +1882,7 @@ library, see 21), `async-present`, `overlap-record`, `blur-merge` (off by defaul
 library, see 25), `fetch-blends`, `merge-chunks`, `cache-slack`, `batch-large-filters`,
 `cache-bind-groups`, `filter-together`, `direct-blends`, `release-shapes`, `evict-meshes`,
 `paced-present`, `parallel-tessellation`, `skip-settled`, `discard-samples`,
-`stencil-per-target`, `direct-frame`. Measurement only (off): `skip-cache-filters`,
+`stencil-per-target`, `direct-frame`, `auto-cache`. Measurement only (off): `skip-cache-filters`,
 `complex-as-normal`.
 
 ### Measurement procedure
