@@ -44,7 +44,7 @@ pub struct GuiController {
     /// True after a frame bypassed `MovieView` by resolving directly into the swapchain,
     /// so the next frame that needs `MovieView` (e.g. when an egui menu opens) redraws it.
     movie_view_stale: bool,
-    surface: wgpu::Surface<'static>,
+    surface: Arc<wgpu::Surface<'static>>,
     surface_format: wgpu::TextureFormat,
     movie_view_renderer: Arc<MovieViewRenderer>,
     // Note that `window.get_inner_size` can change at any point on x11, even between two lines of code.
@@ -214,7 +214,7 @@ impl GuiController {
             repaint_after: Duration::ZERO,
             shows_ui: true,
             movie_view_stale: false,
-            surface,
+            surface: Arc::new(surface),
             surface_format,
             movie_view_renderer,
             size,
@@ -471,80 +471,132 @@ impl GuiController {
         let mut render_movie = Some(render_movie);
         let mut movie_drawn = false;
 
-        if can_direct_swapchain {
-            self.pending_presents.wait();
-            let acquire_start = Instant::now();
-            let surface_texture = match self.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                state @ (wgpu::CurrentSurfaceTexture::Lost
-                | wgpu::CurrentSurfaceTexture::Outdated) => {
-                    tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
-                    self.reconfigure_surface();
-                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-                    return (acquire_start.elapsed(), false);
+        if can_direct_swapchain
+            && let Some(ref mut p) = player
+            && let Some(renderer) =
+                <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(p.renderer_mut())
+        {
+            enum AcquiredSurface {
+                Ready(wgpu::SurfaceTexture),
+                Reconfigure,
+                Skip,
+            }
+            let surface = self.surface.clone();
+            let pending_presents = self.pending_presents.clone();
+            let expected_size = self.size;
+            let acquired: Arc<Mutex<Option<(AcquiredSurface, Duration)>>> =
+                Arc::new(Mutex::new(None));
+            let acquired_cb = acquired.clone();
+
+            let defer = ruffle_render::perf_flags::enabled(
+                ruffle_render::perf_flags::PerfFlag::AsyncSubmit,
+            );
+            renderer.set_defer_submit(defer);
+            renderer.set_direct_output_acquirer(Some(Box::new(move || {
+                let wait_start = Instant::now();
+                pending_presents.wait();
+                let res = surface.get_current_texture();
+                let wait = wait_start.elapsed();
+                ruffle_core::perf_stats::record_render_wait(wait);
+                match res {
+                    wgpu::CurrentSurfaceTexture::Success(t)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                        if t.texture.width() == expected_size.width
+                            && t.texture.height() == expected_size.height
+                        {
+                            let tex = t.texture.clone();
+                            *acquired_cb.lock().expect("acquired lock") =
+                                Some((AcquiredSurface::Ready(t), wait));
+                            ruffle_render_wgpu::backend::DirectOutputAcquire::Ready(tex)
+                        } else {
+                            drop(t);
+                            *acquired_cb.lock().expect("acquired lock") =
+                                Some((AcquiredSurface::Skip, wait));
+                            ruffle_render_wgpu::backend::DirectOutputAcquire::SkipFrame
+                        }
+                    }
+                    state @ (wgpu::CurrentSurfaceTexture::Lost
+                    | wgpu::CurrentSurfaceTexture::Outdated) => {
+                        tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
+                        *acquired_cb.lock().expect("acquired lock") =
+                            Some((AcquiredSurface::Reconfigure, wait));
+                        ruffle_render_wgpu::backend::DirectOutputAcquire::SkipFrame
+                    }
+                    wgpu::CurrentSurfaceTexture::Timeout => {
+                        tracing::warn!("Surface acquisition timed out, skipping a frame");
+                        *acquired_cb.lock().expect("acquired lock") =
+                            Some((AcquiredSurface::Skip, wait));
+                        ruffle_render_wgpu::backend::DirectOutputAcquire::SkipFrame
+                    }
+                    wgpu::CurrentSurfaceTexture::Occluded => {
+                        tracing::trace!("Surface is occluded, skipping a frame");
+                        *acquired_cb.lock().expect("acquired lock") =
+                            Some((AcquiredSurface::Skip, wait));
+                        ruffle_render_wgpu::backend::DirectOutputAcquire::SkipFrame
+                    }
+                    wgpu::CurrentSurfaceTexture::Validation => {
+                        panic!("wgpu: Acquiring a texture failed with a validation error");
+                    }
                 }
-                wgpu::CurrentSurfaceTexture::Timeout => {
-                    tracing::warn!("Surface acquisition timed out, skipping a frame");
-                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-                    return (acquire_start.elapsed(), false);
-                }
-                wgpu::CurrentSurfaceTexture::Occluded => {
-                    tracing::trace!("Surface is occluded, skipping a frame");
-                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-                    return (acquire_start.elapsed(), false);
-                }
-                wgpu::CurrentSurfaceTexture::Validation => {
-                    panic!("wgpu: Acquiring a texture failed with a validation error");
-                }
-            };
-            let acquire_wait = acquire_start.elapsed();
-            if surface_texture.texture.width() == self.size.width
-                && surface_texture.texture.height() == self.size.height
-                && let Some(ref mut p) = player
-                && let Some(renderer) =
-                    <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(p.renderer_mut())
-            {
-                let defer = ruffle_render::perf_flags::enabled(
-                    ruffle_render::perf_flags::PerfFlag::AsyncSubmit,
-                );
-                renderer.set_defer_submit(defer);
-                renderer.set_direct_output(Some(surface_texture.texture.clone()));
-                if let Some(f) = render_movie.take() {
-                    f(p);
-                }
-                let renderer =
-                    <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(p.renderer_mut())
-                        .expect("checked above");
-                renderer.set_direct_output(None);
-                self.window.pre_present_notify();
-                let queue = self.descriptors.queue.clone();
-                if renderer.has_deferred_frame() {
-                    let guard = self.pending_presents.start();
-                    renderer.submit_deferred_frame(
-                        Vec::new(),
-                        Some(Box::new(move || {
+            })));
+
+            if let Some(f) = render_movie.take() {
+                f(p);
+            }
+            let renderer =
+                <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(p.renderer_mut())
+                    .expect("checked above");
+            renderer.set_direct_output_acquirer(None);
+
+            match acquired.lock().expect("acquired lock").take() {
+                Some((AcquiredSurface::Ready(surface_texture), acquire_wait)) => {
+                    self.window.pre_present_notify();
+                    let queue = self.descriptors.queue.clone();
+                    if renderer.has_deferred_frame() {
+                        let guard = self.pending_presents.start();
+                        renderer.submit_deferred_frame(
+                            Vec::new(),
+                            Some(Box::new(move || {
+                                ruffle_render_wgpu::backend::set_present_time(present_time);
+                                queue.present(surface_texture);
+                                drop(guard);
+                            })),
+                        );
+                    } else {
+                        let guard = self.pending_presents.start();
+                        renderer.run_after_submissions(Box::new(move || {
                             ruffle_render_wgpu::backend::set_present_time(present_time);
                             queue.present(surface_texture);
                             drop(guard);
-                        })),
-                    );
-                } else {
-                    let guard = self.pending_presents.start();
-                    renderer.run_after_submissions(Box::new(move || {
-                        ruffle_render_wgpu::backend::set_present_time(present_time);
-                        queue.present(surface_texture);
-                        drop(guard);
-                    }));
+                        }));
+                    }
+                    self.movie_view_stale = true;
+                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                    #[cfg(feature = "tracy")]
+                    tracing_tracy::client::frame_mark();
+                    return (acquire_wait, true);
                 }
-                self.movie_view_stale = true;
-                self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
-                #[cfg(feature = "tracy")]
-                tracing_tracy::client::frame_mark();
-                return (acquire_wait, true);
+                Some((AcquiredSurface::Reconfigure, acquire_wait)) => {
+                    if renderer.has_deferred_frame() {
+                        renderer.submit_deferred_frame(Vec::new(), None);
+                    }
+                    self.reconfigure_surface();
+                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                    return (acquire_wait, false);
+                }
+                Some((AcquiredSurface::Skip, acquire_wait)) => {
+                    if renderer.has_deferred_frame() {
+                        renderer.submit_deferred_frame(Vec::new(), None);
+                    }
+                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                    return (acquire_wait, false);
+                }
+                None => {
+                    // `f(p)` did not submit a frame (e.g. player paused without drawing).
+                    self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
+                    return (Duration::ZERO, false);
+                }
             }
-            // Mid-resize mismatch: drop the mismatched swapchain texture and fall through.
-            drop(surface_texture);
         }
 
         if need_movie

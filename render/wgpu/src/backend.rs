@@ -69,6 +69,13 @@ pub fn create_wgpu_instance(
     })
 }
 
+/// Result of lazily acquiring a swapchain texture for direct-to-swapchain MSAA resolve
+/// right before the final main pass is encoded.
+pub enum DirectOutputAcquire {
+    Ready(wgpu::Texture),
+    SkipFrame,
+}
+
 pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) descriptors: Arc<Descriptors>,
     target: T,
@@ -103,9 +110,12 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     /// submitting + presenting in one job.
     defer_submit: bool,
     deferred_frame_pending: bool,
-    /// Optional swapchain texture to resolve the frame straight into (bypassing `MovieView`
-    /// and the fullscreen `egui_render` blit pass when no egui UI is visible).
-    direct_output: Option<wgpu::Texture>,
+    /// Optional lazy acquirer for a swapchain texture to resolve the frame straight into
+    /// (bypassing `MovieView` and the fullscreen `egui_render` blit pass when no egui UI is
+    /// visible). Invoked right before the final main pass so display-list building,
+    /// tessellation, and offscreen cache/filter passes overlap with waiting for the next
+    /// drawable.
+    direct_output_acquirer: Option<Box<dyn FnOnce() -> DirectOutputAcquire>>,
     /// Cached full-window `Surface` matching `direct_output`'s dimensions, format, and quality.
     direct_surface: Option<((u32, u32), wgpu::TextureFormat, StageQuality, Surface)>,
 }
@@ -312,7 +322,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             cab_cache: crate::filters::FilteredCabCache::new(),
             defer_submit: false,
             deferred_frame_pending: false,
-            direct_output: None,
+            direct_output_acquirer: None,
             direct_surface: None,
         })
     }
@@ -414,10 +424,14 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         self.defer_submit = defer;
     }
 
-    /// Sets a one-shot swapchain texture for the next `submit_frame` to resolve straight
-    /// into, bypassing `target` (`MovieView`) and any fullscreen GUI blit pass.
-    pub fn set_direct_output(&mut self, texture: Option<wgpu::Texture>) {
-        self.direct_output = texture;
+    /// Sets a one-shot lazy swapchain-texture acquirer for the next `submit_frame` to
+    /// resolve straight into, bypassing `target` (`MovieView`) and any fullscreen GUI blit
+    /// pass.
+    pub fn set_direct_output_acquirer(
+        &mut self,
+        acquirer: Option<Box<dyn FnOnce() -> DirectOutputAcquire>>,
+    ) {
+        self.direct_output_acquirer = acquirer;
     }
 
     pub fn has_deferred_frame(&self) -> bool {
@@ -1282,135 +1296,137 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             .scope("Frame commands", &mut self.active_frame.command_encoder);
         let filter_atlas_ref =
             (!self.filter_atlas.slots.is_empty()).then_some(&self.filter_atlas);
-        if let Some(swap_tex) = self.direct_output.take() {
-            let swap_w = swap_tex.width();
-            let swap_h = swap_tex.height();
-            let swap_fmt = swap_tex.format();
-            let quality = self.surface.quality();
-            let fetch_blends = self.descriptors.shaders.fetch_blend_shaders.is_some()
-                && ruffle_render::perf_flags::enabled(
-                    ruffle_render::perf_flags::PerfFlag::FetchBlends,
-                );
-            let has_stage_blends = commands.commands.iter().any(|cmd| match cmd {
-                ruffle_render::commands::Command::Blend(_, mode)
-                | ruffle_render::commands::Command::BlendBounded(_, mode, _) => match mode {
-                    ruffle_render::commands::RenderBlendMode::Shader(_) => true,
-                    ruffle_render::commands::RenderBlendMode::Builtin(b) if !fetch_blends => {
-                        matches!(
-                            crate::blend::BlendType::from(
-                                ruffle_render::commands::RenderBlendMode::Builtin(*b)
-                            ),
-                            crate::blend::BlendType::Complex(_)
-                        )
-                    }
-                    _ => false,
-                },
-                _ => false,
-            });
-            if !has_stage_blends && clear.a == 255 {
-                let mut commands = commands;
-                let has_letterbox = self
-                    .visible_region
-                    .is_some_and(|(x, y, w, h)| x != 0 || y != 0 || w != swap_w || h != swap_h);
-                let (scissor, pass_clear) = if has_letterbox {
-                    let (rx, ry, rw, rh) = self.visible_region.expect("checked above");
-                    let sx = rx.max(0) as u32;
-                    let sy = ry.max(0) as u32;
-                    let sw = rw.min(swap_w.saturating_sub(sx));
-                    let sh = rh.min(swap_h.saturating_sub(sy));
-                    if clear != Color::BLACK && sw > 0 && sh > 0 {
-                        commands.commands.insert(
-                            0,
-                            ruffle_render::commands::Command::DrawRect {
-                                color: clear,
-                                matrix: ruffle_render::matrix::Matrix::translate(
-                                    swf::Twips::from_pixels_i32(rx),
-                                    swf::Twips::from_pixels_i32(ry),
-                                ) * ruffle_render::matrix::Matrix::scale(
-                                    rw as f32, rh as f32,
+        if let Some(acquirer) = self.direct_output_acquirer.take() {
+            if let DirectOutputAcquire::Ready(swap_tex) = acquirer() {
+                let swap_w = swap_tex.width();
+                let swap_h = swap_tex.height();
+                let swap_fmt = swap_tex.format();
+                let quality = self.surface.quality();
+                let fetch_blends = self.descriptors.shaders.fetch_blend_shaders.is_some()
+                    && ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::FetchBlends,
+                    );
+                let has_stage_blends = commands.commands.iter().any(|cmd| match cmd {
+                    ruffle_render::commands::Command::Blend(_, mode)
+                    | ruffle_render::commands::Command::BlendBounded(_, mode, _) => match mode {
+                        ruffle_render::commands::RenderBlendMode::Shader(_) => true,
+                        ruffle_render::commands::RenderBlendMode::Builtin(b) if !fetch_blends => {
+                            matches!(
+                                crate::blend::BlendType::from(
+                                    ruffle_render::commands::RenderBlendMode::Builtin(*b)
                                 ),
-                            },
-                        );
-                    }
-                    (Some((sx, sy, sw, sh)), wgpu::Color::BLACK)
-                } else {
-                    (None, clear_wgpu)
-                };
-                if !matches!(
-                    &self.direct_surface,
-                    Some((size, fmt, q, _))
-                        if *size == (swap_w, swap_h) && *fmt == swap_fmt && *q == quality
-                ) {
-                    self.direct_surface = Some((
-                        (swap_w, swap_h),
-                        swap_fmt,
-                        quality,
-                        Surface::new(&self.descriptors, quality, swap_w, swap_h, swap_fmt),
-                    ));
-                }
-                let direct_surface = &mut self.direct_surface.as_mut().expect("just created").3;
-                direct_surface.set_scissor(scissor);
-                let target = direct_surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(swap_tex, pass_clear),
-                    &self.descriptors,
-                    &self.meshes,
-                    commands,
-                    &mut self.active_frame.staging_belt,
-                    &self.active_frame.dynamic_transforms,
-                    &mut scope,
-                    LayerRef::None,
-                    &mut self.texture_pool,
-                    filter_atlas_ref,
-                );
-                target.ensure_cleared(&mut scope);
-            } else {
-                // Rare fallback (PixelBender shader blend on stage or transparent stage):
-                // render to a pooled surface and copy into the swapchain without requiring
-                // `TEXTURE_BINDING` / `COPY_SRC` on the swapchain texture.
-                let surface = match self.visible_region {
-                    Some(region) => {
-                        if !matches!(&self.region_surface, Some((r, s)) if *r == region && s.quality() == quality)
-                        {
-                            let (x, y, width, height) = region;
-                            self.region_surface = Some((
-                                region,
-                                Surface::new(
-                                    &self.descriptors,
-                                    quality,
-                                    width,
-                                    height,
-                                    self.target.format(),
-                                )
-                                .with_origin((x, y)),
-                            ));
+                                crate::blend::BlendType::Complex(_)
+                            )
                         }
-                        &self.region_surface.as_ref().expect("just created").1
+                        _ => false,
+                    },
+                    _ => false,
+                });
+                if !has_stage_blends && clear.a == 255 {
+                    let mut commands = commands;
+                    let has_letterbox = self
+                        .visible_region
+                        .is_some_and(|(x, y, w, h)| x != 0 || y != 0 || w != swap_w || h != swap_h);
+                    let (scissor, pass_clear) = if has_letterbox {
+                        let (rx, ry, rw, rh) = self.visible_region.expect("checked above");
+                        let sx = rx.max(0) as u32;
+                        let sy = ry.max(0) as u32;
+                        let sw = rw.min(swap_w.saturating_sub(sx));
+                        let sh = rh.min(swap_h.saturating_sub(sy));
+                        if clear != Color::BLACK && sw > 0 && sh > 0 {
+                            commands.commands.insert(
+                                0,
+                                ruffle_render::commands::Command::DrawRect {
+                                    color: clear,
+                                    matrix: ruffle_render::matrix::Matrix::translate(
+                                        swf::Twips::from_pixels_i32(rx),
+                                        swf::Twips::from_pixels_i32(ry),
+                                    ) * ruffle_render::matrix::Matrix::scale(
+                                        rw as f32, rh as f32,
+                                    ),
+                                },
+                            );
+                        }
+                        (Some((sx, sy, sw, sh)), wgpu::Color::BLACK)
+                    } else {
+                        (None, clear_wgpu)
+                    };
+                    if !matches!(
+                        &self.direct_surface,
+                        Some((size, fmt, q, _))
+                            if *size == (swap_w, swap_h) && *fmt == swap_fmt && *q == quality
+                    ) {
+                        self.direct_surface = Some((
+                            (swap_w, swap_h),
+                            swap_fmt,
+                            quality,
+                            Surface::new(&self.descriptors, quality, swap_w, swap_h, swap_fmt),
+                        ));
                     }
-                    None => &self.surface,
-                };
-                let target = surface.draw_commands(
-                    RenderTargetMode::FreshWithColor(clear_wgpu),
-                    &self.descriptors,
-                    &self.meshes,
-                    commands,
-                    &mut self.active_frame.staging_belt,
-                    &self.active_frame.dynamic_transforms,
-                    &mut scope,
-                    LayerRef::None,
-                    &mut self.texture_pool,
-                    filter_atlas_ref,
-                );
-                let swap_view = swap_tex.create_view(&Default::default());
-                crate::utils::run_copy_pipeline_into_region(
-                    &self.descriptors,
-                    swap_fmt,
-                    &swap_view,
-                    target.color_view(),
-                    target.globals(),
-                    1,
-                    &mut scope,
-                    self.visible_region,
-                );
+                    let direct_surface = &mut self.direct_surface.as_mut().expect("just created").3;
+                    direct_surface.set_scissor(scissor);
+                    let target = direct_surface.draw_commands(
+                        RenderTargetMode::ExistingWithColor(swap_tex, pass_clear),
+                        &self.descriptors,
+                        &self.meshes,
+                        commands,
+                        &mut self.active_frame.staging_belt,
+                        &self.active_frame.dynamic_transforms,
+                        &mut scope,
+                        LayerRef::None,
+                        &mut self.texture_pool,
+                        filter_atlas_ref,
+                    );
+                    target.ensure_cleared(&mut scope);
+                } else {
+                    // Rare fallback (PixelBender shader blend on stage or transparent stage):
+                    // render to a pooled surface and copy into the swapchain without requiring
+                    // `TEXTURE_BINDING` / `COPY_SRC` on the swapchain texture.
+                    let surface = match self.visible_region {
+                        Some(region) => {
+                            if !matches!(&self.region_surface, Some((r, s)) if *r == region && s.quality() == quality)
+                            {
+                                let (x, y, width, height) = region;
+                                self.region_surface = Some((
+                                    region,
+                                    Surface::new(
+                                        &self.descriptors,
+                                        quality,
+                                        width,
+                                        height,
+                                        self.target.format(),
+                                    )
+                                    .with_origin((x, y)),
+                                ));
+                            }
+                            &self.region_surface.as_ref().expect("just created").1
+                        }
+                        None => &self.surface,
+                    };
+                    let target = surface.draw_commands(
+                        RenderTargetMode::FreshWithColor(clear_wgpu),
+                        &self.descriptors,
+                        &self.meshes,
+                        commands,
+                        &mut self.active_frame.staging_belt,
+                        &self.active_frame.dynamic_transforms,
+                        &mut scope,
+                        LayerRef::None,
+                        &mut self.texture_pool,
+                        filter_atlas_ref,
+                    );
+                    let swap_view = swap_tex.create_view(&Default::default());
+                    crate::utils::run_copy_pipeline_into_region(
+                        &self.descriptors,
+                        swap_fmt,
+                        &swap_view,
+                        target.color_view(),
+                        target.globals(),
+                        1,
+                        &mut scope,
+                        self.visible_region,
+                    );
+                }
             }
         } else {
             let surface = match self.visible_region {

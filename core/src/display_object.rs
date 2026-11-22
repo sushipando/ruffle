@@ -1625,9 +1625,19 @@ fn try_auto_cache<'gc>(
         }
         _ => false,
     };
+    // Non-Normal blend layers (Multiply, Overlay, Add, Layer, etc.) with >1 fill/child
+    // otherwise pay an offscreen LayerAtlas MSAA pass every frame; caching them into a
+    // single bitmap lets `direct_blend_mode_for` draw them inline in the main pass with
+    // hardware blending or Metal framebuffer fetch.
+    let is_blend_layer = blend_mode != ExtendedBlendMode::Normal;
+    let min_cost = if is_blend_layer {
+        2
+    } else {
+        AUTO_CACHE_MIN_COST
+    };
     let eligible = sub_ok
-        && draw_cost >= AUTO_CACHE_MIN_COST
-        && (!has_non_normal_blend || is_backdrop || blend_mode != ExtendedBlendMode::Normal);
+        && draw_cost >= min_cost
+        && (!has_non_normal_blend || is_backdrop || is_blend_layer);
     if !eligible {
         this.base().cell.borrow_mut().auto_cache_rejected = true;
         return None;
@@ -1658,7 +1668,8 @@ fn try_auto_cache<'gc>(
     }
     let width = (x1 - x0) as u32;
     let height = (y1 - y0) as u32;
-    if !(16..=4096).contains(&width) || !(16..=4096).contains(&height) {
+    let min_dim = if is_blend_layer { 4 } else { 16 };
+    if !(min_dim..=4096).contains(&width) || !(min_dim..=4096).contains(&height) {
         this.base().cell.borrow_mut().auto_cache_rejected = true;
         return None;
     }

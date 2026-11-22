@@ -16,6 +16,15 @@ pub fn enabled() -> bool {
 
 static INNER_GOTO_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static INNER_GOTOS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static RENDER_WAIT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records time spent blocked waiting for a swapchain drawable inside `Player::render`,
+/// so `PerfStats::record_render` reports active CPU render time rather than vsync idle wait.
+pub fn record_render_wait(d: Duration) {
+    if enabled() {
+        RENDER_WAIT_NANOS.fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Adds the time a goto spent running frame construction and frame scripts for the whole
 /// stage (see `run_inner_goto_frame`).
@@ -106,7 +115,9 @@ impl PerfStats {
     }
 
     pub fn record_render(&mut self, d: Duration) {
-        self.render.add(d);
+        let wait_ns = RENDER_WAIT_NANOS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        self.render
+            .add(d.saturating_sub(Duration::from_nanos(wait_ns)));
         let (tessellation, shapes) = tessellation_stats::take();
         self.tessellation.add(tessellation);
         self.tessellated_shapes += shapes;

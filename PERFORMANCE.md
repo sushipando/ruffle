@@ -1795,6 +1795,59 @@ the parent avatar `MovieClip` every frame.
   **3.5–4.1 → 2.68–3.02 ms**, and lifting live 20p `yulgar` framerate from **47–51 fps (2×)** to
   **72–94 fps (3×–4×)** with zero visual loss (all 151 Metal `visual/` regression tests pass).
 
+### 91. `AutoCache` blend-layer bypass
+
+*File: `core/src/display_object.rs` (`try_auto_cache`).*
+
+Multi-fill/stroke static shapes and small clips with non-`Normal` blend modes (`Multiply`,
+`Overlay`, `Add`, `HardLight`, `Layer`, etc.) fell below the normal `AutoCache` thresholds
+(`AUTO_CACHE_MIN_COST = 6`, `16 px` minimum dimension), forcing `LayerAtlas` to rasterize
+them into an offscreen 4× MSAA atlas and composite them back every single frame (77–90
+`blend-trivial` layers/fr in `yulgar`, triggering 50-layer atlas passes).
+
+* Lowered `try_auto_cache` thresholds for `blend_mode != ExtendedBlendMode::Normal` to
+  `min_cost = 2` and `min_dim = 4` (leaving single-draw shapes at `draw_cost == 1` alone
+  since `direct_blend_mode_for` already handles them inline with zero passes). Once cached
+  into a persistent bitmap, `direct_blend_mode_for` composites the static blend layer inline
+  in the main pass via hardware blending or Metal framebuffer fetch.
+* Live Artix 20p `yulgar`: `blend-trivial` dropped **~55–65%** (**77 → 26.5–39.3/fr**;
+  `Multiply/small/1cmd` **45 → 5–10**, `atlas/50layers` **1.0 → 0.0**), `direct-blend` rose
+  from **378 → 614–627/fr**, passes fell from **13.9–14.7 → 10.0–12.3/fr**, and 72 fps GPU
+  busy dropped **66–69% → 56–63%** (`3.87–4.08 → 3.18–3.68 ms/cmdbuf`).
+
+### 92. Deferred swapchain acquire and paced subframe lead
+
+*Files: `render/wgpu/src/backend.rs` (`DirectOutputAcquire`, `set_direct_output_acquirer`,
+`submit_frame`), `desktop/src/gui/controller.rs` (`render`), `desktop/src/app.rs`
+(`schedule_subframes`, `RedrawRequested`), `core/src/perf_stats.rs` (`record_render_wait`),
+`core/src/lib.rs`.*
+
+With direct swapchain resolution (88), `GuiController::render` called
+`pending_presents.wait()` and `surface.get_current_texture()` *before* `Player::render()`,
+leaving the main thread idle waiting for a `CAMetalLayer` drawable before starting CPU
+display-list traversal, parallel tessellation, and offscreen `AutoCache`/filter passes. In
+addition, paced interpolated subframes only woke up at `due`, leaving no overlap between
+CPU preparation and the next swapchain slot.
+
+* Replaced eager `set_direct_output` with a lazy `set_direct_output_acquirer` closure
+  invoked inside `WgpuRenderBackend::submit_frame` right before encoding the final main pass
+  (after display-list traversal, `finish_pending_shapes`, `cache_entries`, `filter_together`,
+  and `apply_filters_batched`), while recording wait time via
+  `perf_stats::record_render_wait` so `RUFFLE_PERF=1` continues reporting active CPU render
+  time rather than vsync idle wait.
+* In `schedule_subframes`, when `pacing_delay` is active (`presentAtTime`), start subframes
+  (`due > start`) up to `min(step * 0.25, 2 ms)` early (`1.73 ms` at 144 Hz) without changing
+  `present_time`, guarded by `end_cutoff = end - 50 µs` so nanosecond `Duration::from_secs_f64`
+  rounding (`6 × 6,944,444 ns = 41,666,664 ns < 41,666,667 ns`) never schedules a phantom
+  subframe before the next movie tick. Widened the post-submit GC slice slack guard to
+  `>= 2.2 ms` (leaving `1.5 ms` before the next wakeup).
+* Live Artix (5120×1440, 144 Hz, `--interpolate 6`, High quality / 4× MSAA): `icestormunder`
+  room 1 locked at **143.9–144.3 fps** (`1.0` pass, `29–34%` GPU); `icestormunder` room 2
+  active combat held **139.2–144.2 fps** continuously across the full 18 s window without
+  dropping to 72 fps (`9.8–10.6` passes, `58–63%` GPU, `1.26–1.41 ms` CPU render); 20p
+  `yulgar` held **72.0 fps** at **56–63% GPU** (`2.31–2.81 ms` CPU render) and stepped up to
+  **108.9 fps** (`62%` GPU, `10.0` passes). All 151 Metal `visual/` regression tests pass.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

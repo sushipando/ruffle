@@ -222,10 +222,10 @@ impl MainWindow {
                     let slack = next_event
                         .map(|due| due.saturating_duration_since(now))
                         .unwrap_or(Duration::from_millis(2));
-                    if slack >= Duration::from_micros(1500) {
+                    if slack >= Duration::from_micros(2200) {
                         let budget = slack
-                            .saturating_sub(Duration::from_millis(1))
-                            .min(Duration::from_micros(1200));
+                            .saturating_sub(Duration::from_micros(1500))
+                            .min(Duration::from_micros(1000));
                         player.collect_gc_slice(budget);
                     }
                 }
@@ -707,15 +707,25 @@ impl MainWindow {
         let step = Duration::from_secs_f64(subframes.step);
         let end = start + Duration::from_secs_f64(subframes.frame_duration);
         let due = self.next_due.unwrap_or(start);
-        if now >= due && due < end {
+        // When presentation is paced (`presentAtTime`), start preparing subsequent
+        // subframes up to 25% of a step (max 2 ms) before `due` so CPU display-list
+        // building and cache encoding overlap with waiting for the next swapchain
+        // drawable, without changing when the frame is actually displayed on screen.
+        let pacing = self.pacing_delay(subframes.frame_duration);
+        let lead = if pacing.is_some() && due > start {
+            Duration::from_secs_f64((subframes.step * 0.25).min(0.002))
+        } else {
+            Duration::ZERO
+        };
+        let end_cutoff = end.checked_sub(Duration::from_micros(50)).unwrap_or(end);
+        let ready = due.checked_sub(lead).unwrap_or(due);
+        if now >= ready && due < end_cutoff {
             // Skip frames that are already late: whose time to be shown has passed, when
             // presentation is paced (a frame may start late, for example the first after a
             // movie frame, which waits for the movie frame to run, and still be shown on
             // time), or otherwise, when the next one is due. But draw the last one before
             // the next movie frame in any case.
-            let late = self
-                .pacing_delay(subframes.frame_duration)
-                .map_or(subframes.step, |delay| delay.as_secs_f64());
+            let late = pacing.map_or(subframes.step, |delay| delay.as_secs_f64());
             let behind = now.saturating_duration_since(due).as_secs_f64() - late;
             let skip = if behind >= 0.0 {
                 (behind / subframes.step).floor() as u32 + 1
@@ -741,11 +751,17 @@ impl MainWindow {
         self.adapt_interpolation(now, subframes.frame_duration);
         self.next_frame_time = self.next_tick_time;
         if let Some(next) = self.next_due
-            && next < end
+            && next < end_cutoff
         {
+            let next_lead = if pacing.is_some() {
+                Duration::from_secs_f64((subframes.step * 0.25).min(0.002))
+            } else {
+                Duration::ZERO
+            };
+            let wake = next.checked_sub(next_lead).unwrap_or(next);
             self.next_frame_time = Some(match self.next_tick_time {
-                Some(tick_time) => tick_time.min(next),
-                None => next,
+                Some(tick_time) => tick_time.min(wake),
+                None => wake,
             });
         }
     }
