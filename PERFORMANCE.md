@@ -1512,6 +1512,82 @@ All 151 Metal `visual/` image regression tests pass. Live measurements in Artix:
 * **`icestormunder` room 2 (6 players combat)**: GPU **51–58%** (`7.1–8.0 ms/fr`), CPU render
   **2.4–2.8 ms** (max **3.1–5.0 ms**), **3.0** cmdbufs/fr.
 
+### 74. Stencil-masked and inline-blended CABs in `LayerAtlas` & `direct_to_filter_atlas`
+
+*Files: `render/wgpu/src/surface/layer_atlas.rs` (`is_cab_leaf`, `render_into_atlas`), `render/wgpu/src/surface/commands.rs` (`chunk_leaf_layers`, `bounded_blend_rect`), `render/wgpu/src/backend.rs`.*
+
+`cab-atlas` and `direct_to_filter_atlas` previously rejected any CAB containing stencil masks
+(`cab-atlas/mask`) or nested inline-blendable blends (`cab-atlas/blend`), forcing each such
+CAB onto its own MSAA render target and pass (3–9 per frame in busy rooms). Tracking balanced
+mask depth in `check_leaf_commands`, pre-rendering one level of nested leaf blends into a
+shared inner `AtlasLayers`, attaching the stencil buffer when any chunk uses masks, and
+clamping CAB-local blend rects to `(0, 0, sw, sh)` brings `cab-atlas` hit rates to **99–100%**
+across Battleon, Yulgar, and Icestormunder.
+
+### 75. Tick- and sub-frame-scoped direct sampling from the filter atlas (`RenderFilterAtlas`)
+
+*Files: `render/src/backend.rs` (`CacheVolatility`), `render/src/filters.rs` (`render_tick`), `core/src/display_object.rs`, `core/src/player.rs`, `render/wgpu/src/filters/batch.rs` (`FilterAtlasResult`), `render/wgpu/src/surface/commands.rs`, `render/wgpu/src/surface/layer_atlas.rs`, `render/wgpu/src/backend.rs`.*
+
+Filtered CABs that rebuild on interpolated sub-frames (`CacheVolatility::Subframe`, when
+`blends_now && is_inter_frame()`) or on 3+ consecutive movie ticks (`CacheVolatility::Tick`,
+continuously animating 24 fps effects) skip copying their filtered output out of the filter
+atlas into individual CAB textures. Instead, the main pass (and higher-level CAB passes)
+sample their slot directly from the filter atlas via `DrawCommand::RenderFilterAtlas` (supporting
+both `Trivial` and Metal `Fetch` blends, color transforms, masks, and `CacheSlack` sub-regions).
+`Tick` atlases remain live across all interpolated sub-frames of the same movie tick so clean
+sub-frames still hit the O(1) `fast_hit` path with zero extra rebuilds, and expire immediately
+when `render_tick` advances. Eliminates 77–98% of filtered CAB copy-out blits and per-CAB bind
+groups in Battleon and Icestormunder (48–95% in Yulgar).
+
+### 76. `used_size` CAB packing, tightly-packed blur downscale pyramid, and multi-step filter compaction
+
+*Files: `render/src/backend.rs`, `core/src/display_object.rs`, `render/wgpu/src/backend.rs`, `render/wgpu/src/filters/batch.rs`.*
+
+* **Exclude `CacheSlack` dead padding**: Passing `(used_width, used_height)` in
+  `BitmapCacheEntry::size` lets `cab-atlas` and `filter-together` pack, scissor, filter, and
+  copy only the live pixels rather than the 32–64 px slack margin.
+* **Tightly-packed downscale pyramid**: Each intermediate blur downscale level now packs only
+  the bitmaps that actually need that scale (with per-item transparent gutters) instead of
+  allocating a `(atlas_w / scale, atlas_h / scale)` texture for the entire atlas.
+* **Multi-step compaction**: `apply_together` now finalizes entries whose last filter finishes
+  at `step` immediately and repacks only remaining multi-filter entries tightly into `step + 1`'s
+  target, eliminating full-atlas allocations and pass-through shader copies of already-finished
+  1-filter CABs.
+
+### 77. Batched identical-uniform filter quads (`batch_quad_indices`)
+
+*Files: `render/wgpu/src/descriptors.rs` (`Quad::batch_quad_indices`), `render/wgpu/src/filters/batch.rs` (`Uniforms`, `draw_batched_quads`).*
+
+`Uniforms::push` now deduplicates identical blur kernel, glow, and color-matrix uniform
+payloads, sorts quads by uniform offset, and merges consecutive same-offset quads into a
+single `set_bind_group` + `draw_indexed` call (collapsing all downscale/upscale quads and
+identical glow/blur kernels into 1 draw call per group instead of 1 per CAB).
+
+### 78. Extended mesh eviction window (`UNUSED_SECONDS = 600`)
+
+*Files: `core/src/player.rs` (`evict_unused_tessellations`).*
+
+Raised `UNUSED_SECONDS` from 120 s to 600 s so temporarily off-screen spell effects and
+equipment stay tessellated during long combat sessions without mid-combat re-tessellation
+hitches.
+
+### Measured impact of 74–78 (5120x1440 144 Hz, Apple M1, zero visual loss)
+
+All 151 Metal `visual/` image regression tests and 177 unit tests pass. Live Artix results:
+
+* **`battleon` (5–10 players in cell)**: Now holds **6× interpolation** — **144.0 fps locked**
+  in 5p `battleon-7` (passes **8.2**, targets **3.3**, GPU **60–62%** / **4.25 ms/fr**, CPU
+  render **1.35–1.43 ms**, `filter-atlas-direct` **98%**) and **134–141 fps** in packed 10p
+  `battleon-2` (passes **25.4 → 15.3**, targets **17.8 → 5.9**, GPU **5.0–5.3 ms/fr**,
+  `cab-atlas/yes` **100%**).
+* **`icestormunder` room 2 (6–7 players combat)**: Passes **24–33 → 12.6–18.2**, targets
+  **14–21 → 3.6–5.9**, GPU **7.1–8.0 ms/fr → 5.9–6.5 ms/fr** (normal 6p combat, **43–49%** at
+  72 fps / **55%** at 144 Hz trial), CPU render **2.4–2.8 ms → 1.46–1.62 ms**, `cab-atlas/yes`
+  **99–100%**, `filter-atlas-direct` **77%**.
+* **`yulgar` (17–19 players, 95–113 filtered CABs/fr)**: `cab-atlas/yes` **100%**, passes
+  **20.0–22.2**, targets **5.9–6.4**, `filter-atlas-direct` **48–95%** (zero visual regressions
+  across heavy overlapping glows, wings, and masks).
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:
