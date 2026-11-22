@@ -25,6 +25,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::num::NonZero;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use swf::{ColorTransform, Fixed8};
 
 mod avm1_button;
@@ -135,11 +136,12 @@ pub struct BitmapCache {
     /// If false, frame-by-frame changes don't change across sub-frames of the same tick.
     blends_in_tick: bool,
 
-    /// The movie frame tick when `bitmap` was last drawn (for inter-frame delta reuse).
-    cached_tick: u32,
-
     /// The `offset` (origin + filter draw_offset) used when `bitmap` was last drawn.
     cached_offset: Point<Twips>,
+
+    /// Stage view scale when `bitmap` was last drawn (filters scale by stage view matrix).
+    stage_scale_x: f32,
+    stage_scale_y: f32,
 }
 
 impl BitmapCache {
@@ -453,9 +455,42 @@ pub struct DisplayObjectBase<'gc> {
 
     /// Rectangle used for 9-slice scaling (`DisplayObject.scale9grid`).
     scaling_grid: Cell<Rectangle<Twips>>,
+
+    /// Movie tick when `invalidate_cached_bitmap` last ran on this object.
+    last_invalidated_tick: Cell<u32>,
+
+    /// Movie tick when this object's own matrix or color transform last changed.
+    last_transform_tick: Cell<u32>,
 }
 
-#[derive(Clone)]
+/// Total GPU texture bytes currently allocated to automatic static-subtree caches.
+static AUTO_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
+const MAX_AUTO_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const AUTO_CACHE_STABLE_TICKS: u32 = 24;
+const AUTO_CACHE_MIN_COST: usize = 6;
+
+#[derive(Debug)]
+struct AutoCache {
+    bitmap: BitmapInfo,
+    /// Exact world matrix (including stage viewport transform) when cached.
+    matrix: Matrix,
+    /// Exact world color transform baked into the cached texture.
+    color_transform: ColorTransform,
+    /// Integer viewport pixel origin of the cached texture.
+    origin: Point<i32>,
+    /// Stage viewport bounds when cached (invalidates on resize/letterbox change).
+    viewport_bounds: Rectangle<Twips>,
+    /// Stage background color if cached as bottom-most backdrop, else `None`.
+    backdrop_clear: Option<Color>,
+    bytes: usize,
+}
+
+impl Drop for AutoCache {
+    fn drop(&mut self) {
+        AUTO_CACHE_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 struct DisplayObjectBaseMut {
     filters: Box<[Filter]>,
 
@@ -464,6 +499,30 @@ struct DisplayObjectBaseMut {
     /// If this Display Object should cacheAsBitmap - and if so, the cache itself.
     /// None means not cached, Some means cached.
     cache: Option<BitmapCache>,
+
+    /// Automatic cache for a static subtree (zero visual loss; dropped on any mutation).
+    auto_cache: Option<AutoCache>,
+
+    /// Set when a stable subtree was checked and found ineligible for auto-caching,
+    /// avoiding repeated walks until the next mutation.
+    auto_cache_rejected: bool,
+
+    /// Number of times a promoted auto-cache was evicted (backs off re-promotion to
+    /// prevent texture churn on slowly animating clips).
+    auto_cache_evictions: u8,
+}
+
+impl Clone for DisplayObjectBaseMut {
+    fn clone(&self) -> Self {
+        Self {
+            filters: self.filters.clone(),
+            blend_shader: self.blend_shader.clone(),
+            cache: self.cache.clone(),
+            auto_cache: None,
+            auto_cache_rejected: false,
+            auto_cache_evictions: 0,
+        }
+    }
 }
 
 impl Default for DisplayObjectBase<'_> {
@@ -473,6 +532,9 @@ impl Default for DisplayObjectBase<'_> {
                 filters: Default::default(),
                 blend_shader: None,
                 cache: None,
+                auto_cache: None,
+                auto_cache_rejected: false,
+                auto_cache_evictions: 0,
             }),
             parent: Default::default(),
             place_frame: Default::default(),
@@ -499,6 +561,8 @@ impl Default for DisplayObjectBase<'_> {
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
             scaling_grid: Default::default(),
+            last_invalidated_tick: Cell::new(interpolation::tick()),
+            last_transform_tick: Cell::new(interpolation::tick()),
         }
     }
 }
@@ -518,6 +582,10 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn reset_for_movie_load(&self) {
         let flags_to_keep = self.flags.get() & DisplayObjectFlags::LOCK_ROOT;
         self.flags.set(flags_to_keep | DisplayObjectFlags::VISIBLE);
+        let tick = interpolation::tick();
+        self.last_invalidated_tick.set(tick);
+        self.last_transform_tick.set(tick);
+        self.clear_auto_cache();
     }
 
     fn depth(&self) -> Depth {
@@ -569,6 +637,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_matrix(&self, matrix: Matrix) {
+        if self.matrix.get() != matrix {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         self.before_transform_change();
         self.matrix.set(matrix);
         self.set_scale_rotation_cached(false);
@@ -580,6 +651,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_color_transform(&self, color_transform: ColorTransform) {
+        if self.color_transform.get() != color_transform {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         self.before_transform_change();
         self.color_transform.set(color_transform);
     }
@@ -603,6 +677,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_x(&self, x: Twips) -> bool {
         let mut matrix = self.matrix.get();
         let changed = matrix.tx != x;
+        if changed {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         matrix.tx = x;
         self.before_transform_change();
         self.matrix.set(matrix);
@@ -617,6 +694,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_y(&self, y: Twips) -> bool {
         let mut matrix = self.matrix.get();
         let changed = matrix.ty != y;
+        if changed {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         matrix.ty = y;
         self.before_transform_change();
         self.matrix.set(matrix);
@@ -707,6 +787,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.b = (scale_x * sin_x) as f32;
         matrix.c = (scale_y * -sin_y) as f32;
         matrix.d = (scale_y * cos_y) as f32;
+        if changed {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         self.before_transform_change();
         self.matrix.set(matrix);
 
@@ -720,6 +803,9 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_scale_x(&self, mut value: Percent) -> bool {
         let changed = self.scale_x.get() != value;
+        if changed {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         self.set_transformed_by_script(true);
         self.cache_scale_rotation();
         self.scale_x.set(value);
@@ -756,6 +842,9 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_scale_y(&self, mut value: Percent) -> bool {
         let changed = self.scale_y.get() != value;
+        if changed {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         self.set_transformed_by_script(true);
         self.cache_scale_rotation();
         self.scale_y.set(value);
@@ -818,6 +907,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let value = Fixed8::from_f64(value);
         let mut tf = self.color_transform.get();
         let changed = tf.a_multiply != value;
+        if changed {
+            self.last_transform_tick.set(interpolation::tick());
+        }
         tf.a_multiply = value;
         self.before_transform_change();
         self.color_transform.set(tf);
@@ -1003,12 +1095,33 @@ impl<'gc> DisplayObjectBase<'gc> {
         if self.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED) {
             return false;
         }
-        if let Some(cache) = &mut *self.bitmap_cache_mut() {
-            cache.make_dirty();
-            cache.changed_tick = interpolation::tick();
+        let tick = interpolation::tick();
+        self.last_invalidated_tick.set(tick);
+        {
+            let mut cell = self.cell.borrow_mut();
+            if let Some(cache) = &mut cell.cache {
+                cache.make_dirty();
+                cache.changed_tick = tick;
+            }
+            if cell.auto_cache.take().is_some() {
+                cell.auto_cache_evictions = cell.auto_cache_evictions.saturating_add(1);
+            }
+            cell.auto_cache_rejected = false;
         }
         self.set_flag(DisplayObjectFlags::CACHE_INVALIDATED, true);
         true
+    }
+
+    fn clear_auto_cache(&self) {
+        let mut cell = self.cell.borrow_mut();
+        cell.auto_cache = None;
+        cell.auto_cache_rejected = false;
+    }
+
+    pub(crate) fn note_auto_cache_eviction(&self) {
+        let mut cell = self.cell.borrow_mut();
+        cell.auto_cache_evictions = cell.auto_cache_evictions.saturating_add(1);
+        self.last_invalidated_tick.set(interpolation::tick());
     }
 
     fn clear_invalidate_flag(&self) {
@@ -1121,6 +1234,681 @@ struct DrawCacheInfo {
     delta: Option<Matrix>,
 }
 
+struct AutoCacheDraw {
+    bitmap: BitmapInfo,
+    dirty: bool,
+    base_matrix: Matrix,
+    color_transform: ColorTransform,
+    origin: Point<i32>,
+    clear: Color,
+}
+
+fn clear_descendant_auto_caches<'gc>(obj: DisplayObject<'gc>) {
+    obj.base().clear_auto_cache();
+    if let Some(container) = obj.as_container() {
+        for child in container.iter_render_list() {
+            clear_descendant_auto_caches(child);
+        }
+    }
+}
+
+fn is_descendant_of<'gc>(obj: DisplayObject<'gc>, ancestor: DisplayObject<'gc>) -> bool {
+    let mut cur = obj.parent();
+    while let Some(p) = cur {
+        if DisplayObject::ptr_eq(p, ancestor) {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// Inspects a static candidate subtree to verify that caching it into an offscreen
+/// texture is strictly zero-loss (no async/editable dynamic content, no external masks,
+/// no Alpha/Erase/Shader blends), and estimates its draw cost.
+fn subtree_allows_auto_cache<'gc>(
+    root: DisplayObject<'gc>,
+    obj: DisplayObject<'gc>,
+    has_non_normal_blend: &mut bool,
+    draw_cost: &mut usize,
+) -> bool {
+    let check_child = |child: DisplayObject<'gc>,
+                       has_non_normal_blend: &mut bool,
+                       draw_cost: &mut usize|
+     -> bool {
+        if !child.visible() || child.maskee().is_some() {
+            return true;
+        }
+        let base = child.base();
+        if base.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED) || base.z() != 0.0 {
+            return false;
+        }
+        match child.blend_mode() {
+            ExtendedBlendMode::Normal => {}
+            ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase | ExtendedBlendMode::Shader => {
+                return false;
+            }
+            _ => {
+                *has_non_normal_blend = true;
+                *draw_cost += 4;
+            }
+        }
+        if let Some(mask) = child.masker() {
+            if !is_descendant_of(mask, root)
+                || mask.base().contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+            {
+                return false;
+            }
+            *draw_cost += 4;
+        }
+        if !child.filters().is_empty() {
+            *draw_cost += 4;
+        }
+        match child {
+            DisplayObject::Video(_) | DisplayObject::Avm1Button(_) => return false,
+            DisplayObject::EditText(et) => {
+                if et.is_editable() {
+                    return false;
+                }
+                *draw_cost += 2;
+            }
+            DisplayObject::Graphic(_)
+            | DisplayObject::MorphShape(_)
+            | DisplayObject::Bitmap(_)
+            | DisplayObject::Text(_) => {
+                *draw_cost += 1;
+            }
+            DisplayObject::Avm2Button(btn) => {
+                if let Some(state) = btn.get_state_child(btn.state().into())
+                    && !subtree_allows_auto_cache(root, state, has_non_normal_blend, draw_cost)
+                {
+                    return false;
+                }
+            }
+            DisplayObject::MovieClip(mc) => {
+                if mc.drawing().is_some() {
+                    *draw_cost += 2;
+                }
+                if !subtree_allows_auto_cache(root, child, has_non_normal_blend, draw_cost) {
+                    return false;
+                }
+            }
+            DisplayObject::LoaderDisplay(_) => {
+                if !subtree_allows_auto_cache(root, child, has_non_normal_blend, draw_cost) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        true
+    };
+
+    if let Some(container) = obj.as_container() {
+        for child in container.iter_render_list() {
+            if !check_child(child, has_non_normal_blend, draw_cost) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn try_auto_cache<'gc>(
+    this: DisplayObject<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+    options: &RenderOptions,
+    blend_mode: ExtendedBlendMode,
+    no_enclosing_blend: bool,
+) -> Option<AutoCacheDraw> {
+    if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::AutoCache) {
+        if this.base().cell.borrow().auto_cache.is_some() {
+            this.base().clear_auto_cache();
+        }
+        return None;
+    }
+    if context.is_offscreen
+        || !context.use_bitmap_cache
+        || !options.skip_masks
+        || !matches!(
+            this,
+            DisplayObject::MovieClip(_) | DisplayObject::LoaderDisplay(_)
+        )
+        || this.opaque_background().is_some()
+        || this.scroll_rect().is_some()
+        || !context.renderer.is_offscreen_supported()
+    {
+        return None;
+    }
+    if matches!(
+        blend_mode,
+        ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase | ExtendedBlendMode::Shader
+    ) {
+        return None;
+    }
+
+    let base_transform = context.transform_stack.transform();
+    if base_transform.tz != 0.0 {
+        if this.base().cell.borrow().auto_cache.is_some() {
+            this.base().clear_auto_cache();
+        }
+        return None;
+    }
+
+    let viewport_bounds = context.stage.viewport_view_bounds();
+    let stage_bg = context.stage.background_color().filter(|c| c.a == 255);
+    let is_backdrop = no_enclosing_blend
+        && context.commands.is_empty()
+        && this.masker().is_none()
+        && this.scroll_rect().is_none()
+        && stage_bg.is_some();
+
+    // Fast path: check existing auto-cache hit.
+    {
+        let base = this.base();
+        let mut cell = base.cell.borrow_mut();
+        if let Some(auto) = &cell.auto_cache {
+            let valid = auto.matrix == base_transform.matrix
+                && auto.color_transform == base_transform.color_transform
+                && auto.viewport_bounds == viewport_bounds
+                && (auto.backdrop_clear.is_none()
+                    || (is_backdrop && auto.backdrop_clear == stage_bg));
+            if valid {
+                return Some(AutoCacheDraw {
+                    bitmap: auto.bitmap.clone(),
+                    dirty: false,
+                    base_matrix: base_transform.matrix,
+                    color_transform: base_transform.color_transform,
+                    origin: auto.origin,
+                    clear: auto.backdrop_clear.unwrap_or(Color::TRANSPARENT),
+                });
+            }
+            // Matrix, color, viewport, or backdrop changed: evict and wait for stability again.
+            cell.auto_cache = None;
+            cell.auto_cache_evictions = cell.auto_cache_evictions.saturating_add(1);
+            cell.auto_cache_rejected = false;
+            this.base()
+                .last_invalidated_tick
+                .set(interpolation::tick());
+            return None;
+        }
+        if cell.auto_cache_rejected {
+            return None;
+        }
+    }
+
+    let tick = interpolation::tick();
+    let last_inv = this.base().last_invalidated_tick.get();
+    let last_tx = this.base().last_transform_tick.get();
+    let evictions = this.base().cell.borrow().auto_cache_evictions.min(3);
+    let required_ticks = AUTO_CACHE_STABLE_TICKS << evictions;
+    if tick.wrapping_sub(last_inv) < required_ticks || tick.wrapping_sub(last_tx) < required_ticks {
+        return None;
+    }
+
+    // Subtree has been unchanged for AUTO_CACHE_STABLE_TICKS movie frames: check eligibility once.
+    let mut has_non_normal_blend = false;
+    let mut draw_cost = if this
+        .as_movie_clip()
+        .is_some_and(|mc| mc.drawing().is_some())
+    {
+        2
+    } else {
+        0
+    };
+    let eligible = subtree_allows_auto_cache(this, this, &mut has_non_normal_blend, &mut draw_cost)
+        && draw_cost >= AUTO_CACHE_MIN_COST
+        && (!has_non_normal_blend || is_backdrop || blend_mode != ExtendedBlendMode::Normal);
+    if !eligible {
+        this.base().cell.borrow_mut().auto_cache_rejected = true;
+        return None;
+    }
+
+    let bounds = this.render_bounds_with_transform(
+        &base_transform.matrix,
+        true,
+        &context.stage.view_matrix(),
+    );
+    if !bounds.is_valid() {
+        this.base().cell.borrow_mut().auto_cache_rejected = true;
+        return None;
+    }
+    let vp_x0 = viewport_bounds.x_min.to_pixels().floor() as i32;
+    let vp_y0 = viewport_bounds.y_min.to_pixels().floor() as i32;
+    let vp_x1 = viewport_bounds.x_max.to_pixels().ceil() as i32;
+    let vp_y1 = viewport_bounds.y_max.to_pixels().ceil() as i32;
+    let x0 = (bounds.x_min.to_pixels().floor() as i32 - 2).max(vp_x0);
+    let y0 = (bounds.y_min.to_pixels().floor() as i32 - 2).max(vp_y0);
+    let x1 = (bounds.x_max.to_pixels().ceil() as i32 + 2).min(vp_x1);
+    let y1 = (bounds.y_max.to_pixels().ceil() as i32 + 2).min(vp_y1);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let width = (x1 - x0) as u32;
+    let height = (y1 - y0) as u32;
+    if !(16..=4096).contains(&width) || !(16..=4096).contains(&height) {
+        this.base().cell.borrow_mut().auto_cache_rejected = true;
+        return None;
+    }
+    let bytes = width as usize * height as usize * 4;
+    if AUTO_CACHE_BYTES.load(Ordering::Relaxed) + bytes > MAX_AUTO_CACHE_BYTES {
+        return None;
+    }
+    let handle = context
+        .renderer
+        .create_empty_texture(NonZero::new(width)?, NonZero::new(height)?)
+        .ok()?;
+    AUTO_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    clear_descendant_auto_caches(this);
+
+    let bitmap = BitmapInfo {
+        handle,
+        width,
+        height,
+    };
+    let origin = Point::new(x0, y0);
+    let backdrop_clear = if has_non_normal_blend && is_backdrop {
+        stage_bg
+    } else {
+        None
+    };
+    this.base().cell.borrow_mut().auto_cache = Some(AutoCache {
+        bitmap: bitmap.clone(),
+        matrix: base_transform.matrix,
+        color_transform: base_transform.color_transform,
+        origin,
+        viewport_bounds,
+        backdrop_clear,
+        bytes,
+    });
+    Some(AutoCacheDraw {
+        bitmap,
+        dirty: true,
+        base_matrix: base_transform.matrix,
+        color_transform: base_transform.color_transform,
+        origin,
+        clear: backdrop_clear.unwrap_or(Color::TRANSPARENT),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BackdropNodeKey {
+    pub(crate) ptr: usize,
+    pub(crate) last_inv_tick: u32,
+    pub(crate) matrix: Matrix,
+    pub(crate) color_transform: ColorTransform,
+}
+
+/// Cached texture holding the longest static painter's-order prefix of the stage
+/// (e.g. an entire room map background including all its internal Multiply/Overlay
+/// shadows over the opaque stage background color).
+#[derive(Debug)]
+pub(crate) struct BackdropCache {
+    pub(crate) bitmap: BitmapInfo,
+    pub(crate) origin: Point<i32>,
+    pub(crate) viewport_bounds: Rectangle<Twips>,
+    pub(crate) clear_color: Color,
+    pub(crate) nodes: Vec<BackdropNodeKey>,
+    pub(crate) built_tick: u32,
+    pub(crate) bytes: usize,
+}
+
+impl Clone for BackdropCache {
+    fn clone(&self) -> Self {
+        AUTO_CACHE_BYTES.fetch_add(self.bytes, Ordering::Relaxed);
+        Self {
+            bitmap: self.bitmap.clone(),
+            origin: self.origin,
+            viewport_bounds: self.viewport_bounds,
+            clear_color: self.clear_color,
+            nodes: self.nodes.clone(),
+            built_tick: self.built_tick,
+            bytes: self.bytes,
+        }
+    }
+}
+
+impl Drop for BackdropCache {
+    fn drop(&mut self) {
+        AUTO_CACHE_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct CollectedBackdropNode<'gc> {
+    pub(crate) obj: DisplayObject<'gc>,
+    pub(crate) key: BackdropNodeKey,
+    pub(crate) parent_matrix: Matrix,
+    pub(crate) parent_ct: ColorTransform,
+    pub(crate) cost: usize,
+}
+
+pub(crate) enum BackdropCacheLookup {
+    Hit {
+        bitmap: BitmapInfo,
+        origin: Point<i32>,
+        skip_len: usize,
+    },
+    Miss,
+}
+
+/// Collects the longest static painter's-order prefix starting from `container` before
+/// the first dynamic or ineligible object. Returns `true` if the entire container was
+/// static (caller may continue to the next sibling), or `false` if collection stopped.
+fn collect_backdrop_prefix<'gc>(
+    container: DisplayObject<'gc>,
+    parent_matrix: Matrix,
+    parent_ct: ColorTransform,
+    tick: u32,
+    out: &mut Vec<CollectedBackdropNode<'gc>>,
+    total_cost: &mut usize,
+) -> bool {
+    let Some(c) = container.as_container() else {
+        return false;
+    };
+    for child in c.iter_render_list() {
+        if child.clip_depth() > 0 {
+            return false;
+        }
+        if !child.visible() || child.maskee().is_some() {
+            continue;
+        }
+        let base = child.base();
+        if base.z() != 0.0 {
+            return false;
+        }
+        let child_tx = base.transform(true);
+        let child_matrix = parent_matrix * child_tx.matrix;
+        let child_ct = parent_ct * child_tx.color_transform;
+        let blend_mode = child.blend_mode();
+        if matches!(
+            blend_mode,
+            ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase | ExtendedBlendMode::Shader
+        ) {
+            return false;
+        }
+
+        let last_inv = base.last_invalidated_tick.get();
+        let last_tx = base.last_transform_tick.get();
+        let evictions = base.cell.borrow().auto_cache_evictions.min(3);
+        let required_ticks = AUTO_CACHE_STABLE_TICKS << evictions;
+        let tx_stable = tick.wrapping_sub(last_tx) >= required_ticks;
+        let self_stable = !base.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+            && tick.wrapping_sub(last_inv) >= required_ticks
+            && tx_stable;
+
+        let mask_ok = match child.masker() {
+            None => true,
+            Some(mask) => {
+                is_descendant_of(mask, child)
+                    && !mask.base().contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+            }
+        };
+
+        let mut node_cost = 0usize;
+        let whole_static = if self_stable && mask_ok {
+            let mut has_blend = false;
+            match child {
+                DisplayObject::Video(_) | DisplayObject::Avm1Button(_) => false,
+                DisplayObject::EditText(et) => {
+                    if et.is_editable() {
+                        false
+                    } else {
+                        node_cost = 2;
+                        true
+                    }
+                }
+                DisplayObject::Graphic(_)
+                | DisplayObject::MorphShape(_)
+                | DisplayObject::Bitmap(_)
+                | DisplayObject::Text(_) => {
+                    node_cost = 1;
+                    true
+                }
+                DisplayObject::Avm2Button(btn) => {
+                    if let Some(state) = btn.get_state_child(btn.state().into()) {
+                        subtree_allows_auto_cache(child, state, &mut has_blend, &mut node_cost)
+                    } else {
+                        true
+                    }
+                }
+                DisplayObject::MovieClip(mc) => {
+                    if mc.drawing().is_some() {
+                        node_cost += 2;
+                    }
+                    subtree_allows_auto_cache(child, child, &mut has_blend, &mut node_cost)
+                }
+                DisplayObject::LoaderDisplay(_) => {
+                    subtree_allows_auto_cache(child, child, &mut has_blend, &mut node_cost)
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        if whole_static {
+            if blend_mode != ExtendedBlendMode::Normal {
+                node_cost += 4;
+            }
+            if !child.filters().is_empty() {
+                node_cost += 4;
+            }
+            if child.masker().is_some() {
+                node_cost += 4;
+            }
+            *total_cost += node_cost;
+            out.push(CollectedBackdropNode {
+                obj: child,
+                key: BackdropNodeKey {
+                    ptr: Gc::as_ptr(base) as usize,
+                    last_inv_tick: last_inv,
+                    matrix: child_matrix,
+                    color_transform: child_ct,
+                },
+                parent_matrix,
+                parent_ct,
+                cost: node_cost,
+            });
+            continue;
+        }
+
+        // Not wholly static: descend into transparent pass-through containers so we can
+        // still cache static layers sitting before the first animated sibling.
+        let can_descend = tx_stable
+            && blend_mode == ExtendedBlendMode::Normal
+            && child.masker().is_none()
+            && child.scroll_rect().is_none()
+            && child.opaque_background().is_none()
+            && !child.is_bitmap_cached()
+            && match child {
+                DisplayObject::MovieClip(mc) => mc.drawing().is_none(),
+                DisplayObject::LoaderDisplay(_) => true,
+                _ => false,
+            };
+        if can_descend {
+            if !collect_backdrop_prefix(child, child_matrix, child_ct, tick, out, total_cost) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Attempts to satisfy the stage's leading static layers from `Stage::backdrop_cache`.
+/// When active, emits a single bitmap draw for the cached backdrop and populates
+/// `stage`'s skip list so `render_children` skips those prefix nodes in O(1).
+pub(crate) fn render_stage_backdrop<'gc>(
+    stage: Stage<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+    viewport_matrix: Matrix,
+) {
+    stage.clear_backdrop_skip();
+    if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::AutoCache)
+        || context.is_offscreen
+        || !context.use_bitmap_cache
+        || !context.commands.is_empty()
+        || !context.renderer.is_offscreen_supported()
+        || stage.window_mode() == crate::display_object::stage::WindowMode::Transparent
+    {
+        stage.clear_backdrop_cache();
+        return;
+    }
+
+    let bg = stage.background_color().unwrap_or(Color::WHITE);
+    if bg.a != 255 {
+        stage.clear_backdrop_cache();
+        return;
+    }
+
+    let tick = interpolation::tick();
+    let mut prefix = Vec::new();
+    let mut total_cost = 0usize;
+    collect_backdrop_prefix(
+        stage.into(),
+        viewport_matrix,
+        ColorTransform::IDENTITY,
+        tick,
+        &mut prefix,
+        &mut total_cost,
+    );
+
+    if prefix.is_empty() || total_cost < 12 {
+        stage.clear_backdrop_cache();
+        return;
+    }
+
+    let viewport_bounds = stage.viewport_view_bounds();
+    let vp_x0 = viewport_bounds.x_min.to_pixels().floor() as i32;
+    let vp_y0 = viewport_bounds.y_min.to_pixels().floor() as i32;
+    let vp_x1 = viewport_bounds.x_max.to_pixels().ceil() as i32;
+    let vp_y1 = viewport_bounds.y_max.to_pixels().ceil() as i32;
+    if vp_x1 <= vp_x0 || vp_y1 <= vp_y0 {
+        stage.clear_backdrop_cache();
+        return;
+    }
+    let width = (vp_x1 - vp_x0) as u32;
+    let height = (vp_y1 - vp_y0) as u32;
+    if width > 4096 || height > 4096 {
+        stage.clear_backdrop_cache();
+        return;
+    }
+
+    // Check cache hit (supports zero-rebuild prefix hits when trailing nodes appear).
+    if let BackdropCacheLookup::Hit {
+        bitmap,
+        origin,
+        skip_len,
+    } = stage.check_backdrop_cache_hit(bg, viewport_bounds, &prefix, tick)
+    {
+        let region = bitmap.full_region();
+        context.commands.render_bitmap(
+            bitmap.handle,
+            Transform {
+                matrix: Matrix::translate(
+                    Twips::from_pixels_i32(origin.x),
+                    Twips::from_pixels_i32(origin.y),
+                ),
+                color_transform: Default::default(),
+                perspective_projection: None,
+                tz: 0.0,
+            },
+            false,
+            PixelSnapping::Always,
+            region,
+        );
+        stage.set_backdrop_skip(prefix[..skip_len].iter().map(|n| n.key.ptr).collect());
+        return;
+    }
+
+    // Cache miss: drop old backdrop first so its bytes don't count against our budget.
+    stage.clear_backdrop_cache();
+    let bytes = width as usize * height as usize * 4;
+    if AUTO_CACHE_BYTES.load(Ordering::Relaxed) + bytes > MAX_AUTO_CACHE_BYTES {
+        return;
+    }
+    let (Some(nw), Some(nh)) = (NonZero::new(width), NonZero::new(height)) else {
+        return;
+    };
+    let Ok(handle) = context.renderer.create_empty_texture(nw, nh) else {
+        return;
+    };
+    AUTO_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+
+    let origin = Point::new(vp_x0, vp_y0);
+    let mut offscreen_commands = CommandList::new();
+    for node in &prefix {
+        clear_descendant_auto_caches(node.obj);
+        let mut transform_stack = TransformStack::new();
+        transform_stack.push(&Transform {
+            color_transform: node.parent_ct,
+            matrix: Matrix {
+                tx: node.parent_matrix.tx - Twips::from_pixels_i32(origin.x),
+                ty: node.parent_matrix.ty - Twips::from_pixels_i32(origin.y),
+                ..node.parent_matrix
+            },
+            perspective_projection: None,
+            tz: 0.0,
+        });
+        let mut offscreen_context = RenderContext {
+            renderer: context.renderer,
+            commands: std::mem::take(&mut offscreen_commands),
+            cache_draws: context.cache_draws,
+            gc_context: context.gc_context,
+            library: context.library,
+            ui: context.ui,
+            transform_stack: &mut transform_stack,
+            is_offscreen: true,
+            use_bitmap_cache: true,
+            stage: context.stage,
+        };
+        node.obj.pre_render(&mut offscreen_context);
+        node.obj.render(&mut offscreen_context);
+        offscreen_commands = offscreen_context.commands;
+    }
+
+    context.cache_draws.push(BitmapCacheEntry {
+        handle: handle.clone(),
+        commands: offscreen_commands,
+        clear: bg,
+        filters: Vec::new(),
+    });
+
+    let bitmap = BitmapInfo {
+        handle,
+        width,
+        height,
+    };
+    let region = bitmap.full_region();
+    context.commands.render_bitmap(
+        bitmap.handle.clone(),
+        Transform {
+            matrix: Matrix::translate(
+                Twips::from_pixels_i32(origin.x),
+                Twips::from_pixels_i32(origin.y),
+            ),
+            color_transform: Default::default(),
+            perspective_projection: None,
+            tz: 0.0,
+        },
+        false,
+        PixelSnapping::Always,
+        region,
+    );
+    let skip_ptrs: Vec<usize> = prefix.iter().map(|n| n.key.ptr).collect();
+    let keys: Vec<BackdropNodeKey> = prefix.into_iter().map(|n| n.key).collect();
+    stage.set_backdrop_cache(BackdropCache {
+        bitmap,
+        origin,
+        viewport_bounds,
+        clear_color: bg,
+        nodes: keys,
+        built_tick: tick,
+        bytes,
+    });
+    stage.set_backdrop_skip(skip_ptrs);
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -1145,33 +1933,36 @@ pub fn render_base<'gc>(
 
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
         let base_transform = context.transform_stack.transform();
-        let inter_frame_hit = if interpolation::is_inter_frame() {
-            this.base().bitmap_cache_mut().as_ref().and_then(|cache| {
-                if cache.contents_changed
-                    || (cache.blends_in_tick && interpolation::is_blending_tick(cache.changed_tick))
-                    || !cache.is_matrix_different(&base_transform.matrix)
-                {
-                    return None;
-                }
-                let tick = interpolation::tick();
-                if cache.cached_tick != tick && cache.cached_tick != tick.wrapping_sub(1) {
-                    return None;
-                }
-                let bitmap = cache.bitmap()?;
+        let stage_matrix = context.stage.view_matrix();
+        let fast_hit = this.base().bitmap_cache_mut().as_ref().and_then(|cache| {
+            if cache.contents_changed
+                || (cache.blends_in_tick && interpolation::is_blending_tick(cache.changed_tick))
+                || cache.stage_scale_x != stage_matrix.a
+                || cache.stage_scale_y != stage_matrix.d
+            {
+                return None;
+            }
+            let bitmap = cache.bitmap()?;
+            if !cache.is_matrix_different(&base_transform.matrix) {
+                // Pure translation (or stationary) with unchanged contents and stage scale:
+                // reuse cached bitmap in O(1) without recomputing bounds/filters or
+                // rebuilding from ±1 twip rounding jitter on subpixel translations.
+                Some((bitmap, cache.cached_offset, None))
+            } else if interpolation::is_inter_frame() {
                 let delta = cache.inter_frame_delta(&base_transform.matrix)?;
-                Some((bitmap, cache.cached_offset, delta))
-            })
-        } else {
-            None
-        };
-        if let Some((bitmap, offset, delta)) = inter_frame_hit {
+                Some((bitmap, cache.cached_offset, Some(delta)))
+            } else {
+                None
+            }
+        });
+        if let Some((bitmap, offset, delta)) = fast_hit {
             Some(DrawCacheInfo {
                 bitmap,
                 dirty: false,
                 base_transform,
                 offset,
                 filters: Vec::new(),
-                delta: Some(delta),
+                delta,
             })
         } else {
             let mut cache_info: Option<DrawCacheInfo> = None;
@@ -1254,8 +2045,9 @@ pub fn render_base<'gc>(
                                     )
                                 }),
                         );
-                        cache.cached_tick = interpolation::tick();
                         cache.cached_offset = offset;
+                        cache.stage_scale_x = stage_matrix.a;
+                        cache.stage_scale_y = stage_matrix.d;
                         cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
                             bitmap,
                             dirty: true,
@@ -1372,6 +2164,68 @@ pub fn render_base<'gc>(
                     pixel_snapping,
                     region,
                 )
+            },
+            &options,
+        );
+    } else if let Some(auto_draw) = try_auto_cache(
+        this,
+        context,
+        &options,
+        blend_mode,
+        original_commands.is_none(),
+    ) {
+        if auto_draw.dirty {
+            let mut transform_stack = TransformStack::new();
+            transform_stack.push(&Transform {
+                color_transform: auto_draw.color_transform,
+                matrix: Matrix {
+                    tx: auto_draw.base_matrix.tx - Twips::from_pixels_i32(auto_draw.origin.x),
+                    ty: auto_draw.base_matrix.ty - Twips::from_pixels_i32(auto_draw.origin.y),
+                    ..auto_draw.base_matrix
+                },
+                perspective_projection: None,
+                tz: 0.0,
+            });
+            let mut offscreen_context = RenderContext {
+                renderer: context.renderer,
+                commands: CommandList::new(),
+                cache_draws: context.cache_draws,
+                gc_context: context.gc_context,
+                library: context.library,
+                ui: context.ui,
+                transform_stack: &mut transform_stack,
+                is_offscreen: true,
+                use_bitmap_cache: true,
+                stage: context.stage,
+            };
+            this.render_self(&mut offscreen_context);
+            offscreen_context.cache_draws.push(BitmapCacheEntry {
+                handle: auto_draw.bitmap.handle.clone(),
+                commands: offscreen_context.commands,
+                clear: auto_draw.clear,
+                filters: Vec::new(),
+            });
+        }
+        apply_standard_mask_and_scroll(
+            this,
+            context,
+            |context| {
+                let region = auto_draw.bitmap.full_region();
+                context.commands.render_bitmap(
+                    auto_draw.bitmap.handle,
+                    Transform {
+                        matrix: Matrix::translate(
+                            Twips::from_pixels_i32(auto_draw.origin.x),
+                            Twips::from_pixels_i32(auto_draw.origin.y),
+                        ),
+                        color_transform: Default::default(),
+                        perspective_projection: None,
+                        tz: 0.0,
+                    },
+                    false,
+                    PixelSnapping::Always,
+                    region,
+                );
             },
             &options,
         );
@@ -2319,6 +3173,7 @@ pub trait TDisplayObject<'gc>:
         let parent_removed = had_parent && parent.is_none();
 
         if parent_removed {
+            clear_descendant_auto_caches(self);
             if let Some(int) = self.as_interactive() {
                 int.drop_focus(context);
             }

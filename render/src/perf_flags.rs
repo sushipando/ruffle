@@ -87,9 +87,12 @@ pub enum PerfFlag {
     /// Draw frames straight into the render target's texture (resolving into it), where
     /// it allows that, instead of into a pooled texture that's then copied into it.
     DirectFrame,
+    /// Automatically cache static display-object subtrees into offscreen textures while
+    /// they remain unchanged, avoiding redrawing static backgrounds and idle objects.
+    AutoCache,
 }
 
-const NAMES: [&str; 31] = [
+const NAMES: [&str; 32] = [
     "bounded-blends",
     "lazy-resolve",
     "layer-atlas",
@@ -121,9 +124,10 @@ const NAMES: [&str; 31] = [
     "discard-samples",
     "stencil-per-target",
     "direct-frame",
+    "auto-cache",
 ];
 
-static FLAGS: [AtomicBool; 31] = [
+static FLAGS: [AtomicBool; 32] = [
     AtomicBool::new(true),  // bounded-blends
     AtomicBool::new(true),  // lazy-resolve
     AtomicBool::new(true),  // layer-atlas
@@ -155,6 +159,7 @@ static FLAGS: [AtomicBool; 31] = [
     AtomicBool::new(true),  // discard-samples
     AtomicBool::new(true),  // stencil-per-target
     AtomicBool::new(true),  // direct-frame
+    AtomicBool::new(true),  // auto-cache
 ];
 
 #[inline]

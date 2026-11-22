@@ -29,7 +29,7 @@ use ruffle_render::commands::CommandHandler;
 use ruffle_render::perspective_projection::PerspectiveProjection;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
-use std::cell::{Cell, Ref, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
@@ -157,6 +157,18 @@ pub struct StageData<'gc> {
 
     /// Whether to show default context menu items
     show_menu: Cell<bool>,
+
+    /// Cached static backdrop prefix of the stage (see `render_stage_backdrop`).
+    #[collect(require_static)]
+    backdrop_cache: RefCell<Option<crate::display_object::BackdropCache>>,
+
+    /// Fast-path guard while skipping prefix nodes already drawn by `backdrop_cache`.
+    backdrop_skip_active: Cell<bool>,
+
+    #[collect(require_static)]
+    backdrop_skip_ptrs: RefCell<Vec<usize>>,
+
+    backdrop_skip_index: Cell<usize>,
 }
 
 impl<'gc> Stage<'gc> {
@@ -191,6 +203,10 @@ impl<'gc> Stage<'gc> {
                 window_mode: Default::default(),
                 show_menu: Cell::new(true),
                 stage_focus_rect: Cell::new(true),
+                backdrop_cache: RefCell::new(None),
+                backdrop_skip_active: Cell::new(false),
+                backdrop_skip_ptrs: RefCell::new(Vec::new()),
+                backdrop_skip_index: Cell::new(0),
                 avm2_object: Lock::new(None),
                 loader_info: Lock::new(None),
                 stage3ds: RefLock::new(vec![]),
@@ -320,6 +336,90 @@ impl<'gc> Stage<'gc> {
     /// Identifies the current frame for `MovieClip::settle`.
     pub fn frame_epoch(self) -> u32 {
         self.0.frame_epoch.get()
+    }
+
+    pub(crate) fn clear_backdrop_cache(self) {
+        *self.0.backdrop_cache.borrow_mut() = None;
+    }
+
+    pub(crate) fn set_backdrop_cache(self, cache: crate::display_object::BackdropCache) {
+        *self.0.backdrop_cache.borrow_mut() = Some(cache);
+    }
+
+    pub(crate) fn check_backdrop_cache_hit(
+        self,
+        clear_color: Color,
+        viewport_bounds: Rectangle<Twips>,
+        prefix: &[crate::display_object::CollectedBackdropNode<'gc>],
+        tick: u32,
+    ) -> crate::display_object::BackdropCacheLookup {
+        use crate::display_object::BackdropCacheLookup;
+        let cache = self.0.backdrop_cache.borrow();
+        let Some(cache) = cache.as_ref() else {
+            return BackdropCacheLookup::Miss;
+        };
+        if cache.clear_color != clear_color || cache.viewport_bounds != viewport_bounds {
+            return BackdropCacheLookup::Miss;
+        }
+        let cached_len = cache.nodes.len();
+        if cached_len <= prefix.len()
+            && cache
+                .nodes
+                .iter()
+                .zip(prefix.iter())
+                .all(|(a, b)| *a == b.key)
+        {
+            if prefix.len() > cached_len {
+                let extra_cost: usize = prefix[cached_len..].iter().map(|n| n.cost).sum();
+                if extra_cost >= 48 && tick.wrapping_sub(cache.built_tick) >= 48 {
+                    return BackdropCacheLookup::Miss;
+                }
+            }
+            return BackdropCacheLookup::Hit {
+                bitmap: cache.bitmap.clone(),
+                origin: cache.origin,
+                skip_len: cached_len,
+            };
+        }
+        // Back off any node whose transform or state changed inside the cached prefix.
+        for (a, b) in cache.nodes.iter().zip(prefix.iter()) {
+            if *a != b.key && a.ptr == b.key.ptr {
+                b.obj.base().note_auto_cache_eviction();
+            }
+        }
+        BackdropCacheLookup::Miss
+    }
+
+    pub(crate) fn set_backdrop_skip(self, ptrs: Vec<usize>) {
+        let active = !ptrs.is_empty();
+        *self.0.backdrop_skip_ptrs.borrow_mut() = ptrs;
+        self.0.backdrop_skip_index.set(0);
+        self.0.backdrop_skip_active.set(active);
+    }
+
+    pub(crate) fn clear_backdrop_skip(self) {
+        self.0.backdrop_skip_active.set(false);
+        self.0.backdrop_skip_index.set(0);
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_backdrop_skip(self) -> bool {
+        self.0.backdrop_skip_active.get()
+    }
+
+    pub(crate) fn consume_backdrop_skip(self, ptr: usize) -> bool {
+        let idx = self.0.backdrop_skip_index.get();
+        let ptrs = self.0.backdrop_skip_ptrs.borrow();
+        if ptrs.get(idx).copied() == Some(ptr) {
+            let next = idx + 1;
+            self.0.backdrop_skip_index.set(next);
+            if next >= ptrs.len() {
+                self.0.backdrop_skip_active.set(false);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Starts a new frame for `MovieClip::settle`: no clip is settled in it yet.
@@ -667,7 +767,11 @@ impl<'gc> Stage<'gc> {
             }
         }
 
+        crate::display_object::render_stage_backdrop(self, context, self.0.viewport_matrix.get());
+
         self.render(context);
+
+        self.clear_backdrop_skip();
 
         self.focus_tracker().render_highlight(context);
 

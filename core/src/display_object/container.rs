@@ -556,6 +556,14 @@ pub trait TDisplayObjectContainer<'gc>:
         let mut clip_depth = 0;
         let mut clip_depth_stack: Vec<(Depth, DisplayObject<'_>)> = vec![];
         for child in self.iter_render_list() {
+            if !context.is_offscreen
+                && context.stage.has_backdrop_skip()
+                && context
+                    .stage
+                    .consume_backdrop_skip(gc_arena::Gc::as_ptr(child.base()) as usize)
+            {
+                continue;
+            }
             let depth = child.depth();
 
             child.pre_render(context);
