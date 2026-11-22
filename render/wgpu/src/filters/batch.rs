@@ -50,6 +50,9 @@ pub struct FilterTogetherEntry {
     pub handle_ptr: usize,
     /// Persistence policy for this filtered entry.
     pub volatility: CacheVolatility,
+    /// Optional dedicated LRU-cache texture to copy the finished filtered result into
+    /// (for 2-hit promotion into `FilteredCabCache`).
+    pub promote_copy: Option<wgpu::Texture>,
 }
 
 /// Filtered CAB atlases kept alive for direct sampling during the current frame (and, for
@@ -57,7 +60,7 @@ pub struct FilterTogetherEntry {
 /// per-CAB copy-out blits and per-CAB bind groups for animated CABs.
 #[derive(Default)]
 pub struct FilterAtlasResult {
-    textures: Vec<PoolEntry<PooledTexture, AlwaysCompatible>>,
+    textures: Vec<Option<PoolEntry<PooledTexture, AlwaysCompatible>>>,
     pub bind_groups: Vec<wgpu::BindGroup>,
     /// Maps `BitmapHandle` pointer -> `(atlas_bind_group_index, slot_x, slot_y, atlas_w, atlas_h)`.
     pub slots: fnv::FnvHashMap<usize, (usize, u32, u32, u32, u32)>,
@@ -77,6 +80,47 @@ impl FilterAtlasResult {
     pub fn remove_slot(&mut self, handle_ptr: usize) {
         self.slots.remove(&handle_ptr);
         self.handles.remove(&handle_ptr);
+    }
+
+    /// Exposes an externally owned cached texture (e.g. from `FilteredCabCache`) for
+    /// zero-copy direct sampling in the main pass.
+    pub fn insert_external_slot(
+        &mut self,
+        handle: BitmapHandle,
+        handle_ptr: usize,
+        bind_group: wgpu::BindGroup,
+        used_size: (u32, u32),
+        volatility: CacheVolatility,
+    ) {
+        let atlas_idx = self.bind_groups.len();
+        self.textures.push(None);
+        self.bind_groups.push(bind_group);
+        self.slots
+            .insert(handle_ptr, (atlas_idx, 0, 0, used_size.0, used_size.1));
+        self.handles.insert(handle_ptr, handle);
+        if matches!(volatility, CacheVolatility::Subframe) {
+            self.subframe_keys.push(handle_ptr);
+        }
+    }
+
+    /// Points a same-frame duplicate CAB (`to_ptr`) at an already-filtered leader's slot
+    /// (`from_ptr`) in this atlas.
+    pub fn alias_slot(
+        &mut self,
+        from_ptr: usize,
+        handle: BitmapHandle,
+        to_ptr: usize,
+        volatility: CacheVolatility,
+    ) -> bool {
+        let Some(&slot) = self.slots.get(&from_ptr) else {
+            return false;
+        };
+        self.slots.insert(to_ptr, slot);
+        self.handles.insert(to_ptr, handle);
+        if matches!(volatility, CacheVolatility::Subframe) {
+            self.subframe_keys.push(to_ptr);
+        }
+        true
     }
 
     /// Drops single-subframe slots and any atlas textures no longer referenced by live
@@ -629,7 +673,13 @@ pub fn apply_together(
         for step in 0..steps {
             let (current_view, current_size) = match (&current_owned, current_direct) {
                 (Some(cur), _) => (&cur.texture.1, cur.size),
-                (None, Some((idx, sz))) => (&direct_out.textures[idx].1, sz),
+                (None, Some((idx, sz))) => (
+                    &direct_out.textures[idx]
+                        .as_ref()
+                        .expect("multi-step direct atlas is owned")
+                        .1,
+                    sz,
+                ),
                 _ => unreachable!("current atlas is always live"),
             };
 
@@ -1175,6 +1225,27 @@ pub fn apply_together(
             for (batch_index, &(index, _, gutter)) in active.iter().enumerate() {
                 let dst_region = dst_regions[batch_index];
                 if entries[index].filters.len() == step + 1 {
+                    let (uw, uh) = used_extent(&entries[index]);
+                    if let Some(ref promote_tex) = entries[index].promote_copy {
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &target.texture.0,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d {
+                                    x: dst_region.x,
+                                    y: dst_region.y,
+                                    z: 0,
+                                },
+                                aspect: Default::default(),
+                            },
+                            promote_tex.as_image_copy(),
+                            wgpu::Extent3d {
+                                width: uw,
+                                height: uh,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
                     match entries[index].volatility {
                         CacheVolatility::Subframe | CacheVolatility::Tick(_) => {
                             let ptr = entries[index].handle_ptr;
@@ -1195,7 +1266,6 @@ pub fn apply_together(
                             direct_count += 1;
                         }
                         CacheVolatility::Persistent => {
-                            let (uw, uh) = used_extent(&entries[index]);
                             encoder.copy_texture_to_texture(
                                 wgpu::TexelCopyTextureInfo {
                                     texture: &target.texture.0,
@@ -1239,7 +1309,7 @@ pub fn apply_together(
                             ],
                             label: create_debug_label!("Filter atlas direct bind group").as_deref(),
                         });
-                direct_out.textures.push(target.texture);
+                direct_out.textures.push(Some(target.texture));
                 direct_out.bind_groups.push(bind_group);
                 crate::perf_counters::count_named_n("filter-atlas-direct", direct_count);
                 if next_active.is_empty() {

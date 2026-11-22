@@ -69,6 +69,10 @@ pub fn set_enabled(enabled: bool) {
     update(|state| state.enabled = enabled);
 }
 
+pub fn is_enabled() -> bool {
+    state().enabled
+}
+
 /// Called before every movie frame.
 pub fn advance_tick() {
     update(|state| state.tick = state.tick.wrapping_add(1).max(1));

@@ -15,7 +15,8 @@ use crate::{
 };
 use image::imageops::FilterType;
 use ruffle_render::backend::{
-    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
+    BitmapCacheEntry, CacheVolatility, Context3D, Context3DProfile, PixelBenderOutput,
+    PixelBenderTarget,
 };
 use ruffle_render::backend::{RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions};
 use ruffle_render::bitmap::{
@@ -95,6 +96,13 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     /// frame (and, for tick-scoped entries, across interpolated sub-frames of the same tick).
     filter_atlas: crate::filters::FilterAtlasResult,
     filter_atlas_tick: u32,
+    /// Content-addressed LRU cache for looping pure-vector filtered CABs.
+    cab_cache: crate::filters::FilteredCabCache,
+    /// When true, `submit_frame` leaves `active_frame.command_encoder` open so the desktop
+    /// shell can append its `egui_render` pass onto the same Metal command buffer before
+    /// submitting + presenting in one job.
+    defer_submit: bool,
+    deferred_frame_pending: bool,
 }
 
 impl WgpuRenderBackend<SwapChainTarget> {
@@ -296,6 +304,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             profiler,
             filter_atlas: crate::filters::FilterAtlasResult::default(),
             filter_atlas_tick: 0,
+            cab_cache: crate::filters::FilteredCabCache::new(),
+            defer_submit: false,
+            deferred_frame_pending: false,
         })
     }
 
@@ -392,6 +403,43 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         self.active_frame.run_after_submissions(task);
     }
 
+    pub fn set_defer_submit(&mut self, defer: bool) {
+        self.defer_submit = defer;
+    }
+
+    pub fn has_deferred_frame(&self) -> bool {
+        self.deferred_frame_pending
+    }
+
+    /// Borrows the render target and the open deferred `CommandEncoder` simultaneously so
+    /// the host GUI can append its present pass onto the movie's own command buffer.
+    pub fn with_target_and_encoder<R>(
+        &mut self,
+        f: impl FnOnce(&T, &mut wgpu::CommandEncoder) -> R,
+    ) -> R {
+        f(&self.target, &mut self.active_frame.command_encoder)
+    }
+
+    /// Submits a deferred movie frame (plus any appended GUI pass) on the async submit
+    /// thread, running `after` (e.g. `set_present_time` + `queue.present`) immediately
+    /// after `queue.submit`.
+    pub fn submit_deferred_frame(
+        &mut self,
+        extra_before: Vec<wgpu::CommandBuffer>,
+        after: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        self.defer_submit = false;
+        if !self.deferred_frame_pending {
+            if let Some(after) = after {
+                self.run_after_submissions(after);
+            }
+            return;
+        }
+        self.deferred_frame_pending = false;
+        self.active_frame
+            .submit_async_with_post(&self.descriptors, extra_before, after);
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.descriptors.device
     }
@@ -429,6 +477,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
+        self.cab_cache.clear();
+        self.filter_atlas.clear();
         // Avoid panics from creating 0-sized framebuffers.
         // TODO: find a way to bubble an error when the size is too large
         let width = std::cmp::max(
@@ -527,6 +577,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn set_quality(&mut self, quality: StageQuality) {
+        if quality != self.surface.quality() {
+            self.cab_cache.clear();
+            self.filter_atlas.clear();
+        }
         self.surface = Surface::new(
             &self.descriptors,
             quality,
@@ -572,6 +626,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) {
         self.finish_pending_shapes();
         let mut cache_entries = cache_entries;
+        if self.deferred_frame_pending {
+            self.submit_deferred_frame(Vec::new(), None);
+        }
         if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::SkipCacheFilters)
         {
             for entry in &mut cache_entries {
@@ -648,6 +705,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 )
                 && ruffle_render::filters::rendering_for_display();
 
+        self.cab_cache.begin_frame();
         let cur_tick = ruffle_render::filters::render_tick();
         if cur_tick == 0 || cur_tick != self.filter_atlas_tick {
             self.filter_atlas.clear();
@@ -844,25 +902,120 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             for &index in &filtered_together {
                 filter_batched[index] = true;
             }
-            let mut filtered_together: Vec<crate::filters::FilterTogetherEntry> = filtered_together
-                .into_iter()
-                .map(|index| {
-                    let entry = cache_entries[index]
-                        .as_mut()
-                        .expect("entries are only taken once");
-                    let direct_commands = direct_to_filter_atlas[index]
-                        .then(|| std::mem::take(&mut entry.commands));
-                    crate::filters::FilterTogetherEntry {
-                        texture: cache_textures[index].clone(),
-                        used_size: used_sizes[index],
-                        filters: entry.filters.clone(),
-                        direct_commands,
-                        handle: entry.handle.clone(),
-                        handle_ptr: Arc::as_ptr(&entry.handle.0) as *const () as usize,
-                        volatility: entry.volatility,
+            let quality = self.surface.quality();
+            let mut filtered_together_entries: Vec<crate::filters::FilterTogetherEntry> =
+                Vec::with_capacity(filtered_together.len());
+            let mut pending_promotions: Vec<(
+                usize,
+                crate::filters::CabContentKey,
+                wgpu::Texture,
+                wgpu::BindGroup,
+                (u32, u32),
+            )> = Vec::new();
+            let mut dedup_leaders: std::collections::HashMap<
+                crate::filters::CabContentKey,
+                usize,
+            > = std::collections::HashMap::new();
+            let mut dedup_followers: Vec<(
+                usize,
+                BitmapHandle,
+                usize,
+                wgpu::Texture,
+                (u32, u32),
+                CacheVolatility,
+            )> = Vec::new();
+            for index in filtered_together {
+                let entry = cache_entries[index]
+                    .as_mut()
+                    .expect("entries are only taken once");
+                let handle_ptr = Arc::as_ptr(&entry.handle.0) as *const () as usize;
+                let used_size = used_sizes[index];
+                let content_key = if direct_to_filter_atlas[index] && entry.clear.a == 0 {
+                    crate::filters::CabContentKey::try_from_entry(
+                        used_size,
+                        entry.clear,
+                        quality,
+                        &entry.filters,
+                        &entry.commands,
+                    )
+                } else {
+                    None
+                };
+                let lru_eligible = entry.volatility != CacheVolatility::Subframe;
+                if lru_eligible
+                    && let Some(ref key) = content_key
+                    && let Some(cached) = self.cab_cache.get(key)
+                {
+                    entry.commands.commands.clear();
+                    if entry.volatility != CacheVolatility::Persistent {
+                        self.filter_atlas.insert_external_slot(
+                            entry.handle.clone(),
+                            handle_ptr,
+                            cached.bind_group.clone(),
+                            cached.used_size,
+                            entry.volatility,
+                        );
+                    } else {
+                        self.active_frame.command_encoder.copy_texture_to_texture(
+                            cached.texture.as_image_copy(),
+                            cache_textures[index].as_image_copy(),
+                            wgpu::Extent3d {
+                                width: used_size.0,
+                                height: used_size.1,
+                                depth_or_array_layers: 1,
+                            },
+                        );
                     }
-                })
-                .collect();
+                    crate::perf_counters::count_named("cab-lru/hit");
+                    continue;
+                }
+                if let Some(ref key) = content_key
+                    && let Some(&leader_ft_idx) = dedup_leaders.get(key)
+                {
+                    let leader_persistent = filtered_together_entries[leader_ft_idx].volatility
+                        == CacheVolatility::Persistent;
+                    let follower_persistent = entry.volatility == CacheVolatility::Persistent;
+                    if leader_persistent == follower_persistent {
+                        entry.commands.commands.clear();
+                        dedup_followers.push((
+                            leader_ft_idx,
+                            entry.handle.clone(),
+                            handle_ptr,
+                            cache_textures[index].clone(),
+                            used_size,
+                            entry.volatility,
+                        ));
+                        crate::perf_counters::count_named("cab-lru/dedup");
+                        continue;
+                    }
+                }
+                let ft_idx = filtered_together_entries.len();
+                let mut promote_copy = None;
+                if let Some(key) = content_key {
+                    if lru_eligible && self.cab_cache.should_promote(&key, used_size) {
+                        let (tex, bg) = crate::filters::FilteredCabCache::allocate_texture(
+                            &self.descriptors,
+                            used_size,
+                        );
+                        promote_copy = Some(tex.clone());
+                        pending_promotions.push((ft_idx, key.clone(), tex, bg, used_size));
+                    }
+                    dedup_leaders.insert(key, ft_idx);
+                }
+                let direct_commands = direct_to_filter_atlas[index]
+                    .then(|| std::mem::take(&mut entry.commands));
+                filtered_together_entries.push(crate::filters::FilterTogetherEntry {
+                    texture: cache_textures[index].clone(),
+                    used_size,
+                    filters: entry.filters.clone(),
+                    direct_commands,
+                    handle: entry.handle.clone(),
+                    handle_ptr,
+                    volatility: entry.volatility,
+                    promote_copy,
+                });
+            }
+            let mut filtered_together = filtered_together_entries;
 
             for &index in &members {
                 let entry = cache_entries[index]
@@ -1009,7 +1162,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         .min(self.descriptors.limits.max_texture_dimension_2d),
                     &mut self.filter_atlas,
                 );
-                for index in skipped {
+                for &index in &skipped {
                     let entry = &mut filtered_together[index];
                     if let Some(commands) = entry.direct_commands.take() {
                         let surface = Surface::new(
@@ -1047,6 +1200,38 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         &entry.texture,
                         &entry.filters,
                     );
+                }
+                for (ft_idx, key, tex, bg, used_size) in pending_promotions {
+                    if !skipped.contains(&ft_idx) {
+                        self.cab_cache.insert(key, tex, bg, used_size);
+                        crate::perf_counters::count_named("cab-lru/promote");
+                    }
+                }
+                for (leader_ft_idx, handle, handle_ptr, tex, used_size, volatility) in
+                    dedup_followers
+                {
+                    let leader = &filtered_together[leader_ft_idx];
+                    if volatility != CacheVolatility::Persistent
+                        && !skipped.contains(&leader_ft_idx)
+                    {
+                        let aliased = self.filter_atlas.alias_slot(
+                            leader.handle_ptr,
+                            handle,
+                            handle_ptr,
+                            volatility,
+                        );
+                        debug_assert!(aliased);
+                    } else {
+                        self.active_frame.command_encoder.copy_texture_to_texture(
+                            leader.texture.as_image_copy(),
+                            tex.as_image_copy(),
+                            wgpu::Extent3d {
+                                width: used_size.0,
+                                height: used_size.1,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
                 }
             }
             for (filters, members) in filter_groups {
@@ -1152,8 +1337,16 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             .resolve_queries(&mut self.active_frame.command_encoder);
         self.active_frame.staging_belt.finish();
 
-        self.active_frame
-            .submit_for_target_async(&self.descriptors, &self.target, frame_output);
+        if self.defer_submit
+            && self.target.can_submit_asynchronously()
+            && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::AsyncSubmit)
+        {
+            drop(frame_output);
+            self.deferred_frame_pending = true;
+        } else {
+            self.active_frame
+                .submit_for_target_async(&self.descriptors, &self.target, frame_output);
+        }
         self.offscreen_texture_pool.end_frame();
         self.texture_pool.end_frame();
         crate::perf_counters::end_frame();
@@ -1833,8 +2026,14 @@ struct AsyncSubmitter {
 
 /// Work for the submit thread, which does it in order.
 enum SubmitJob {
-    /// Finish the encoder and submit it.
-    Frame(wgpu::CommandEncoder, wgpu::Queue),
+    /// Finish the encoder, submit any preceding buffers + it, and optionally run a
+    /// post-submit callback (e.g. `set_present_time` + `queue.present`).
+    Frame {
+        encoder: wgpu::CommandEncoder,
+        extra_before: Vec<wgpu::CommandBuffer>,
+        queue: wgpu::Queue,
+        after: Option<Box<dyn FnOnce() + Send>>,
+    },
     /// Anything that must happen after the frames before it were submitted
     /// (see `WgpuRenderBackend::run_after_submissions`).
     Task(Box<dyn FnOnce() + Send>),
@@ -1866,8 +2065,17 @@ impl AsyncSubmitter {
                 }
                 for job in job_receiver {
                     match job {
-                        SubmitJob::Frame(encoder, queue) => {
-                            queue.submit(Some(encoder.finish()));
+                        SubmitJob::Frame {
+                            encoder,
+                            mut extra_before,
+                            queue,
+                            after,
+                        } => {
+                            extra_before.push(encoder.finish());
+                            queue.submit(extra_before);
+                            if let Some(after) = after {
+                                after();
+                            }
                         }
                         SubmitJob::Task(task) => task(),
                     }
@@ -1984,6 +2192,15 @@ impl ActiveFrame {
 
     /// Finishes and submits the current commands on the submit thread.
     fn submit_async(&mut self, descriptors: &Descriptors) {
+        self.submit_async_with_post(descriptors, Vec::new(), None);
+    }
+
+    fn submit_async_with_post(
+        &mut self,
+        descriptors: &Descriptors,
+        extra_before: Vec<wgpu::CommandBuffer>,
+        after: Option<Box<dyn FnOnce() + Send>>,
+    ) {
         self.wait_for_submission();
         apply_wgpu_core_switches();
         self.draws_since_flush = 0;
@@ -2004,7 +2221,12 @@ impl ActiveFrame {
         let submitter = self.submitter.get_or_insert_with(AsyncSubmitter::new);
         submitter
             .jobs
-            .send(SubmitJob::Frame(draw_encoder, descriptors.queue.clone()))
+            .send(SubmitJob::Frame {
+                encoder: draw_encoder,
+                extra_before,
+                queue: descriptors.queue.clone(),
+                after,
+            })
             .expect("Submit thread should be running");
         self.jobs_in_flight += 1;
     }

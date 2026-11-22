@@ -1588,6 +1588,62 @@ All 151 Metal `visual/` image regression tests and 177 unit tests pass. Live Art
   **20.0–22.2**, targets **5.9–6.4**, `filter-atlas-direct` **48–95%** (zero visual regressions
   across heavy overlapping glows, wings, and masks).
 
+### 79. Content-addressed filtered-CAB LRU cache and same-frame deduplication (`FilteredCabCache`)
+
+*Files: `render/wgpu/src/filters/cache.rs`, `render/wgpu/src/mesh.rs` (`Mesh::id`), `render/wgpu/src/filters/batch.rs` (`FilterAtlasResult::insert_external_slot`, `alias_slot`, `promote_copy`), `render/wgpu/src/backend.rs`.*
+
+Looping pure-vector filtered CABs (animated capes, wings, weapons, pulsing auras, combat
+effects) are now cached across animation loops in a thrash-proof content-addressed LRU cache
+keyed by exact canonical inputs (`used_size`, `clear`, `StageQuality`, exact filter bytes, and
+exact vector `CommandList` bytes using monotonic `Mesh::id`). Safety guards ensure zero visual
+regressions:
+* Pure-vector commands only (excludes any CAB containing `RenderBitmap`, `RenderStage3D`,
+  `RenderAlphaMask`, or `BlendMode::Shader` so mutable `BitmapData`/video/nested textures can
+  never serve stale pixels).
+* Exact canonical byte comparison (zero hash-collision risk) with exact `f32::to_bits()`
+  matrices and color transforms (preserves sub-pixel antialiasing).
+* 2-hit admission filter + `Subframe` exclusion (only canonical movie-tick frames enter the
+  cache) + 192 MB VRAM cap with a 360-frame hot-window guard (prevents active loops from
+  evicting each other) + idle eviction and clear on resize/quality change.
+* Same-frame deduplication: identical CABs within a single frame render and filter once and
+  alias the leader's filter-atlas slot (`cab-lru/dedup`).
+
+### 80. Subframe incremental GC spreading (`collect_gc_slice`)
+
+*Files: `core/src/player.rs` (`collect_gc_slice`), `core/src/display_object/interpolation.rs` (`is_enabled`), `desktop/src/app.rs`.*
+
+When frame interpolation is active, `Player::update` caps per-tick GC debt collection to an
+0.8 ms budget (using `gc-arena`'s `metrics().allocation_debt()` and `adjust_debt()` in
+4,000-unit chunks) and drains remaining debt at up to 1.2 ms after each interpolated subframe
+is submitted while the GPU renders. This cuts combat `frame max` GC stalls in `icestormunder`
+nearly in half (**12.9–17.3 ms → 7.0–9.0 ms**) without modifying `gc-arena`.
+
+### 81. Merged `egui_render` command encoder and empty-UI buffer skip
+
+*Files: `render/wgpu/src/backend.rs` (`defer_submit`, `with_target_and_encoder`, `submit_deferred_frame`), `desktop/src/gui/controller.rs`, `desktop/src/app.rs`.*
+
+When `AsyncPresent` is active, `WgpuRenderBackend::submit_frame` defers finishing its
+`CommandEncoder` so `GuiController::render` appends `egui_render` directly onto the movie's
+own Metal command buffer and submits + presents in a single async job, while skipping
+`egui_renderer.update_buffers()` and `egui_renderer.render()` whenever no egui UI is open.
+Cuts Metal command buffers from **3.0–3.3/fr → 2.0–2.3/fr** (~120–144 fewer Metal command
+buffer submissions/s at 144 Hz).
+
+### Measured impact of 79–81 (5120x1440 144 Hz, Apple M1, zero visual loss)
+
+All 151 Metal `visual/` image regression tests and 177 unit tests pass. Live Artix results:
+
+* **`battleon-1` (packed, 726 `direct-blend`, 30 `fetch-blend`)**: holds **6× (~132–139 fps)**
+  at **61–64% GPU (~4.6 ms/fr)**, passes **7.2–8.0**, targets **3.0–3.1**, **2.0 cmdbufs/fr**,
+  `cab-lru/promote` **0.0–0.2** (zero thrashing).
+* **`yulgar-2` (19 players)**: `cab-lru/hit` **45–47%** (`10.0–11.6` filtered CABs/fr skipped),
+  `filter-together` cut in half (**25 → 12.1–13.6**), passes **14.7–16.8**, `filter-atlas-direct`
+  **97%**, **2.3 cmdbufs/fr**.
+* **`icestormunder-1` room 2 (7 players heavy combat)**: `cab-lru/hit` + `cab-lru/dedup` skip
+  up to **70%** of filtered combat CABs (`35.3 / 50.2`), passes **9.7–12.0** (down from 24–33),
+  targets **3.7–4.1** (down from 14–21), combat `frame max` **6.97–9.00 ms** (down from
+  12.9–17.3 ms), GPU **48–54%**, **2.2 cmdbufs/fr**.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

@@ -355,6 +355,27 @@ impl GuiController {
         PhysicalPosition::new(x, y)
     }
 
+    /// Prepares the player's renderer to defer submitting its command buffer so
+    /// `GuiController::render` can append `egui_render` onto the same Metal command buffer.
+    pub fn begin_movie_render(&self, player: &mut Player) {
+        if ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::AsyncPresent)
+            && let Some(renderer) =
+                <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(player.renderer_mut())
+        {
+            renderer.set_defer_submit(true);
+        }
+    }
+
+    fn flush_deferred_movie(&self, player: &mut Option<MutexGuard<Player>>) {
+        if let Some(player) = player.as_deref_mut()
+            && let Some(renderer) =
+                <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(player.renderer_mut())
+            && renderer.has_deferred_frame()
+        {
+            renderer.submit_deferred_frame(Vec::new(), None);
+        }
+    }
+
     /// Runs the GUI, and presents a frame showing it over the movie (`movie_drawn` says
     /// whether the movie was just drawn again). Returns how long it waited for a surface
     /// texture to draw into, which is how long the frames presented before were still
@@ -419,6 +440,7 @@ impl GuiController {
             }
         }
         if !movie_drawn && !showed_ui && !self.shows_ui {
+            self.flush_deferred_movie(&mut player);
             self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
             return Duration::ZERO;
         }
@@ -445,6 +467,7 @@ impl GuiController {
                 // platform-specific reasons, wgpu bugs?).
                 // Testing on Vulkan shows that reconfiguring the surface works in that case.
                 tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
+                self.flush_deferred_movie(&mut player);
                 self.reconfigure_surface();
                 self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
                 return acquire_start.elapsed();
@@ -453,6 +476,7 @@ impl GuiController {
                 // Acquiring the frame took too long (a full second, as of wgpu 29).
                 // The best thing we can do is skip a frame and wait.
                 tracing::warn!("Surface acquisition timed out, skipping a frame");
+                self.flush_deferred_movie(&mut player);
                 self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
                 return acquire_start.elapsed();
             }
@@ -465,6 +489,7 @@ impl GuiController {
                 // Unlike `Timeout`, this returns immediately, so it would repeat
                 // at the movie's frame rate: keep it quiet, it's not an error.
                 tracing::trace!("Surface is occluded, skipping a frame");
+                self.flush_deferred_movie(&mut player);
                 self.free_textures(std::mem::take(&mut full_output.textures_delta.free));
                 return acquire_start.elapsed();
             }
@@ -486,97 +511,160 @@ impl GuiController {
             size_in_pixels: [self.size.width, self.size.height],
             pixels_per_point: scale_factor,
         };
+        let window_size = (self.size.width, self.size.height);
+        let menu_height = self.height_offset() as f32;
+        let has_egui = !clipped_primitives.is_empty();
+        let surface_view = surface_texture.texture.create_view(&Default::default());
 
-        let mut encoder =
-            self.descriptors
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("egui encoder"),
-                });
-
-        let mut command_buffers = self.egui_renderer.update_buffers(
-            &self.descriptors.device,
-            &self.descriptors.queue,
-            &mut encoder,
-            &clipped_primitives,
-            &screen_descriptor,
-        );
-
-        let movie_view = if let Some(player) = player.as_deref_mut() {
-            let renderer =
-                <dyn Any>::downcast_ref::<WgpuRenderBackend<MovieView>>(player.renderer_mut())
-                    .expect("Renderer must be correct type");
-            Some(renderer.target())
-        } else {
-            None
-        };
-
-        {
-            let surface_view = surface_texture.texture.create_view(&Default::default());
-
-            let mut render_pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &surface_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    label: Some("egui_render"),
-                    ..Default::default()
-                })
-                .forget_lifetime();
-
-            if let Some(movie_view) = movie_view {
-                movie_view.render(
-                    &self.movie_view_renderer,
-                    &mut render_pass,
-                    (self.size.width, self.size.height),
-                    self.height_offset() as f32,
-                );
-            }
-
-            self.egui_renderer
-                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
-
-            #[cfg(feature = "tracy_images")]
-            {
-                drop(render_pass);
-                self.tracy_frame_captures
-                    .capture_frame(&self.descriptors.device, &mut encoder);
-            }
-        }
-
-        command_buffers.push(encoder.finish());
-        self.window.pre_present_notify();
-        let queue = self.descriptors.queue.clone();
-        let present = move || {
-            queue.submit(command_buffers);
-            ruffle_render_wgpu::backend::set_present_time(present_time);
-            queue.present(surface_texture);
-        };
-        // The movie's frame may still be being submitted on the renderer's submit
-        // thread. This frame shows it, so it must be submitted after it: let that
-        // thread do it, instead of waiting here.
-        let renderer = player.as_deref_mut().and_then(|player| {
+        // Fast path: append `egui_render` directly onto the movie's deferred
+        // `CommandEncoder` and submit + present in one async job (avoiding an extra
+        // Metal command buffer and queue.submit every frame).
+        let mut renderer = player.as_deref_mut().and_then(|player| {
             <dyn Any>::downcast_mut::<WgpuRenderBackend<MovieView>>(player.renderer_mut())
         });
-        match renderer {
-            Some(renderer)
-                if ruffle_render::perf_flags::enabled(
-                    ruffle_render::perf_flags::PerfFlag::AsyncPresent,
-                ) =>
-            {
-                let guard = self.pending_presents.start();
-                renderer.run_after_submissions(Box::new(move || {
-                    present();
+        if let Some(ref mut renderer) = renderer
+            && renderer.has_deferred_frame()
+        {
+            let egui_renderer = &mut self.egui_renderer;
+            let descriptors = &self.descriptors;
+            let movie_view_renderer = &self.movie_view_renderer;
+            #[cfg(feature = "tracy_images")]
+            let tracy_frame_captures = &mut self.tracy_frame_captures;
+            let extra_buffers = renderer.with_target_and_encoder(|movie_view, encoder| {
+                let extra = if has_egui {
+                    egui_renderer.update_buffers(
+                        &descriptors.device,
+                        &descriptors.queue,
+                        encoder,
+                        &clipped_primitives,
+                        &screen_descriptor,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let mut render_pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &surface_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        label: Some("egui_render"),
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+                movie_view.render(movie_view_renderer, &mut render_pass, window_size, menu_height);
+                if has_egui {
+                    egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+                }
+                #[cfg(feature = "tracy_images")]
+                {
+                    drop(render_pass);
+                    tracy_frame_captures.capture_frame(&descriptors.device, encoder);
+                }
+                extra
+            });
+            self.window.pre_present_notify();
+            let queue = self.descriptors.queue.clone();
+            let guard = self.pending_presents.start();
+            renderer.submit_deferred_frame(
+                extra_buffers,
+                Some(Box::new(move || {
+                    ruffle_render_wgpu::backend::set_present_time(present_time);
+                    queue.present(surface_texture);
                     drop(guard);
-                }));
+                })),
+            );
+        } else {
+            let mut encoder =
+                self.descriptors
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("egui encoder"),
+                    });
+
+            let mut command_buffers = if has_egui {
+                self.egui_renderer.update_buffers(
+                    &self.descriptors.device,
+                    &self.descriptors.queue,
+                    &mut encoder,
+                    &clipped_primitives,
+                    &screen_descriptor,
+                )
+            } else {
+                Vec::new()
+            };
+
+            let movie_view = renderer.as_deref().map(|r| r.target());
+
+            {
+                let mut render_pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &surface_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        label: Some("egui_render"),
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+
+                if let Some(movie_view) = movie_view {
+                    movie_view.render(
+                        &self.movie_view_renderer,
+                        &mut render_pass,
+                        window_size,
+                        menu_height,
+                    );
+                }
+
+                if has_egui {
+                    self.egui_renderer
+                        .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+                }
+
+                #[cfg(feature = "tracy_images")]
+                {
+                    drop(render_pass);
+                    self.tracy_frame_captures
+                        .capture_frame(&self.descriptors.device, &mut encoder);
+                }
             }
-            _ => present(),
+
+            command_buffers.push(encoder.finish());
+            self.window.pre_present_notify();
+            let queue = self.descriptors.queue.clone();
+            let present = move || {
+                queue.submit(command_buffers);
+                ruffle_render_wgpu::backend::set_present_time(present_time);
+                queue.present(surface_texture);
+            };
+            // The movie's frame may still be being submitted on the renderer's submit
+            // thread. This frame shows it, so it must be submitted after it: let that
+            // thread do it, instead of waiting here.
+            match renderer {
+                Some(renderer)
+                    if ruffle_render::perf_flags::enabled(
+                        ruffle_render::perf_flags::PerfFlag::AsyncPresent,
+                    ) =>
+                {
+                    let guard = self.pending_presents.start();
+                    renderer.run_after_submissions(Box::new(move || {
+                        present();
+                        drop(guard);
+                    }));
+                }
+                _ => present(),
+            }
         }
 
         self.free_textures(std::mem::take(&mut full_output.textures_delta.free));

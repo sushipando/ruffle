@@ -176,6 +176,7 @@ impl MainWindow {
                     let frame_duration = player.frame_duration_seconds();
                     player.set_render_fraction(self.render_fraction(frame_duration));
                     present_time = self.present_time(frame_duration);
+                    self.gui.begin_movie_render(player);
                     player.render();
                     movie_drawn = true;
                 }
@@ -196,6 +197,14 @@ impl MainWindow {
                 // work.
                 self.adaptation
                     .add_busy(start.elapsed().saturating_sub(waited));
+                // After submitting an interpolated frame, spend a small bounded slice
+                // draining any GC debt deferred from movie ticks while the GPU renders.
+                if movie_drawn
+                    && self.max_interpolate > 1
+                    && let Some(mut player) = self.player.get()
+                {
+                    player.collect_gc_slice(Duration::from_micros(1200));
+                }
             }
 
             // Important that we return here, or we'll get a feedback loop with egui

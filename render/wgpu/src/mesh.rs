@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use wgpu::util::DeviceExt;
+
+static NEXT_MESH_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::buffer_builder::BufferBuilder;
 use ruffle_render::backend::{RenderBackend, ShapeHandle, ShapeHandleImpl};
@@ -37,6 +40,7 @@ pub struct MeshData {
 /// several threads, before a frame is drawn, and anything that needs a pending mesh
 /// earlier tessellates it on the spot (see `Mesh::data`).
 pub struct Mesh {
+    pub id: u64,
     data: OnceCell<MeshData>,
     pending: RefCell<Option<PendingShape>>,
 }
@@ -46,6 +50,7 @@ impl ShapeHandleImpl for Mesh {}
 impl fmt::Debug for Mesh {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mesh")
+            .field("id", &self.id)
             .field("data", &self.data.get())
             .field("pending", &self.pending.borrow().is_some())
             .finish()
@@ -55,6 +60,7 @@ impl fmt::Debug for Mesh {
 impl Mesh {
     pub fn ready(data: MeshData) -> Self {
         Self {
+            id: NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed),
             data: OnceCell::from(data),
             pending: RefCell::new(None),
         }
@@ -62,6 +68,7 @@ impl Mesh {
 
     pub fn pending(shape: PendingShape) -> Self {
         Self {
+            id: NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed),
             data: OnceCell::new(),
             pending: RefCell::new(Some(shape)),
         }
@@ -434,6 +441,13 @@ pub fn as_mesh(handle: &ShapeHandle) -> &MeshData {
     <dyn Any>::downcast_ref::<Mesh>(&*handle.0)
         .expect("Shape handle must be a WGPU ShapeData")
         .data()
+}
+
+/// Returns the monotonic, never-reused ID of this shape's `Mesh` without forcing tessellation.
+pub fn mesh_id(handle: &ShapeHandle) -> u64 {
+    <dyn Any>::downcast_ref::<Mesh>(&*handle.0)
+        .expect("Shape handle must be a WGPU ShapeData")
+        .id
 }
 
 #[derive(Debug)]

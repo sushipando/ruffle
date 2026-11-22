@@ -2334,6 +2334,43 @@ impl Player {
         self.gc_arena.borrow_mut().finish_cycle();
     }
 
+    /// Runs incremental GC work up to `budget`, deferring any excess allocation debt so
+    /// heavy allocation bursts can be drained smoothly across idle interpolated sub-frames
+    /// instead of stalling a single movie tick for 10-17 ms.
+    pub fn collect_gc_slice(&mut self, budget: Duration) {
+        const CHUNK_DEBT: f64 = 4_000.0;
+        const HIGH_DEBT_WATERMARK: f64 = 250_000.0;
+        let mut arena = self.gc_arena.borrow_mut();
+        let initial_debt = arena.metrics().allocation_debt();
+        if initial_debt <= 0.0 {
+            return;
+        }
+        let budget = if initial_debt > HIGH_DEBT_WATERMARK {
+            budget.max(Duration::from_micros(2500))
+        } else {
+            budget
+        };
+        let start = Instant::now();
+        loop {
+            let cur = arena.metrics().allocation_debt();
+            if cur <= 0.0 {
+                break;
+            }
+            let slice = cur.min(CHUNK_DEBT);
+            let defer = cur - slice;
+            if defer > 0.0 {
+                arena.metrics().adjust_debt(-defer);
+            }
+            arena.collect_debt();
+            if defer > 0.0 {
+                arena.metrics().adjust_debt(defer);
+            }
+            if start.elapsed() >= budget {
+                break;
+            }
+        }
+    }
+
     /// Diagnostics (leak debugging): prints the most common types of reachable GC objects.
     fn print_heap_histogram(&self) {
         let Ok(arena) = self.gc_arena.try_borrow() else {
@@ -2697,8 +2734,14 @@ impl Player {
         });
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
-        // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        // GC: when frame interpolation is active, cap per-tick GC to a small slice and
+        // drain any remaining debt during the idle interpolated sub-frames (see
+        // `collect_gc_slice`) so combat allocation spikes don't stall movie ticks.
+        if crate::display_object::interpolation::is_enabled() {
+            self.collect_gc_slice(Duration::from_micros(800));
+        } else {
+            self.gc_arena.borrow_mut().collect_debt();
+        }
 
         rval
     }
