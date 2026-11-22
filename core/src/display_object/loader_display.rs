@@ -241,16 +241,39 @@ impl<'gc> TInteractiveObject<'gc> for LoaderDisplay<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        let parent_to_global = self
+            .parent()
+            .filter(|p| p.as_stage().is_none())
+            .map_or(Matrix::IDENTITY, |p| p.local_to_global_matrix());
+        self.mouse_pick_avm2_with_matrix(context, point, require_button_mode, parent_to_global)
+    }
+
+    fn mouse_pick_avm2_with_matrix(
+        self,
+        context: &mut UpdateContext<'gc>,
+        point: Point<Twips>,
+        require_button_mode: bool,
+        parent_to_global: Matrix,
+    ) -> Avm2MousePick<'gc> {
         let mut options = HitTestOptions::SKIP_INVISIBLE;
         options.set(HitTestOptions::SKIP_MASK, self.maskee().is_none());
 
         if self.visible() {
+            let mut self_to_global = parent_to_global * self.base().raw_matrix();
+            if let Some(rect) = self.scroll_rect() {
+                self_to_global *= Matrix::translate(-rect.x_min, -rect.y_min);
+            }
             // A loader has at most one child.
             if let Some(child) = self.iter_render_list().next() {
                 if let Some(int) = child.as_interactive() {
                     if int.as_displayobject().movie().is_action_script_3() {
                         return int
-                            .mouse_pick_avm2(context, point, require_button_mode)
+                            .mouse_pick_avm2_with_matrix(
+                                context,
+                                point,
+                                require_button_mode,
+                                self_to_global,
+                            )
                             .combine_with_parent(self.into());
                     } else if let Some(result) =
                         int.mouse_pick_avm1(context, point, require_button_mode)
@@ -259,7 +282,17 @@ impl<'gc> TInteractiveObject<'gc> for LoaderDisplay<'gc> {
                     }
                 }
 
-                if child.hit_test_shape(context, point, options) {
+                let hit = match child {
+                    DisplayObject::Graphic(g) if !g.base().has_scroll_rect() => {
+                        g.hit_test_shape_with_matrix(
+                            point,
+                            options,
+                            self_to_global * g.base().raw_matrix(),
+                        )
+                    }
+                    _ => child.hit_test_shape(context, point, options),
+                };
+                if hit {
                     if self.mouse_enabled() {
                         return Avm2MousePick::Hit(self.into());
                     } else {

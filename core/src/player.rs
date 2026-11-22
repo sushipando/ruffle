@@ -3595,7 +3595,12 @@ fn run_mouse_pick<'gc>(
         level.as_interactive().and_then(|l| {
             if l.as_displayobject().movie().is_action_script_3() {
                 let pick = l
-                    .mouse_pick_avm2(context, *context.mouse_position, require_button_mode)
+                    .mouse_pick_avm2_with_matrix(
+                        context,
+                        *context.mouse_position,
+                        require_button_mode,
+                        Matrix::IDENTITY,
+                    )
                     .combine_with_parent(context.stage.into());
 
                 if let Avm2MousePick::Hit(target) = pick {

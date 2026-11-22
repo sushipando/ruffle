@@ -3262,6 +3262,20 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        let parent_to_global = self
+            .parent()
+            .filter(|p| p.as_stage().is_none())
+            .map_or(Matrix::IDENTITY, |p| p.local_to_global_matrix());
+        self.mouse_pick_avm2_with_matrix(context, point, require_button_mode, parent_to_global)
+    }
+
+    fn mouse_pick_avm2_with_matrix(
+        self,
+        context: &mut UpdateContext<'gc>,
+        point: Point<Twips>,
+        require_button_mode: bool,
+        parent_to_global: Matrix,
+    ) -> Avm2MousePick<'gc> {
         // Don't do anything if run in an AVM1 context.
         if !self.movie().is_action_script_3() {
             return Avm2MousePick::Miss;
@@ -3280,9 +3294,14 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             }
 
             let this: InteractiveObject<'gc> = self.into();
-            let Some(local_matrix) = self.global_to_local_matrix() else {
+            let mut self_to_global = parent_to_global * self.base().raw_matrix();
+            if let Some(rect) = self.scroll_rect() {
+                self_to_global *= Matrix::translate(-rect.x_min, -rect.y_min);
+            }
+            let det = self_to_global.a * self_to_global.d - self_to_global.b * self_to_global.c;
+            if det == 0.0 || !det.is_finite() {
                 return Avm2MousePick::Miss;
-            };
+            }
 
             if let Some(masker) = self.masker()
                 && !masker.hit_test_shape(context, point, HitTestOptions::empty())
@@ -3298,87 +3317,67 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             let mut found_propagate = None;
 
             if has_children {
-                let mut clip_layers = self
+                let children = self.raw_container();
+                let mouse_children = children.mouse_children();
+                let has_clips = children
                     .iter_render_list()
-                    .any(|child| child.clip_depth() > 0)
-                    .then(|| {
-                        self.iter_render_list()
-                            .flat_map(|child| {
-                                if child.clip_depth() > 0 {
-                                    // Note - we intentionally use 'child.depth()' here instead
-                                    // of the position in the render list - this matches Flash's
-                                    // behavior. The 'depth' value comes from the PlaceObject tag
-                                    Some((child, (child.depth() + 1)..=(child.clip_depth())))
-                                } else {
-                                    None
-                                }
-                            })
-                            .rev()
-                            .peekable()
-                    });
+                    .any(|child| child.clip_depth() > 0);
+                let mut clip_layers = has_clips.then(|| {
+                    children
+                        .iter_render_list()
+                        .filter_map(|child| {
+                            if child.clip_depth() > 0 {
+                                // Note - we intentionally use 'child.depth()' here instead
+                                // of the position in the render list - this matches Flash's
+                                // behavior. The 'depth' value comes from the PlaceObject tag
+                                Some((child, (child.depth() + 1)..=(child.clip_depth())))
+                            } else {
+                                None
+                            }
+                        })
+                        .rev()
+                        .peekable()
+                });
 
                 // Interactive children run first, followed by non-interactive children.
                 // Depth is considered within each group.
-
-                let interactive = self
-                    .iter_render_list()
-                    .rev()
-                    .filter(|child| child.as_interactive().is_some());
-                let non_interactive = self
-                    .iter_render_list()
-                    .rev()
-                    .filter(|child| child.as_interactive().is_none());
-
-                for child in interactive.into_iter().chain(non_interactive) {
-                    // Mask children are not clickable
+                let mut saw_non_interactive = false;
+                for child in children.iter_render_list().rev() {
                     if child.clip_depth() > 0 || child.maskee().is_some() {
                         continue;
                     }
+                    let Some(int_child) = child.as_interactive() else {
+                        saw_non_interactive = true;
+                        continue;
+                    };
 
-                    let mut res = if let Some(child) = child.as_interactive() {
-                        if child.as_displayobject().movie().is_action_script_3() {
-                            child.mouse_pick_avm2(context, point, require_button_mode)
-                        } else {
-                            let avm1_result =
-                                child.mouse_pick_avm1(context, point, require_button_mode);
-                            if let Some(result) = avm1_result {
-                                Avm2MousePick::Hit(result)
-                            } else {
-                                Avm2MousePick::Miss
-                            }
-                        }
-                    } else if child.hit_test_shape(context, point, options)
-                        && child
-                            .masker()
-                            .map(|mask| mask.hit_test_shape(context, point, options))
-                            .unwrap_or(true)
-                    {
-                        if self.mouse_enabled() {
-                            Avm2MousePick::Hit(this)
-                        } else {
-                            Avm2MousePick::PropagateToParent
-                        }
+                    let mut res = if int_child.as_displayobject().movie().is_action_script_3() {
+                        int_child.mouse_pick_avm2_with_matrix(
+                            context,
+                            point,
+                            require_button_mode,
+                            self_to_global,
+                        )
                     } else {
-                        Avm2MousePick::Miss
+                        let avm1_result =
+                            int_child.mouse_pick_avm1(context, point, require_button_mode);
+                        if let Some(result) = avm1_result {
+                            Avm2MousePick::Hit(result)
+                        } else {
+                            Avm2MousePick::Miss
+                        }
                     };
 
                     if let Some(clip_layers) = clip_layers.as_mut() {
                         while let Some((clip, clip_range)) = clip_layers.peek() {
-                            // This clip layer no longer applies to the remaining children (which all have lower depth values).
-                            // This is a rare case where we actually use 'child.depth()' in AVM2 - child.depth()
-                            // gets set from a PlaceObject tag, and may be *greater* than position in the render list.
                             if *clip_range.start() > child.depth() {
                                 clip_layers.next();
                                 continue;
                             }
-
-                            if clip_range.contains(&child.depth()) {
-                                // If the clip layer applies to the current child, check if the child is masked by the clip.
-                                // If the position isn't within the mask region, then treat this as a miss unconditionally.
-                                // We'll continue the outer loop over the children, as another child may be hit.
-                                if !clip.hit_test_shape(context, point, options) {
-                                    res = Avm2MousePick::Miss;
-                                }
+                            if clip_range.contains(&child.depth())
+                                && !clip.hit_test_shape(context, point, options)
+                            {
+                                res = Avm2MousePick::Miss;
                             }
                             break;
                         }
@@ -3389,9 +3388,89 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                             return res.combine_with_parent(self.into());
                         }
                         Avm2MousePick::PropagateToParent => {
+                            if !mouse_children {
+                                return res.combine_with_parent(self.into());
+                            }
                             found_propagate = Some(res);
                         }
                         Avm2MousePick::Miss => {}
+                    }
+                }
+
+                if saw_non_interactive {
+                    let mut clip_layers = has_clips.then(|| {
+                        children
+                            .iter_render_list()
+                            .filter_map(|child| {
+                                if child.clip_depth() > 0 {
+                                    Some((child, (child.depth() + 1)..=(child.clip_depth())))
+                                } else {
+                                    None
+                                }
+                            })
+                            .rev()
+                            .peekable()
+                    });
+                    for child in children.iter_render_list().rev() {
+                        if child.clip_depth() > 0
+                            || child.maskee().is_some()
+                            || child.as_interactive().is_some()
+                        {
+                            continue;
+                        }
+
+                        let hit = match child {
+                            DisplayObject::Graphic(g) if !g.base().has_scroll_rect() => {
+                                g.hit_test_shape_with_matrix(
+                                    point,
+                                    options,
+                                    self_to_global * g.base().raw_matrix(),
+                                )
+                            }
+                            _ => child.hit_test_shape(context, point, options),
+                        };
+                        let mut res = if hit
+                            && child
+                                .masker()
+                                .map(|mask| mask.hit_test_shape(context, point, options))
+                                .unwrap_or(true)
+                        {
+                            if self.mouse_enabled() {
+                                Avm2MousePick::Hit(this)
+                            } else {
+                                Avm2MousePick::PropagateToParent
+                            }
+                        } else {
+                            Avm2MousePick::Miss
+                        };
+
+                        if let Some(clip_layers) = clip_layers.as_mut() {
+                            while let Some((clip, clip_range)) = clip_layers.peek() {
+                                if *clip_range.start() > child.depth() {
+                                    clip_layers.next();
+                                    continue;
+                                }
+                                if clip_range.contains(&child.depth())
+                                    && !clip.hit_test_shape(context, point, options)
+                                {
+                                    res = Avm2MousePick::Miss;
+                                }
+                                break;
+                            }
+                        }
+
+                        match res {
+                            Avm2MousePick::Hit(_) => {
+                                return res.combine_with_parent(self.into());
+                            }
+                            Avm2MousePick::PropagateToParent => {
+                                if !mouse_children {
+                                    return res.combine_with_parent(self.into());
+                                }
+                                found_propagate = Some(res);
+                            }
+                            Avm2MousePick::Miss => {}
+                        }
                     }
                 }
             }
@@ -3405,6 +3484,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             // (Check for a drawing first, as computing the bounds involves all descendants.)
             if has_drawing
                 && let Some(drawing) = self.drawing()
+                && let Some(local_matrix) = self_to_global.inverse()
                 && self.world_bounds(BoundsMode::Engine).contains(point)
                 && drawing.hit_test(local_matrix * point, &local_matrix)
             {

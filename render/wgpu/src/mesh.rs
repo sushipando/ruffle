@@ -140,7 +140,46 @@ impl PendingShape {
                 bitmaps,
             },
             job: TessellationJob {
-                shape: OwnedShape::from(shape),
+                input: JobInput::Distilled(OwnedShape::from(shape)),
+                scale,
+                bitmap_sizes,
+            },
+        }
+    }
+
+    /// Defers SWF shape parsing, path distillation, and tessellation onto worker threads
+    /// so the main thread only looks up any referenced bitmap handles.
+    pub fn from_raw(
+        descriptors: Arc<Descriptors>,
+        raw: ruffle_render::backend::RawSwfShape,
+        bitmap_source: &dyn BitmapSource,
+        renderer: &mut dyn RenderBackend,
+        scale: f32,
+    ) -> Self {
+        let mut bitmap_sizes = HashMap::new();
+        let mut bitmaps = HashMap::new();
+        for id in raw.bitmap_ids {
+            if !bitmap_sizes.contains_key(&id)
+                && let Some(size) = bitmap_source.bitmap_size(id)
+            {
+                bitmap_sizes.insert(id, size);
+                if let Some(handle) = bitmap_source.bitmap_handle(id, renderer) {
+                    bitmaps.insert(id, handle);
+                }
+            }
+        }
+        Self {
+            finish: FinishShape {
+                descriptors,
+                shape_id: raw.id,
+                bitmaps,
+            },
+            job: TessellationJob {
+                input: JobInput::RawSwf {
+                    swf_version: raw.swf_version,
+                    shape_version: raw.shape_version,
+                    data: raw.data,
+                },
                 scale,
                 bitmap_sizes,
             },
@@ -196,53 +235,86 @@ pub fn tessellate_all(
         .collect()
 }
 
+enum JobInput {
+    Distilled(OwnedShape),
+    RawSwf {
+        swf_version: u8,
+        shape_version: u8,
+        data: Vec<u8>,
+    },
+}
+
 /// Tessellating a shape: plain data, so that it can be done on another thread.
 pub struct TessellationJob {
-    shape: OwnedShape,
+    input: JobInput,
     scale: f32,
     bitmap_sizes: HashMap<CharacterId, BitmapSize>,
 }
 
 impl TessellationJob {
     pub fn tessellate(self, tessellator: &mut ShapeTessellator) -> LyonMesh {
-        let OwnedShape {
-            id,
-            shape_bounds,
-            edge_bounds,
-            fills,
-            lines,
-            paths,
-        } = self.shape;
-        let paths = paths
-            .into_iter()
-            .map(|path| match path {
-                OwnedPath::Fill {
-                    style,
-                    commands,
-                    winding_rule,
-                } => DrawPath::Fill {
-                    style: &fills[style],
-                    commands,
-                    winding_rule,
-                },
-                OwnedPath::Stroke {
-                    style,
-                    is_closed,
-                    commands,
-                } => DrawPath::Stroke {
-                    style: &lines[style],
-                    is_closed,
-                    commands,
-                },
-            })
-            .collect();
-        let shape = DistilledShape {
-            paths,
-            shape_bounds,
-            edge_bounds,
-            id,
-        };
-        tessellator.tessellate_shape_with_scale(shape, &BitmapSizes(&self.bitmap_sizes), self.scale)
+        match self.input {
+            JobInput::Distilled(owned) => {
+                let OwnedShape {
+                    id,
+                    shape_bounds,
+                    edge_bounds,
+                    fills,
+                    lines,
+                    paths,
+                } = owned;
+                let paths = paths
+                    .into_iter()
+                    .map(|path| match path {
+                        OwnedPath::Fill {
+                            style,
+                            commands,
+                            winding_rule,
+                        } => DrawPath::Fill {
+                            style: &fills[style],
+                            commands,
+                            winding_rule,
+                        },
+                        OwnedPath::Stroke {
+                            style,
+                            is_closed,
+                            commands,
+                        } => DrawPath::Stroke {
+                            style: &lines[style],
+                            is_closed,
+                            commands,
+                        },
+                    })
+                    .collect();
+                let shape = DistilledShape {
+                    paths,
+                    shape_bounds,
+                    edge_bounds,
+                    id,
+                };
+                tessellator.tessellate_shape_with_scale(
+                    shape,
+                    &BitmapSizes(&self.bitmap_sizes),
+                    self.scale,
+                )
+            }
+            JobInput::RawSwf {
+                swf_version,
+                shape_version,
+                data,
+            } => {
+                let mut reader = swf::read::Reader::new(&data, swf_version);
+                let swf_shape = reader
+                    .read_define_shape(shape_version)
+                    .expect("the shape was parsed from this data before");
+                let shape: DistilledShape = (&swf_shape).into();
+                tessellator.tessellate_shape_with_scale(
+                    shape,
+                    &BitmapSizes(&self.bitmap_sizes),
+                    self.scale,
+                )
+            }
+        }
     }
 }
 

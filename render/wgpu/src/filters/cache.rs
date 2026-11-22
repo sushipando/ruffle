@@ -29,8 +29,9 @@ const SMALL_MAX_PIXELS: u64 = 384 * 384;
 const LARGE_MAX_BYTES: usize = 128 * 1024 * 1024;
 /// Maximum single CAB pixel area eligible for caching (1024x1024 = 4 MB).
 const MAX_ENTRY_PIXELS: u64 = 1024 * 1024;
-/// Maximum single CAB pixel area eligible for promoting interpolated subframes (256x256).
-pub const SUBFRAME_PROMOTE_MAX_PIXELS: u64 = 256 * 256;
+/// Maximum single CAB pixel area eligible for promoting interpolated subframes (384x384,
+/// matching the isolated small/medium tier so large animations are never affected).
+pub const SUBFRAME_PROMOTE_MAX_PIXELS: u64 = SMALL_MAX_PIXELS;
 /// Maximum command count per CAB eligible for canonical key serialization.
 const MAX_COMMANDS: usize = 128;
 /// Evict cached textures unused for this many submitted frames (~12-25 s).
@@ -63,8 +64,33 @@ impl CabContentKey {
         filters: &[Filter],
         commands: &CommandList,
     ) -> Option<Self> {
+        if filters.is_empty() {
+            return None;
+        }
+        Self::try_from_entry_inner(used_size, clear, quality, filters, commands)
+    }
+
+    /// Same as `try_from_entry`, but also permits unfiltered (`filters.is_empty()`) entries
+    /// for zero-VRAM same-handle skip checks on `Persistent` CABs.
+    pub fn try_from_any_entry(
+        used_size: (u32, u32),
+        clear: Color,
+        quality: StageQuality,
+        filters: &[Filter],
+        commands: &CommandList,
+    ) -> Option<Self> {
+        Self::try_from_entry_inner(used_size, clear, quality, filters, commands)
+    }
+
+    fn try_from_entry_inner(
+        used_size: (u32, u32),
+        clear: Color,
+        quality: StageQuality,
+        filters: &[Filter],
+        commands: &CommandList,
+    ) -> Option<Self> {
         let pixels = u64::from(used_size.0) * u64::from(used_size.1);
-        if pixels == 0 || pixels > MAX_ENTRY_PIXELS || filters.is_empty() {
+        if pixels == 0 || pixels > MAX_ENTRY_PIXELS {
             return None;
         }
         if commands.commands.is_empty() || commands.commands.len() > MAX_COMMANDS {

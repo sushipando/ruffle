@@ -827,7 +827,14 @@ impl MainWindow {
         let severely_behind = total > 0 && skipped * 4 > total;
         let was_behind = std::mem::replace(&mut adaptation.behind, behind);
         let on_trial = adaptation.since_raise.is_some();
+        let warming_top_rate = self.every == *range.start() && load < 0.85;
+        let swamped = total > 0 && skipped * 2 > total;
         let abort_trial = match adaptation.since_raise {
+            // Raising to 1-frame-per-refresh introduces new interpolated subframe phases
+            // (e.g. 1/6, 3/6, 5/6 at 144 Hz) that need 2-3 seconds to warm up
+            // FilteredCabCache. Don't abort during the 3s warmup unless truly swamped
+            // (>50% skipped or >=90% load).
+            Some(0..=2) if warming_top_rate => swamped || load >= 0.90,
             // The first second after raising often spans the rate transition; only abort
             // immediately if severely behind (>25% skipped).
             Some(0) => severely_behind,
@@ -837,7 +844,8 @@ impl MainWindow {
             Some(_) => behind && (was_behind || severely_behind || load >= 0.75),
             None => false,
         };
-        if (behind && was_behind) || abort_trial {
+        let in_warmup = matches!(adaptation.since_raise, Some(0..=2)) && warming_top_rate;
+        if (!in_warmup && behind && was_behind) || abort_trial {
             // Less often: every one more refresh.
             let fewer = (self.every < *range.end()).then(|| self.every + 1);
             if let Some(fewer) = fewer {

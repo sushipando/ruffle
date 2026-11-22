@@ -346,6 +346,28 @@ impl<'gc> Stage<'gc> {
         *self.0.backdrop_cache.borrow_mut() = Some(cache);
     }
 
+    pub(crate) fn fast_backdrop_inter_frame_hit(
+        self,
+        clear_color: Color,
+        viewport_bounds: Rectangle<Twips>,
+        tick: u32,
+    ) -> Option<(ruffle_render::bitmap::BitmapInfo, Point<i32>, Vec<usize>)> {
+        let cache = self.0.backdrop_cache.borrow();
+        let cache = cache.as_ref()?;
+        if cache.checked_tick == tick
+            && cache.clear_color == clear_color
+            && cache.viewport_bounds == viewport_bounds
+        {
+            Some((
+                cache.bitmap.clone(),
+                cache.origin,
+                cache.nodes.iter().map(|n| n.ptr).collect(),
+            ))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn check_backdrop_cache_hit(
         self,
         clear_color: Color,
@@ -354,8 +376,8 @@ impl<'gc> Stage<'gc> {
         tick: u32,
     ) -> crate::display_object::BackdropCacheLookup {
         use crate::display_object::BackdropCacheLookup;
-        let cache = self.0.backdrop_cache.borrow();
-        let Some(cache) = cache.as_ref() else {
+        let mut cache_ref = self.0.backdrop_cache.borrow_mut();
+        let Some(cache) = cache_ref.as_mut() else {
             return BackdropCacheLookup::Miss;
         };
         if cache.clear_color != clear_color || cache.viewport_bounds != viewport_bounds {
@@ -375,6 +397,7 @@ impl<'gc> Stage<'gc> {
                     return BackdropCacheLookup::Miss;
                 }
             }
+            cache.checked_tick = tick;
             return BackdropCacheLookup::Hit {
                 bitmap: cache.bitmap.clone(),
                 origin: cache.origin,

@@ -327,14 +327,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         })
     }
 
-    fn register_shape_internal(
-        &mut self,
-        shape: DistilledShape,
-        bitmap_source: &dyn BitmapSource,
-        scale: f32,
-    ) -> ShapeHandle {
-        let pending =
-            PendingShape::new(self.descriptors.clone(), shape, bitmap_source, self, scale);
+    fn finish_or_queue_pending(&mut self, pending: PendingShape) -> ShapeHandle {
         if ruffle_render::perf_flags::enabled(
             ruffle_render::perf_flags::PerfFlag::ParallelTessellation,
         ) {
@@ -345,6 +338,17 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         let PendingShape { job, finish } = pending;
         let mesh = job.tessellate(&mut self.shape_tessellator);
         ShapeHandle(Arc::new(Mesh::ready(finish.build(mesh))))
+    }
+
+    fn register_shape_internal(
+        &mut self,
+        shape: DistilledShape,
+        bitmap_source: &dyn BitmapSource,
+        scale: f32,
+    ) -> ShapeHandle {
+        let pending =
+            PendingShape::new(self.descriptors.clone(), shape, bitmap_source, self, scale);
+        self.finish_or_queue_pending(pending)
     }
 
     /// Tessellates the shapes registered since the last frame (see `Mesh`), on several
@@ -645,6 +649,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     #[instrument(level = "debug", skip_all)]
+    fn register_raw_shape_with_scale(
+        &mut self,
+        raw: ruffle_render::backend::RawSwfShape,
+        bitmap_source: &dyn BitmapSource,
+        scale: f32,
+    ) -> ShapeHandle {
+        let pending =
+            PendingShape::from_raw(self.descriptors.clone(), raw, bitmap_source, self, scale);
+        self.finish_or_queue_pending(pending)
+    }
+
+    #[instrument(level = "debug", skip_all)]
     fn submit_frame(
         &mut self,
         clear: Color,
@@ -829,6 +845,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             let members: Vec<usize> = (0..levels.len())
                 .filter(|&index| levels[index] == level)
                 .collect();
+            let quality = self.surface.quality();
+            let mut preserved_unfiltered_key = vec![false; levels.len()];
             let atlased: Vec<_> = members
                 .iter()
                 .copied()
@@ -843,6 +861,25 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     } else {
                         (texture.texture.width(), texture.texture.height())
                     };
+                    if entry.filters.is_empty()
+                        && entry.volatility == CacheVolatility::Persistent
+                        && let Some(key) = crate::filters::CabContentKey::try_from_any_entry(
+                            (w, h),
+                            entry.clear,
+                            quality,
+                            &entry.filters,
+                            &entry.commands,
+                        )
+                    {
+                        if texture.last_cab_key.borrow().as_ref() == Some(&key) {
+                            entry.commands.commands.clear();
+                            preserved_unfiltered_key[index] = true;
+                            crate::perf_counters::count_named("cab-same/unfiltered");
+                            return None;
+                        }
+                        *texture.last_cab_key.borrow_mut() = Some(key);
+                        preserved_unfiltered_key[index] = true;
+                    }
                     Some(crate::surface::layer_atlas::LeafLayer {
                         commands: std::mem::take(&mut entry.commands),
                         origin: (0, 0),
@@ -1078,7 +1115,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     crate::perf_counters::count(crate::perf_counters::Counter::CacheEntryFiltered);
                 }
                 let texture = as_texture(&entry.handle);
-                if !in_filtered_together[index] {
+                if !in_filtered_together[index] && !preserved_unfiltered_key[index] {
                     *texture.last_cab_key.borrow_mut() = None;
                 }
                 let surface = Surface::new(

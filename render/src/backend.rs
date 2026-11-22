@@ -42,6 +42,15 @@ pub struct BitmapCacheEntry {
     pub volatility: CacheVolatility,
 }
 
+/// Raw SWF `DefineShape` tag payload for off-thread parsing and tessellation.
+pub struct RawSwfShape {
+    pub id: swf::CharacterId,
+    pub swf_version: u8,
+    pub shape_version: u8,
+    pub data: Vec<u8>,
+    pub bitmap_ids: Vec<swf::CharacterId>,
+}
+
 pub trait RenderBackend: Any {
     fn viewport_dimensions(&self) -> ViewportDimensions;
     // Do not call this method directly - use `player.set_viewport_dimensions`,
@@ -61,6 +70,19 @@ pub trait RenderBackend: Any {
     ) -> ShapeHandle {
         // Default implementation ignores scale
         self.register_shape(shape, bitmap_source)
+    }
+
+    fn register_raw_shape_with_scale(
+        &mut self,
+        raw: RawSwfShape,
+        bitmap_source: &dyn BitmapSource,
+        scale: f32,
+    ) -> ShapeHandle {
+        let mut reader = swf::read::Reader::new(&raw.data, raw.swf_version);
+        let shape = reader
+            .read_define_shape(raw.shape_version)
+            .expect("the shape was parsed from this data before");
+        self.register_shape_with_scale((&shape).into(), bitmap_source, scale)
     }
 
     fn render_offscreen(

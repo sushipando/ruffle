@@ -594,6 +594,18 @@ pub trait TInteractiveObject<'gc>:
         Avm2MousePick::Miss
     }
 
+    /// Top-down matrix-passing variant of `mouse_pick_avm2` used by `run_mouse_pick` to
+    /// propagate `parent_to_global` in a register instead of querying `global_matrix_cache`.
+    fn mouse_pick_avm2_with_matrix(
+        self,
+        context: &mut UpdateContext<'gc>,
+        point: Point<Twips>,
+        require_button_mode: bool,
+        _parent_to_global: crate::prelude::Matrix,
+    ) -> Avm2MousePick<'gc> {
+        self.mouse_pick_avm2(context, point, require_button_mode)
+    }
+
     /// The cursor to use when this object is the hovered element under a mouse.
     fn mouse_cursor(self, _context: &mut UpdateContext<'gc>) -> MouseCursor {
         MouseCursor::Hand

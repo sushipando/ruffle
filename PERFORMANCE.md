@@ -1901,6 +1901,80 @@ non-`Normal` (`Multiply`/`Overlay`/`Add`) shading layers.
   (`3.18–3.68 → 2.80–3.15 ms/cmdbuf`), and CPU render dropped **2.31–2.81 → 1.93–2.30 ms**
   (`18–21%` CPU busy). All 151 Metal `visual/` regression tests pass.
 
+### 95. `adapt_interpolation` `FilteredCabCache` warmup grace and expanded `Subframe` promotion
+
+*Files: `desktop/src/app.rs` (`adapt_interpolation`), `render/wgpu/src/filters/cache.rs`,
+`render/wgpu/src/backend.rs`.*
+
+Stepping up from 72 fps (`3×`) to 144 fps (`6×`) introduces new interpolated subframe phases
+(`1/6, 3/6, 5/6`) that need 2–3 seconds to promote into `FilteredCabCache`. Previously
+`adapt_interpolation` aborted the trial on second 0 (`Some(0) => severely_behind`), bouncing
+back to 72 fps before the new subframe phases warmed up.
+
+* Added a 3-second warmup grace window (`Some(0..=2)`) when stepping up to
+  `every == *range.start()` while `load < 0.85` (only aborting early if `>50%` skipped or
+  `load >= 0.90`).
+* Raised `SUBFRAME_PROMOTE_MAX_PIXELS` from `256×256` to `384×384` (the full isolated
+  small/medium tier) and extended `CabContentKey` same-handle skipping to unfiltered
+  `Persistent` CABs (`try_from_any_entry` / `cab-same/unfiltered`), skipping 4× MSAA
+  rasterization and copies whenever an unfiltered `cacheAsBitmap` rebuilds with identical
+  commands.
+
+### 96. Inter-frame `BackdropCache` fast path
+
+*Files: `core/src/display_object.rs` (`BackdropCache`, `render_stage_backdrop`),
+`core/src/display_object/stage.rs` (`fast_backdrop_inter_frame_hit`,
+`check_backdrop_cache_hit`).*
+
+A 10-second CPU `sample` in `icestormunder` room 2 showed `render_stage_backdrop` spending
+**85 ms** (~12% of `Player::render`) walking `collect_backdrop_prefix` →
+`check_auto_cache_node` on every interpolated subframe even though the static backdrop never
+changes mid-tick. Added `checked_tick: u32` to `BackdropCache` so interpolated subframes
+(`interpolation::is_inter_frame()`) reuse the tick's validated backdrop and skip list in
+O(1) without re-walking the display tree.
+
+### 97. Off-thread SWF shape parsing and path distillation
+
+*Files: `render/src/backend.rs` (`RawSwfShape`, `RenderBackend::register_raw_shape_with_scale`),
+`render/wgpu/src/mesh.rs` (`PendingShape::from_raw`, `JobInput::RawSwf`),
+`render/wgpu/src/backend.rs`, `core/src/display_object/graphic.rs`.*
+
+Parallel tessellation (47) previously ran `read_define_shape`, `DistilledShape::from`, and
+`OwnedShape` path cloning synchronously on the main thread before handing work to the
+worker pool. `GraphicShared` now records deduplicated `bitmap_ids` once at tag load time,
+and unparsed shapes pass their raw SWF tag bytes via `register_raw_shape_with_scale` so
+worker threads run SWF shape decoding, path distillation, and Lyon tessellation in parallel
+across all cores. In heavy 7-player `icestormunder` combat, a 320-shape burst dropped from
+~25.8 ms to **16.1 ms** with `render max 5.58 ms` and no frame stall.
+
+### 98. Top-down matrix-passing AVM2 mouse picking (`mouse_pick_avm2_with_matrix`)
+
+*Files: `core/src/display_object.rs` (`DisplayObjectBase::raw_matrix`),
+`core/src/display_object/interactive.rs`, `core/src/display_object/movie_clip.rs`,
+`core/src/display_object/loader_display.rs`, `core/src/display_object/graphic.rs`
+(`hit_test_shape_with_matrix`), `core/src/display_object/container.rs`,
+`core/src/player.rs` (`run_mouse_pick`).*
+
+A 10-second CPU `sample` in heavy 7-player `icestormunder` combat revealed `run_mouse_pick`
+consuming **552 ms** (**36% of all `Player::tick`**, `310 ms` in `run_frame` + `242 ms` in
+`tick-other`), of which 99.5% was `global_matrix_cache` `HashMap`/TLS overhead,
+`InterpolationData::blended` TLS lookups outside rendering, unconditional matrix inversion
+per `MovieClip`, and 3× `RenderIter` scans — while actual `shape_hit_test` was only 3 ms.
+
+* Propagated `parent_to_global: Matrix` top-down through `MovieClip` and `LoaderDisplay`
+  using `raw_matrix()`, checking singular matrices via determinant in 2 flops and deferring
+  `inverse()` to clips with `drawing`.
+* Added `Graphic::hit_test_shape_with_matrix` to cull off-cursor shapes directly against
+  `child_to_global * self_bounds` with zero hash lookups or matrix inversions, borrowed
+  `raw_container()` once per clip (skipping the non-interactive pass when none exist), and
+  early-returned on the first child hit/propagate when `!mouse_children`.
+* Live Artix heavy 7-player `icestormunder` room 2 (42 nested gotos/s): `frame avg / max`
+  dropped **5.04–8.48 / 10.6–17.0 ms → 1.50–3.13 / 2.35–7.88 ms** (~2.5× faster),
+  `tick-other avg / max` dropped **1.14–2.50 / 4.26–9.58 ms → 0.20–0.76 / 2.13–4.16 ms**
+  (~3–5× faster), CPU `render avg` at 115–120 fps dropped **3.43–4.55 → 1.98–2.35 ms**
+  (`busy` **56–71% → 28–37%**). All 177 unit tests, 151 Metal `visual/` tests, and 46
+  `mouse_pick`/`mouse_events` regression tests pass.
+
 ## Memory: long sessions
 
 Replacing most of the content over and over used to make the movie slower and slower:

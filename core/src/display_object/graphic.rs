@@ -104,11 +104,30 @@ impl<'gc> Graphic<'gc> {
         source: Option<Range<usize>>,
     ) -> Self {
         let mut styles = swf_shape.styles.fill_styles.len() + swf_shape.styles.line_styles.len();
+        let mut bitmap_ids: Vec<CharacterId> = Vec::new();
+        let mut collect_bitmaps = |shape_styles: &swf::ShapeStyles| {
+            for fs in &shape_styles.fill_styles {
+                if let swf::FillStyle::Bitmap { id, .. } = fs
+                    && !bitmap_ids.contains(id)
+                {
+                    bitmap_ids.push(*id);
+                }
+            }
+            for ls in &shape_styles.line_styles {
+                if let swf::FillStyle::Bitmap { id, .. } = ls.fill_style()
+                    && !bitmap_ids.contains(id)
+                {
+                    bitmap_ids.push(*id);
+                }
+            }
+        };
+        collect_bitmaps(&swf_shape.styles);
         for rec in &swf_shape.shape {
             if let swf::ShapeRecord::StyleChange(ch) = rec
                 && let Some(ns) = &ch.new_styles
             {
                 styles += ns.fill_styles.len() + ns.line_styles.len();
+                collect_bitmaps(ns);
             }
         }
         let draw_cost = if swf_shape.shape.is_empty() {
@@ -122,6 +141,7 @@ impl<'gc> Graphic<'gc> {
             edge_bounds: swf_shape.edge_bounds,
             is_empty: swf_shape.shape.is_empty(),
             draw_cost,
+            bitmap_ids: bitmap_ids.into_boxed_slice(),
             shape: ShapeRecords::new(swf_shape, source),
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
@@ -151,6 +171,7 @@ impl<'gc> Graphic<'gc> {
             edge_bounds: Default::default(),
             is_empty: true,
             draw_cost: 0,
+            bitmap_ids: Box::new([]),
             shape: ShapeRecords::new(
                 swf::Shape {
                     version: 32,
@@ -189,6 +210,37 @@ impl<'gc> Graphic<'gc> {
 
     pub fn drawing_mut(&self) -> RefMut<'_, Drawing> {
         self.0.drawing.get_or_init(Default::default).borrow_mut()
+    }
+
+    /// Fast hit test using a precomputed `child_to_global` matrix from a top-down mouse pick,
+    /// avoiding `global_matrix_cache` hash lookups and matrix inversion for off-cursor shapes.
+    pub(crate) fn hit_test_shape_with_matrix(
+        self,
+        point: Point<Twips>,
+        options: HitTestOptions,
+        child_to_global: Matrix,
+    ) -> bool {
+        if options.contains(HitTestOptions::SKIP_INVISIBLE) && !self.visible() {
+            return false;
+        }
+        let bounds = child_to_global * self.self_bounds(BoundsMode::Engine);
+        if !bounds.contains(point) {
+            return false;
+        }
+        let Some(local_matrix) = child_to_global.inverse() else {
+            return false;
+        };
+        let point = local_matrix * point;
+        if let Some(drawing) = self.0.drawing.get() {
+            if drawing.borrow().hit_test(point, &local_matrix) {
+                return true;
+            }
+        } else {
+            let shared = self.0.shared.get();
+            let shape = shared.shape.get(shared.movie);
+            return ruffle_render::shape_utils::shape_hit_test(&shape, point, &local_matrix);
+        }
+        false
     }
 
     /// Estimated vector draw cost for `AutoCache` heuristics (accounts for multi-style
@@ -236,15 +288,31 @@ impl<'gc> Graphic<'gc> {
             .library
             .library_for_movie(shared.movie)
             .expect("Graphic's movie has a library");
-        let shape = shared.shape.get(shared.movie);
-        let new_handle = context.renderer.register_shape_with_scale(
-            (&*shape).into(),
-            &MovieLibrarySource { library },
-            current_scale,
-        );
-        // Not needed until the next tessellation (or hit test).
-        drop(shape);
-        shared.shape.release();
+        let new_handle = if let Some((range, shape_version)) = shared.shape.raw_source_if_unparsed()
+        {
+            context.renderer.register_raw_shape_with_scale(
+                ruffle_render::backend::RawSwfShape {
+                    id: shared.id,
+                    swf_version: shared.movie.version(),
+                    shape_version,
+                    data: shared.movie.data()[range].to_vec(),
+                    bitmap_ids: shared.bitmap_ids.to_vec(),
+                },
+                &MovieLibrarySource { library },
+                current_scale,
+            )
+        } else {
+            let shape = shared.shape.get(shared.movie);
+            let handle = context.renderer.register_shape_with_scale(
+                (&*shape).into(),
+                &MovieLibrarySource { library },
+                current_scale,
+            );
+            // Not needed until the next tessellation (or hit test).
+            drop(shape);
+            shared.shape.release();
+            handle
+        };
         if let Some(start) = start {
             crate::perf_stats::record_tessellation(start.elapsed());
         }
@@ -476,6 +544,10 @@ struct GraphicShared<'gc> {
     /// Approximate draw complexity derived from style and record counts.
     draw_cost: u16,
 
+    /// Deduplicated bitmap character IDs referenced by fill/line styles (for off-thread parsing).
+    #[collect(require_static)]
+    bitmap_ids: Box<[CharacterId]>,
+
     #[collect(require_static)]
     shape_bounds: Rectangle<Twips>,
 
@@ -530,6 +602,16 @@ impl ShapeRecords {
         Self {
             parsed: RefCell::new(Some(Rc::new(shape))),
             source: source.map(|range| (range, version)),
+        }
+    }
+
+    /// Returns the raw SWF tag slice and DefineShape version when the shape is currently
+    /// released, allowing the renderer to parse and distill it on worker threads.
+    fn raw_source_if_unparsed(&self) -> Option<(Range<usize>, u8)> {
+        if self.parsed.borrow().is_none() {
+            self.source.clone()
+        } else {
+            None
         }
     }
 

@@ -702,6 +702,13 @@ impl<'gc> DisplayObjectBase<'gc> {
             .matrix(self.matrix.get(), self.color_transform.get())
     }
 
+    /// The unblended matrix (zero TLS overhead when called outside interpolated rendering,
+    /// such as during `run_mouse_pick`).
+    #[inline(always)]
+    pub(crate) fn raw_matrix(&self) -> Matrix {
+        self.matrix.get()
+    }
+
     /// Records the transform from before this frame changes it (see `interpolation`).
     fn before_transform_change(&self) {
         self.interpolation
@@ -2282,6 +2289,7 @@ pub(crate) struct BackdropCache {
     pub(crate) clear_color: Color,
     pub(crate) nodes: Vec<BackdropNodeKey>,
     pub(crate) built_tick: u32,
+    pub(crate) checked_tick: u32,
     pub(crate) bytes: usize,
 }
 
@@ -2295,6 +2303,7 @@ impl Clone for BackdropCache {
             clear_color: self.clear_color,
             nodes: self.nodes.clone(),
             built_tick: self.built_tick,
+            checked_tick: self.checked_tick,
             bytes: self.bytes,
         }
     }
@@ -2511,6 +2520,34 @@ pub(crate) fn render_stage_backdrop<'gc>(
     }
 
     let tick = interpolation::tick();
+    let viewport_bounds = stage.viewport_view_bounds();
+    // On interpolated subframes, nothing in the static backdrop changed since this movie
+    // tick was validated; reuse the cached backdrop directly without re-walking the tree.
+    if interpolation::is_inter_frame() {
+        if let Some((bitmap, origin, ptrs)) =
+            stage.fast_backdrop_inter_frame_hit(bg, viewport_bounds, tick)
+        {
+            let region = bitmap.full_region();
+            context.commands.render_bitmap(
+                bitmap.handle,
+                Transform {
+                    matrix: Matrix::translate(
+                        Twips::from_pixels_i32(origin.x),
+                        Twips::from_pixels_i32(origin.y),
+                    ),
+                    color_transform: Default::default(),
+                    perspective_projection: None,
+                    tz: 0.0,
+                },
+                false,
+                PixelSnapping::Always,
+                region,
+            );
+            stage.set_backdrop_skip(ptrs);
+        }
+        return;
+    }
+
     let mut prefix = Vec::new();
     let mut total_cost = 0usize;
     collect_backdrop_prefix(
@@ -2527,7 +2564,6 @@ pub(crate) fn render_stage_backdrop<'gc>(
         return;
     }
 
-    let viewport_bounds = stage.viewport_view_bounds();
     let vp_x0 = viewport_bounds.x_min.to_pixels().floor() as i32;
     let vp_y0 = viewport_bounds.y_min.to_pixels().floor() as i32;
     let vp_x1 = viewport_bounds.x_max.to_pixels().ceil() as i32;
@@ -2655,6 +2691,7 @@ pub(crate) fn render_stage_backdrop<'gc>(
         clear_color: bg,
         nodes: keys,
         built_tick: tick,
+        checked_tick: tick,
         bytes,
     });
     stage.set_backdrop_skip(skip_ptrs);
