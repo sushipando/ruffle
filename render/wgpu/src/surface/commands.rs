@@ -1344,6 +1344,7 @@ fn command_screen_aabb(command: &Command) -> Option<[f32; 4]> {
             let h = region.height() as f32;
             ((0.0, 0.0, w, h), &transform.matrix)
         }
+        Command::DrawRect { matrix, .. } => ((0.0, 0.0, 1.0, 1.0), matrix),
         _ => return None,
     };
     let (x0, y0, x1, y1) = local;
@@ -1369,18 +1370,41 @@ fn command_screen_aabb(command: &Command) -> Option<[f32; 4]> {
     Some([min_x - 1.0, min_y - 1.0, max_x + 1.0, max_y + 1.0])
 }
 
-fn unwrap_passthrough_blend_ref(mut cmds: &[Command]) -> &[Command] {
-    while let [Command::Blend(inner, mode) | Command::BlendBounded(inner, mode, _)] = cmds {
-        if matches!(
-            mode,
-            RenderBlendMode::Builtin(BlendMode::Normal | BlendMode::Layer)
-        ) {
-            cmds = inner.commands.as_slice();
-        } else {
-            break;
+const MAX_DIRECT_BLEND_LEAVES: usize = 32;
+
+/// Recursively collects leaf commands through passthrough `Normal`/`Layer` wrappers up to
+/// `MAX_DIRECT_BLEND_LEAVES`. Returns `Err(reason)` if a non-passthrough or over-limit
+/// subtree is encountered.
+fn collect_direct_blend_leaves<'a>(
+    cmds: &'a [Command],
+    depth: u8,
+    out: &mut smallvec::SmallVec<[&'a Command; MAX_DIRECT_BLEND_LEAVES]>,
+) -> Result<(), &'static str> {
+    if depth > 4 {
+        return Err("depth");
+    }
+    for cmd in cmds {
+        match cmd {
+            Command::Blend(inner, mode) | Command::BlendBounded(inner, mode, _)
+                if matches!(
+                    mode,
+                    RenderBlendMode::Builtin(BlendMode::Normal | BlendMode::Layer)
+                ) =>
+            {
+                collect_direct_blend_leaves(inner.commands.as_slice(), depth + 1, out)?;
+            }
+            Command::RenderShape { .. }
+            | Command::RenderBitmap { .. }
+            | Command::DrawRect { .. } => {
+                if out.len() >= MAX_DIRECT_BLEND_LEAVES {
+                    return Err("count");
+                }
+                out.push(cmd);
+            }
+            _ => return Err("cmd"),
         }
     }
-    cmds
+    Ok(())
 }
 
 fn unwrap_passthrough_blend_owned(mut commands: CommandList) -> CommandList {
@@ -1414,19 +1438,28 @@ pub(crate) fn direct_blend_mode_for(
     if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::DirectBlends) {
         return None;
     }
-    let single_fill = match unwrap_passthrough_blend_ref(commands.commands.as_slice()) {
-        [command] => match command {
+    let mut leaves: smallvec::SmallVec<[&Command; MAX_DIRECT_BLEND_LEAVES]> =
+        smallvec::SmallVec::new();
+    let collect_res = collect_direct_blend_leaves(commands.commands.as_slice(), 0, &mut leaves);
+    let reject_reason = match collect_res {
+        Err(reason) => Some(reason),
+        Ok(()) if leaves.is_empty() => Some("empty"),
+        Ok(()) if leaves.len() == 1 => match leaves[0] {
             Command::RenderShape { shape, .. } => {
                 let mesh = as_mesh(shape);
-                mesh.non_overlapping || (mesh.draws.len() == 1 && mesh.draws[0].single_fill)
+                if mesh.non_overlapping || (mesh.draws.len() == 1 && mesh.draws[0].single_fill) {
+                    None
+                } else {
+                    Some("mesh")
+                }
             }
-            Command::RenderBitmap { .. } => true,
-            _ => false,
+            Command::RenderBitmap { .. } | Command::DrawRect { .. } => None,
+            _ => Some("cmd"),
         },
-        cmds if cmds.len() >= 2 && cmds.len() <= 16 => {
-            let mut aabbs = [[0.0f32; 4]; 16];
-            let mut ok = true;
-            for (i, cmd) in cmds.iter().enumerate() {
+        Ok(()) => {
+            let mut aabbs = [[0.0f32; 4]; MAX_DIRECT_BLEND_LEAVES];
+            let mut reason = None;
+            for (i, cmd) in leaves.iter().enumerate() {
                 if let Some(aabb) = command_screen_aabb(cmd) {
                     for prev in &aabbs[..i] {
                         if aabb[0] < prev[2]
@@ -1434,24 +1467,28 @@ pub(crate) fn direct_blend_mode_for(
                             && aabb[1] < prev[3]
                             && prev[1] < aabb[3]
                         {
-                            ok = false;
+                            reason = Some("overlap");
                             break;
                         }
                     }
-                    if !ok {
+                    if reason.is_some() {
                         break;
                     }
                     aabbs[i] = aabb;
                 } else {
-                    ok = false;
+                    reason = Some("mesh");
                     break;
                 }
             }
-            ok
+            reason
         }
-        _ => false,
     };
-    if !single_fill {
+    if let Some(reason) = reject_reason {
+        if crate::perf_counters::enabled()
+            && matches!(blend_mode, RenderBlendMode::Builtin(BlendMode::Add))
+        {
+            crate::perf_counters::count_named(format!("add-nodirect/{reason}"));
+        }
         return None;
     }
     match BlendType::from(blend_mode.clone()) {
@@ -1513,6 +1550,17 @@ impl WgpuCommandHandler<'_, '_> {
             RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)
         ) && matches!(self.nearest_layer, LayerRef::None)
         {
+            return;
+        }
+        // Inside a verified non-overlapping direct blend, passthrough `Normal`/`Layer`
+        // wrappers execute their children directly under the active `direct_blend` mode.
+        if self.direct_blend.is_some()
+            && matches!(
+                blend_mode,
+                RenderBlendMode::Builtin(BlendMode::Normal | BlendMode::Layer)
+            )
+        {
+            commands.execute(self);
             return;
         }
         if let Some(mode) = self.direct_blend_mode(&commands, &blend_mode) {

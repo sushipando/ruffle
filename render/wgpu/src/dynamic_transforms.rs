@@ -12,15 +12,14 @@ const VERTICES_ARENA_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Holds the per-object data (transforms and dynamic vertices) of draw chunks.
 ///
-/// Every chunk gets its own region of an arena buffer, and all regions written
-/// since the last submission are uploaded at once by `flush` (with a single
-/// `Queue::write_buffer`, which is ordered after previously submitted work, so
-/// the arena can be reused every frame). Previously, every chunk was copied into
-/// the same small buffer right before its render pass, which costs a copy (and
-/// on Metal, a command buffer) per chunk.
+/// Every chunk gets its own non-overlapping region of an arena buffer and is copied into
+/// the active frame's `CommandEncoder` via `StagingBelt` right before its render pass.
+/// That keeps all uploads inside the frame's single Metal command buffer (avoiding a
+/// separate `Queue::write_buffer` pending-writes command buffer every frame) while still
+/// allowing multiple chunks to execute in one merged render pass.
 ///
 /// If an arena fills up, chunks fall back to being copied into a reserved region
-/// at the end of the arena right before their pass, like before.
+/// at the end of the arena right before their pass.
 pub struct DynamicTransforms {
     pub buffer: wgpu::Buffer,
     pub vertex_buffer: wgpu::Buffer,
@@ -31,13 +30,13 @@ pub struct DynamicTransforms {
     /// The maximum size of a chunk's vertices.
     pub chunk_vertices_size: u64,
     uniform_alignment: u64,
-    pending: Mutex<Pending>,
+    cursors: Mutex<Cursors>,
 }
 
 #[derive(Default)]
-struct Pending {
-    transforms: Vec<u8>,
-    vertices: Vec<u8>,
+struct Cursors {
+    transforms: u64,
+    vertices: u64,
 }
 
 /// Where a chunk's data is, for binding it.
@@ -106,7 +105,7 @@ impl DynamicTransforms {
             binding_size,
             chunk_vertices_size,
             uniform_alignment,
-            pending: Default::default(),
+            cursors: Default::default(),
         }
     }
 
@@ -122,7 +121,8 @@ impl DynamicTransforms {
         }
     }
 
-    /// Stores a chunk's data, returning where it can be bound from.
+    /// Stores a chunk's data into the arena via `staging_belt` in `encoder`, returning
+    /// where it can be bound from.
     pub fn upload(
         &self,
         transforms: BufferBuilder,
@@ -131,58 +131,36 @@ impl DynamicTransforms {
         encoder: &mut wgpu::CommandEncoder,
     ) -> ChunkOffsets {
         let fallback = self.fallback_offsets();
-        let mut pending = self.pending.lock().expect("pending lock");
-        let transforms_offset = align(pending.transforms.len() as u64, self.uniform_alignment);
-        let vertices_offset = align(pending.vertices.len() as u64, 256);
-        let transforms_end = transforms_offset + transforms.bytes().len() as u64;
-        let vertices_end = vertices_offset + vertices.bytes().len() as u64;
+        let (transforms_offset, vertices_offset, is_fallback) = {
+            let mut cursors = self.cursors.lock().expect("cursors lock");
+            let transforms_offset = align(cursors.transforms, self.uniform_alignment);
+            let vertices_offset = align(cursors.vertices, 256);
+            let transforms_end = transforms_offset + transforms.bytes().len() as u64;
+            let vertices_end = vertices_offset + vertices.bytes().len() as u64;
 
-        if transforms_end <= fallback.transforms as u64 && vertices_end <= fallback.vertices {
-            pending.transforms.resize(transforms_offset as usize, 0);
-            pending.transforms.extend_from_slice(transforms.bytes());
-            pending.vertices.resize(vertices_offset as usize, 0);
-            pending.vertices.extend_from_slice(vertices.bytes());
-            return ChunkOffsets {
-                transforms: transforms_offset as u32,
-                vertices: vertices_offset,
-                fallback: false,
-            };
+            if transforms_end <= fallback.transforms as u64 && vertices_end <= fallback.vertices {
+                cursors.transforms = transforms_end;
+                cursors.vertices = vertices_end;
+                (transforms_offset, vertices_offset, false)
+            } else {
+                (fallback.transforms as u64, fallback.vertices, true)
+            }
+        };
+
+        transforms.copy_to(staging_belt, encoder, &self.buffer, transforms_offset);
+        vertices.copy_to(staging_belt, encoder, &self.vertex_buffer, vertices_offset);
+        ChunkOffsets {
+            transforms: transforms_offset as u32,
+            vertices: vertices_offset,
+            fallback: is_fallback,
         }
-
-        // The arenas are full; copy into the reserved regions right before this chunk.
-        drop(pending);
-        transforms.copy_to(
-            staging_belt,
-            encoder,
-            &self.buffer,
-            fallback.transforms as u64,
-        );
-        vertices.copy_to(
-            staging_belt,
-            encoder,
-            &self.vertex_buffer,
-            fallback.vertices,
-        );
-        fallback
     }
 
-    /// Uploads all chunk data stored since the last flush.
-    /// Must be called before submitting any commands that draw those chunks.
-    pub fn flush(&self, queue: &wgpu::Queue) {
-        let mut guard = self.pending.lock().expect("pending lock");
-        let pending = &mut *guard;
-        for (data, buffer) in [
-            (&mut pending.transforms, &self.buffer),
-            (&mut pending.vertices, &self.vertex_buffer),
-        ] {
-            if !data.is_empty() {
-                data.resize(
-                    align(data.len() as u64, wgpu::COPY_BUFFER_ALIGNMENT) as usize,
-                    0,
-                );
-                queue.write_buffer(buffer, 0, data);
-                data.clear();
-            }
-        }
+    /// Resets the arena cursors at frame submission boundaries so the next frame reuses the
+    /// arenas from offset 0 (all copies were already encoded into the frame's `CommandEncoder`).
+    pub fn flush(&self) {
+        let mut cursors = self.cursors.lock().expect("cursors lock");
+        cursors.transforms = 0;
+        cursors.vertices = 0;
     }
 }

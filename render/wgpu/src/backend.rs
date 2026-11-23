@@ -854,6 +854,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             let mut preserved_unfiltered_key = vec![false; levels.len()];
             let filter_atlas_key_ref =
                 (!self.filter_atlas.slots.is_empty()).then_some(&self.filter_atlas);
+            let mut pending_unfiltered_promotions: Vec<(
+                crate::filters::CabContentKey,
+                wgpu::Texture,
+                crate::filters::CacheAllocation,
+                (u32, u32),
+            )> = Vec::new();
             let atlased: Vec<_> = members
                 .iter()
                 .copied()
@@ -885,6 +891,45 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             crate::perf_counters::count_named("cab-same/unfiltered");
                             return None;
                         }
+                        if let Some(cached) = self.cab_cache.get(&key) {
+                            entry.commands.commands.clear();
+                            self.active_frame.command_encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &cached.texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d {
+                                        x: cached.src_origin.0,
+                                        y: cached.src_origin.1,
+                                        z: 0,
+                                    },
+                                    aspect: Default::default(),
+                                },
+                                texture.texture.as_image_copy(),
+                                wgpu::Extent3d {
+                                    width: w,
+                                    height: h,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            texture.bump_generation_keeping_key();
+                            *texture.last_cab_key.borrow_mut() = Some(key);
+                            preserved_unfiltered_key[index] = true;
+                            crate::perf_counters::count_named("cab-lru/unfiltered-hit");
+                            return None;
+                        }
+                        if self.cab_cache.should_promote(&key, (w, h), false) {
+                            let alloc = self.cab_cache.allocate_entry(
+                                &self.descriptors,
+                                &mut self.active_frame.command_encoder,
+                                (w, h),
+                            );
+                            pending_unfiltered_promotions.push((
+                                key.clone(),
+                                texture.texture.clone(),
+                                alloc,
+                                (w, h),
+                            ));
+                        }
                         *texture.last_cab_key.borrow_mut() = Some(key);
                         preserved_unfiltered_key[index] = true;
                     }
@@ -915,6 +960,28 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     self.surface.quality(),
                     filter_atlas_ref,
                 ));
+                for (key, src_tex, alloc, (w, h)) in pending_unfiltered_promotions {
+                    self.active_frame.command_encoder.copy_texture_to_texture(
+                        src_tex.as_image_copy(),
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &alloc.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: alloc.dst_origin.0,
+                                y: alloc.dst_origin.1,
+                                z: 0,
+                            },
+                            aspect: Default::default(),
+                        },
+                        wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    self.cab_cache.insert_entry(key, alloc, false);
+                    crate::perf_counters::count_named("cab-lru/unfiltered-promote");
+                }
             }
             let mut filter_groups: Vec<(Vec<Filter>, Vec<usize>)> = vec![];
             // Entries whose filters are applied together, whatever they are.
@@ -2388,7 +2455,7 @@ impl ActiveFrame {
             command_encoder: descriptors
                 .device
                 .create_command_encoder(&Default::default()),
-            staging_belt: wgpu::util::StagingBelt::new(descriptors.device.clone(), 65536),
+            staging_belt: wgpu::util::StagingBelt::new(descriptors.device.clone(), 262144),
             dynamic_transforms: DynamicTransforms::new(descriptors),
             draws_since_flush: 0,
             submitter: None,
@@ -2446,7 +2513,7 @@ impl ActiveFrame {
         self.draws_since_flush = 0;
         apply_wgpu_core_switches();
         self.staging_belt.finish();
-        self.dynamic_transforms.flush(&descriptors.queue);
+        self.dynamic_transforms.flush();
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder,
             descriptors
@@ -2496,7 +2563,7 @@ impl ActiveFrame {
         apply_wgpu_core_switches();
         self.draws_since_flush = 0;
         self.staging_belt.finish();
-        self.dynamic_transforms.flush(&descriptors.queue);
+        self.dynamic_transforms.flush();
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder,
             descriptors
@@ -2507,7 +2574,7 @@ impl ActiveFrame {
         let next_belt = self
             .spare_belt
             .take()
-            .unwrap_or_else(|| wgpu::util::StagingBelt::new(descriptors.device.clone(), 65536));
+            .unwrap_or_else(|| wgpu::util::StagingBelt::new(descriptors.device.clone(), 262144));
         self.in_flight_belt = Some(std::mem::replace(&mut self.staging_belt, next_belt));
         let submitter = self.submitter.get_or_insert_with(AsyncSubmitter::new);
         submitter
@@ -2527,7 +2594,7 @@ impl ActiveFrame {
         apply_wgpu_core_switches();
         self.draws_since_flush = 0;
         self.staging_belt.finish();
-        self.dynamic_transforms.flush(&descriptors.queue);
+        self.dynamic_transforms.flush();
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder,
             descriptors

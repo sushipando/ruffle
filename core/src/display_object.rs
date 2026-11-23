@@ -503,6 +503,40 @@ struct AutoCache {
     bytes: usize,
 }
 
+impl AutoCache {
+    /// Returns the relative 2×2 transform mapping this cached bitmap's linear basis to `cur`
+    /// for smooth interpolated sub-frame reuse (bounded to small scale/rotation deltas).
+    fn inter_frame_delta(&self, cur: &Matrix) -> Option<Matrix> {
+        let det = self.matrix.a * self.matrix.d - self.matrix.b * self.matrix.c;
+        if det.abs() < 1e-6 {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        let ia = self.matrix.d * inv_det;
+        let ib = -self.matrix.b * inv_det;
+        let ic = -self.matrix.c * inv_det;
+        let id = self.matrix.a * inv_det;
+        let da = cur.a * ia + cur.c * ib;
+        let db = cur.b * ia + cur.d * ib;
+        let dc = cur.a * ic + cur.c * id;
+        let dd = cur.b * ic + cur.d * id;
+        let delta_det = da * dd - db * dc;
+        let sx = da.hypot(db);
+        let sy = dc.hypot(dd);
+        if delta_det <= 0.0 || !(0.75..=1.35).contains(&sx) || !(0.75..=1.35).contains(&sy) {
+            return None;
+        }
+        Some(Matrix {
+            a: da,
+            b: db,
+            c: dc,
+            d: dd,
+            tx: Twips::ZERO,
+            ty: Twips::ZERO,
+        })
+    }
+}
+
 impl Drop for AutoCache {
     fn drop(&mut self) {
         AUTO_CACHE_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
@@ -1366,7 +1400,7 @@ struct AutoCacheDraw {
     base_matrix: Matrix,
     color_transform: ColorTransform,
     origin: Point<i32>,
-    draw_pos: Point<Twips>,
+    draw_matrix: Matrix,
     subpixel_shifted: bool,
     clear: Color,
 }
@@ -1620,12 +1654,11 @@ fn try_auto_cache<'gc>(
             let exact_tx = dx == Twips::ZERO && dy == Twips::ZERO;
             let matrix_ok =
                 linear_same && (exact_tx || (!auto.clipped && auto.backdrop_clear.is_none()));
-            let valid = matrix_ok
-                && auto.color_transform == base_transform.color_transform
+            let base_valid = auto.color_transform == base_transform.color_transform
                 && auto.viewport_bounds == viewport_bounds
                 && (auto.backdrop_clear.is_none()
                     || (is_backdrop && auto.backdrop_clear == stage_bg));
-            if valid {
+            if base_valid && matrix_ok {
                 let draw_pos = Point::new(
                     Twips::from_pixels_i32(auto.origin.x) + dx,
                     Twips::from_pixels_i32(auto.origin.y) + dy,
@@ -1637,9 +1670,33 @@ fn try_auto_cache<'gc>(
                     base_matrix: base_transform.matrix,
                     color_transform: base_transform.color_transform,
                     origin: auto.origin,
-                    draw_pos,
+                    draw_matrix: Matrix::translate(draw_pos.x, draw_pos.y),
                     subpixel_shifted,
                     clear: auto.backdrop_clear.unwrap_or(Color::TRANSPARENT),
+                });
+            }
+            if base_valid
+                && !linear_same
+                && !auto.clipped
+                && auto.backdrop_clear.is_none()
+                && interpolation::is_inter_frame()
+                && let Some(delta) = auto.inter_frame_delta(&base_transform.matrix)
+            {
+                let offset_x = Twips::from_pixels_i32(auto.origin.x) - auto.matrix.tx;
+                let offset_y = Twips::from_pixels_i32(auto.origin.y) - auto.matrix.ty;
+                let draw_matrix =
+                    Matrix::translate(base_transform.matrix.tx, base_transform.matrix.ty)
+                        * delta
+                        * Matrix::translate(offset_x, offset_y);
+                return Some(AutoCacheDraw {
+                    bitmap: auto.bitmap.clone(),
+                    dirty: false,
+                    base_matrix: base_transform.matrix,
+                    color_transform: base_transform.color_transform,
+                    origin: auto.origin,
+                    draw_matrix,
+                    subpixel_shifted: true,
+                    clear: Color::TRANSPARENT,
                 });
             }
             // Linear matrix, color, viewport, or backdrop changed: evict and wait for stability again.
@@ -1809,7 +1866,7 @@ fn try_auto_cache<'gc>(
         base_matrix: base_transform.matrix,
         color_transform: base_transform.color_transform,
         origin,
-        draw_pos: Point::new(Twips::from_pixels_i32(x0), Twips::from_pixels_i32(y0)),
+        draw_matrix: Matrix::translate(Twips::from_pixels_i32(x0), Twips::from_pixels_i32(y0)),
         subpixel_shifted: false,
         clear: backdrop_clear.unwrap_or(Color::TRANSPARENT),
     })
@@ -3188,7 +3245,7 @@ pub fn render_base<'gc>(
                 context.commands.render_bitmap(
                     auto_draw.bitmap.handle,
                     Transform {
-                        matrix: Matrix::translate(auto_draw.draw_pos.x, auto_draw.draw_pos.y),
+                        matrix: auto_draw.draw_matrix,
                         color_transform: Default::default(),
                         perspective_projection: None,
                         tz: 0.0,

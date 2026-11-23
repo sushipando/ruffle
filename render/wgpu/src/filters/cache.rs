@@ -30,7 +30,7 @@ const SMALL_MAX_BYTES: usize = 384 * 1024 * 1024;
 /// Pixel area threshold separating the small/medium tier from the large tier (384x384).
 const SMALL_MAX_PIXELS: u64 = 384 * 384;
 /// Maximum VRAM retained by the large keyframe tier (384x384 < pixels <= 1024x1024).
-const LARGE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const LARGE_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// Dedicated VRAM tier for interpolated subframe CABs (<= 384x384 px), sized so heavy
 /// 19-20 player rooms with 75+ glowing CABs can keep all 5 interpolated subframe phases
 /// warm at 144 fps without overflowing.
@@ -902,8 +902,8 @@ impl CabTier {
     }
 
     #[inline]
-    fn is_under_half(&self) -> bool {
-        self.total_bytes * 2 < self.max_bytes
+    fn is_under_fast_fill(&self) -> bool {
+        self.total_bytes * 4 < self.max_bytes * 3
     }
 
     fn can_promote(&self, bytes: usize, frame: u64) -> bool {
@@ -1057,17 +1057,17 @@ impl FilteredCabCache {
         }
     }
 
-    fn tier_under_half(&self, used_size: (u32, u32), is_subframe: bool) -> bool {
+    fn tier_under_fast_fill(&self, used_size: (u32, u32), is_subframe: bool) -> bool {
         if is_subframe {
-            Self::is_small(used_size) && self.subframe.is_under_half()
+            Self::is_small(used_size) && self.subframe.is_under_fast_fill()
         } else if Self::is_small(used_size) {
-            self.small.is_under_half()
+            self.small.is_under_fast_fill()
         } else {
-            self.large.is_under_half()
+            self.large.is_under_fast_fill()
         }
     }
 
-    /// Adaptive admission filter: promotes on first sight while the target tier is <50% full
+    /// Adaptive admission filter: promotes on first sight while the target tier is <75% full
     /// (cutting 144 fps warmup time in half), and tightens to 2-hit admission once busy so
     /// one-off particles never displace looping animations.
     pub fn should_promote(
@@ -1081,7 +1081,7 @@ impl FilteredCabCache {
         if !already_seen {
             self.seen.put(h, ());
         }
-        if already_seen || self.tier_under_half(used_size, is_subframe) {
+        if already_seen || self.tier_under_fast_fill(used_size, is_subframe) {
             let ok = self.can_promote(used_size, is_subframe);
             if !ok {
                 let counter = if is_subframe {
@@ -1270,12 +1270,12 @@ impl BlendLayerCache {
         if !already_seen {
             self.seen.put(h, ());
         }
-        let under_half = if Self::is_small(used_size) {
-            self.small.is_under_half()
+        let under_fast_fill = if Self::is_small(used_size) {
+            self.small.is_under_fast_fill()
         } else {
-            self.large.is_under_half()
+            self.large.is_under_fast_fill()
         };
-        if already_seen || under_half {
+        if already_seen || under_fast_fill {
             let bytes = used_size.0 as usize * used_size.1 as usize * 4;
             let ok = if Self::is_small(used_size) {
                 self.small.can_promote(bytes, self.frame)
