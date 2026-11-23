@@ -16,7 +16,9 @@ use crate::descriptors::Descriptors;
 pub use crate::filters::batch::{
     FilterAtlasResult, FilterTogetherEntry, apply_together, can_apply_together,
 };
-pub use crate::filters::cache::{CabContentKey, FilteredCabCache, SUBFRAME_PROMOTE_MAX_PIXELS};
+pub use crate::filters::cache::{
+    BlendLayerCache, CabContentKey, FilteredCabCache, SUBFRAME_PROMOTE_MAX_PIXELS,
+};
 use crate::filters::bevel::BevelFilter;
 use crate::filters::blur::BlurFilter;
 use crate::filters::color_matrix::ColorMatrixFilter;

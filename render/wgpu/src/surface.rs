@@ -101,6 +101,7 @@ impl Surface {
         texture_pool: &'global mut TexturePool,
         frame_region: Option<(i32, i32, u32, u32)>,
         filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
+        blend_cache: Option<&'encoder mut crate::filters::BlendLayerCache>,
     ) {
         let target = self.draw_commands(
             render_target_mode,
@@ -113,6 +114,7 @@ impl Surface {
             layer,
             texture_pool,
             filter_atlas,
+            blend_cache,
         );
 
         run_copy_pipeline_into_region(
@@ -141,6 +143,7 @@ impl Surface {
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
         filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
+        mut blend_cache: Option<&'encoder mut crate::filters::BlendLayerCache>,
     ) -> CommandTarget {
         // Everything drawn over an opaque background keeps it opaque
         // (except shader blends, which the command handler accounts for).
@@ -185,7 +188,7 @@ impl Surface {
         } else {
             commands
         };
-        let (mut chunks, leaf_layers) = chunk_blends(
+        let (mut chunks, leaf_layers, pending_blend_promotions) = chunk_blends(
             commands,
             descriptors,
             staging_belt,
@@ -203,6 +206,7 @@ impl Surface {
             },
             texture_pool,
             filter_atlas,
+            blend_cache.as_deref_mut(),
         );
 
         let atlas_layers = if !leaf_layers.is_empty() {
@@ -222,6 +226,11 @@ impl Surface {
         } else {
             None
         };
+        if let Some(cache) = blend_cache {
+            for (key, tex, view, bind_group, used_size) in pending_blend_promotions {
+                cache.insert(key, tex, view, bind_group, used_size);
+            }
+        }
         let atlas_bind_groups = atlas_layers
             .as_ref()
             .map_or(&[][..], |layers| &layers.bind_groups);

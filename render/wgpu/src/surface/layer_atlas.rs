@@ -163,7 +163,8 @@ fn check_leaf_commands(
 }
 
 /// Whether a layer with these commands can be rendered in the atlas: it must only
-/// contain plain draws, balanced stencil masks, or direct blends, and be reasonably small.
+/// contain plain draws, balanced stencil masks, direct blends, or one level of
+/// inline-blendable nested leaf blend layers, and be reasonably small.
 pub fn is_leaf(
     descriptors: &Descriptors,
     commands: &CommandList,
@@ -171,7 +172,7 @@ pub fn is_leaf(
     height: u32,
     is_layer: bool,
 ) -> bool {
-    check_leaf_commands(descriptors, commands, width, height, false, is_layer)
+    check_leaf_commands(descriptors, commands, width, height, true, is_layer)
 }
 
 /// Whether a CAB with these commands can be rendered in the CAB/filter atlas: like
@@ -282,6 +283,7 @@ pub fn render_leaf_layers(
                         slot.x as i32 - layer.origin.0,
                         slot.y as i32 - layer.origin.1,
                     ),
+                    layer.origin,
                     (slot.x, slot.y, layer.width, layer.height),
                     layer.is_layer,
                 )
@@ -535,7 +537,7 @@ pub fn render_into_atlas(
     );
 
     let (mut chunks, inner_leaf_layers) = chunk_leaf_layers(
-        layers.map(|(cmds, offset, scissor)| (cmds, offset, scissor, false)),
+        layers.map(|(cmds, offset, scissor)| (cmds, offset, (0, 0), scissor, false)),
         descriptors,
         staging_belt,
         dynamic_transforms,

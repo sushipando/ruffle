@@ -3199,24 +3199,20 @@ fn blend_layer_bounds<'gc>(
     matrix: &Matrix,
     view_matrix: &Matrix,
 ) -> Option<Rectangle<Twips>> {
-    let in_layer = this.blend_mode() == ExtendedBlendMode::Layer;
-    blend_layer_bounds_impl(this, matrix, view_matrix, in_layer)
+    blend_layer_bounds_impl(this, matrix, view_matrix, true)
 }
 
-/// `in_layer`: whether the bounds are for a `Layer` blend (of an ancestor of `this`, or of
-/// `this` itself).
+/// `is_root`: whether `this` is the root display object whose blend layer bounds are being
+/// computed. Descendant `Alpha`/`Erase` nodes never expand the ancestor layer's bounds
+/// (inside a `Layer` they only reduce alpha; outside a `Layer` Flash ignores them).
 fn blend_layer_bounds_impl<'gc>(
     this: DisplayObject<'gc>,
     matrix: &Matrix,
     view_matrix: &Matrix,
-    in_layer: bool,
+    is_root: bool,
 ) -> Option<Rectangle<Twips>> {
     let blend_mode = this.blend_mode();
-    // `Alpha` and `Erase` only reduce the alpha of the layer they're drawn onto (where they
-    // are opaque), so they don't make a layer cover more pixels. Leaving them out keeps
-    // the common "`Layer` parent with an `Alpha` mask child" pattern from always covering
-    // the whole target.
-    if in_layer
+    if !is_root
         && matches!(
             blend_mode,
             ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase
@@ -3243,7 +3239,7 @@ fn blend_layer_bounds_impl<'gc>(
                 child,
                 &matrix,
                 view_matrix,
-                in_layer,
+                false,
             )?);
         }
     }

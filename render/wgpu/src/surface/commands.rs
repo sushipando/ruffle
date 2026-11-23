@@ -822,6 +822,14 @@ pub enum LayerRef<'a> {
 
 /// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
 /// Every complex blend will be its own item, but every other draw will be chunked together
+pub type PendingBlendPromotion = (
+    crate::filters::CabContentKey,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::BindGroup,
+    (u32, u32),
+);
+
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_blends<'encoder, 'global: 'encoder>(
     commands: CommandList,
@@ -838,7 +846,12 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
     filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
-) -> (Vec<Chunk>, Vec<layer_atlas::LeafLayer>) {
+    blend_cache: Option<&'encoder mut crate::filters::BlendLayerCache>,
+) -> (
+    Vec<Chunk>,
+    Vec<layer_atlas::LeafLayer>,
+    Vec<PendingBlendPromotion>,
+) {
     let mut handler = WgpuCommandHandler::new(
         descriptors,
         staging_belt,
@@ -852,10 +865,15 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         nearest_layer,
         texture_pool,
         filter_atlas,
+        blend_cache,
     );
     handler.opaque = opaque;
     let chunks = handler.chunk_blends(commands);
-    (chunks, mem::take(&mut handler.leaf_layers))
+    (
+        chunks,
+        mem::take(&mut handler.leaf_layers),
+        mem::take(&mut handler.pending_blend_promotions),
+    )
 }
 
 /// Fills in atlas bind-group indices and UV sub-rect vertices for every
@@ -899,7 +917,7 @@ pub fn bind_atlas_layers(chunks: &mut [Chunk], atlas_layers: &layer_atlas::Atlas
 /// and the scissor rectangle `(x, y, width, height)` to clip them to.
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
-    layers: impl Iterator<Item = (CommandList, (i32, i32), (u32, u32, u32, u32), bool)>,
+    layers: impl Iterator<Item = (CommandList, (i32, i32), (i32, i32), (u32, u32, u32, u32), bool)>,
     descriptors: &'encoder Descriptors,
     staging_belt: &'encoder mut wgpu::util::StagingBelt,
     dynamic_transforms: &'encoder DynamicTransforms,
@@ -924,9 +942,11 @@ pub fn chunk_leaf_layers<'encoder, 'global: 'encoder>(
         LayerRef::None,
         texture_pool,
         filter_atlas,
+        None,
     );
-    for (commands, (dx, dy), scissor, is_layer) in layers {
+    for (commands, (dx, dy), scissor_origin, scissor, is_layer) in layers {
         handler.scissor = Some(scissor);
+        handler.scissor_origin = scissor_origin;
         handler.nearest_layer = if is_layer {
             LayerRef::Current
         } else {
@@ -972,6 +992,8 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     translation: (Twips, Twips),
     /// The current scissor rectangle, to be restored when starting a new chunk.
     scissor: Option<(u32, u32, u32, u32)>,
+    /// The world/parent pixel origin of the layer currently being drawn into `scissor`.
+    scissor_origin: (i32, i32),
     /// Whether the target is known to be fully opaque (and stays so), allowing
     /// some complex blends to be done as trivial ones.
     opaque: bool,
@@ -983,6 +1005,10 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     direct_blend: Option<ShapeBlend>,
     /// Optional filtered CAB atlas for direct sampling without copy-out blits.
     filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
+    /// Optional content-addressed cache for pure-vector offscreen blend layers.
+    blend_cache: Option<&'encoder mut crate::filters::BlendLayerCache>,
+    /// Leaf-layer cache promotions deferred until `render_leaf_layers` populates them.
+    pending_blend_promotions: Vec<PendingBlendPromotion>,
 }
 
 impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
@@ -1000,6 +1026,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
         filter_atlas: Option<&'encoder crate::filters::FilterAtlasResult>,
+        blend_cache: Option<&'encoder mut crate::filters::BlendLayerCache>,
     ) -> Self {
         let transforms = Self::new_transforms(descriptors, dynamic_transforms);
         let vertices = Self::new_vertices(descriptors, dynamic_transforms);
@@ -1033,12 +1060,15 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
                 Twips::from_pixels_i32(-origin.1),
             ),
             scissor: None,
+            scissor_origin: (0, 0),
             transforms,
             vertices,
             needs_stencil: false,
             num_masks: 0,
             direct_blend: None,
             filter_atlas,
+            blend_cache,
+            pending_blend_promotions: vec![],
         }
     }
 
@@ -1203,7 +1233,7 @@ impl WgpuCommandHandler<'_, '_> {
         // Padding for anti-aliasing and bitmap smoothing at the edges.
         const PADDING: i32 = 2;
         let (ox, oy, target_w, target_h) = match self.scissor {
-            Some((_, _, sw, sh)) => (0, 0, sw, sh),
+            Some((_, _, sw, sh)) => (self.scissor_origin.0, self.scissor_origin.1, sw, sh),
             None => (self.origin.0, self.origin.1, self.width, self.height),
         };
         let clamp_x = |v: f64| (v as i32).clamp(ox, ox + target_w as i32);
@@ -1227,8 +1257,11 @@ impl WgpuCommandHandler<'_, '_> {
         let (y0, y1) = round(y0, y1, oy, oy + target_h as i32);
         let (width, height) = ((x1 - x0) as u32, (y1 - y0) as u32);
 
-        // Not worth it if we'd cover most of the target anyway.
-        if (width as u64 * height as u64) * 4 > (target_w as u64 * target_h as u64) * 3 {
+        // Keep bounded rects whenever the layer fits in the shared layer atlas, so we
+        // don't drop out of `leaf_layers` batching into a standalone full-target pass.
+        if !layer_atlas::fits(width, height)
+            && (width as u64 * height as u64) * 4 > (target_w as u64 * target_h as u64) * 3
+        {
             return None;
         }
         Some(Some((x0, y0, width, height)))
@@ -1315,6 +1348,41 @@ fn command_screen_aabb(command: &Command) -> Option<[f32; 4]> {
     Some([min_x - 1.0, min_y - 1.0, max_x + 1.0, max_y + 1.0])
 }
 
+fn unwrap_passthrough_blend_ref(mut cmds: &[Command]) -> &[Command] {
+    while let [Command::Blend(inner, mode) | Command::BlendBounded(inner, mode, _)] = cmds {
+        if matches!(
+            mode,
+            RenderBlendMode::Builtin(BlendMode::Normal | BlendMode::Layer)
+        ) {
+            cmds = inner.commands.as_slice();
+        } else {
+            break;
+        }
+    }
+    cmds
+}
+
+fn unwrap_passthrough_blend_owned(mut commands: CommandList) -> CommandList {
+    while commands.commands.len() == 1 {
+        let is_passthrough = matches!(
+            commands.commands.first(),
+            Some(Command::Blend(_, mode) | Command::BlendBounded(_, mode, _))
+                if matches!(
+                    mode,
+                    RenderBlendMode::Builtin(BlendMode::Normal | BlendMode::Layer)
+                )
+        );
+        if !is_passthrough {
+            break;
+        }
+        match commands.commands.pop().unwrap() {
+            Command::Blend(inner, _) | Command::BlendBounded(inner, _, _) => commands = inner,
+            _ => unreachable!(),
+        }
+    }
+    commands
+}
+
 pub(crate) fn direct_blend_mode_for(
     descriptors: &Descriptors,
     commands: &CommandList,
@@ -1325,7 +1393,7 @@ pub(crate) fn direct_blend_mode_for(
     if !ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::DirectBlends) {
         return None;
     }
-    let single_fill = match commands.commands.as_slice() {
+    let single_fill = match unwrap_passthrough_blend_ref(commands.commands.as_slice()) {
         [command] => match command {
             Command::RenderShape { shape, .. } => {
                 let mesh = as_mesh(shape);
@@ -1428,8 +1496,9 @@ impl WgpuCommandHandler<'_, '_> {
         }
         if let Some(mode) = self.direct_blend_mode(&commands, &blend_mode) {
             crate::perf_counters::count_named("direct-blend");
+            let unwrapped = unwrap_passthrough_blend_owned(commands);
             self.direct_blend = Some(mode);
-            commands.execute(self);
+            unwrapped.execute(self);
             self.direct_blend = None;
             return;
         }
@@ -1454,7 +1523,7 @@ impl WgpuCommandHandler<'_, '_> {
         let (origin, width, height) = match rect {
             Some((x, y, width, height)) => ((x, y), width, height),
             None => match self.scissor {
-                Some((_, _, sw, sh)) => ((0, 0), sw, sh),
+                Some((_, _, sw, sh)) => (self.scissor_origin, sw, sh),
                 None => (self.origin, self.width, self.height),
             },
         };
@@ -1518,11 +1587,120 @@ impl WgpuCommandHandler<'_, '_> {
             _ => None,
         };
 
+        // Helper to emit an already-rendered (or cached) texture inline with `shape_blend`.
+        let emit_inline_texture = |this: &mut Self,
+                                   texture: PoolOrArcTexture,
+                                   bind_group: wgpu::BindGroup,
+                                   shape_blend: ShapeBlend| {
+            let matrix = Matrix::translate(
+                Twips::from_pixels_i32(origin.0),
+                Twips::from_pixels_i32(origin.1),
+            ) * Matrix::scale(width as f32, height as f32);
+            match shape_blend {
+                ShapeBlend::Fetch(blend_mode) => {
+                    crate::perf_counters::count_named("fetch-blend");
+                    this.add_to_current(matrix, 0.0, Default::default(), |instance_index| {
+                        DrawCommand::FetchBlend {
+                            _texture: texture,
+                            binds: bind_group,
+                            instance_index,
+                            blend_mode,
+                        }
+                    });
+                }
+                ShapeBlend::Trivial(blend_mode) => {
+                    crate::perf_counters::count(crate::perf_counters::Counter::BlendTrivial);
+                    this.add_to_current(matrix, 0.0, Default::default(), |instance_index| {
+                        DrawCommand::RenderTexture {
+                            _texture: texture,
+                            binds: bind_group,
+                            instance_index,
+                            blend_mode,
+                        }
+                    });
+                }
+            }
+        };
+
+        // Content-addressed blend-layer LRU cache: skip 4× MSAA offscreen rasterization
+        // completely for static/24fps-animated/looping pure-vector blend layers.
+        let blend_key = if let Some(shape_blend) = inline_blend
+            && matches!(self.nearest_layer, LayerRef::None)
+            && self.blend_cache.is_some()
+        {
+            let clear_swf = Color {
+                r: (clear_color.r * 255.0).round() as u8,
+                g: (clear_color.g * 255.0).round() as u8,
+                b: (clear_color.b * 255.0).round() as u8,
+                a: (clear_color.a * 255.0).round() as u8,
+            };
+            let key = crate::filters::CabContentKey::try_from_blend_layer(
+                (width, height),
+                origin,
+                clear_swf,
+                self.quality,
+                is_layer,
+                &commands,
+            );
+            if let Some(ref k) = key
+                && let Some(cached) = self.blend_cache.as_deref_mut().and_then(|c| c.get(k))
+            {
+                let tex = PoolOrArcTexture::Manual((cached.texture.clone(), cached.view.clone()));
+                let bg = cached.bind_group.clone();
+                crate::perf_counters::count_named("blend-lru/hit");
+                emit_inline_texture(self, tex, bg, shape_blend);
+                return;
+            }
+            key
+        } else {
+            None
+        };
+
+        let promote_key = if let Some(key) = blend_key
+            && self
+                .blend_cache
+                .as_deref_mut()
+                .is_some_and(|c| c.should_promote(&key, (width, height)))
+        {
+            Some(key)
+        } else {
+            None
+        };
+
         let use_leaf_atlas = (rect.is_some() || self.scissor.is_some())
             && ruffle_render::perf_flags::enabled(ruffle_render::perf_flags::PerfFlag::LayerAtlas)
             && layer_atlas::is_leaf(self.descriptors, &commands, width, height, is_layer);
 
         if use_leaf_atlas && let Some(shape_blend) = inline_blend {
+            if let Some(key) = promote_key {
+                let (tex, view, bind_group) = crate::filters::BlendLayerCache::allocate_texture(
+                    self.descriptors,
+                    (width, height),
+                );
+                self.leaf_layers.push(layer_atlas::LeafLayer {
+                    commands,
+                    origin,
+                    width,
+                    height,
+                    destination: Some(tex.clone()),
+                    is_layer,
+                });
+                self.pending_blend_promotions.push((
+                    key,
+                    tex.clone(),
+                    view.clone(),
+                    bind_group.clone(),
+                    (width, height),
+                ));
+                crate::perf_counters::count_named("blend-lru/promote");
+                emit_inline_texture(
+                    self,
+                    PoolOrArcTexture::Manual((tex, view)),
+                    bind_group,
+                    shape_blend,
+                );
+                return;
+            }
             // Sample directly from the layer atlas via UV sub-rect, avoiding a per-layer
             // texture allocation, copy-out blit, and per-layer bind group.
             match shape_blend {
@@ -1602,9 +1780,45 @@ impl WgpuCommandHandler<'_, '_> {
                 target_layer,
                 self.texture_pool,
                 self.filter_atlas,
+                self.blend_cache.as_deref_mut(),
             );
             target.ensure_cleared(self.draw_encoder);
-            target.take_color_texture()
+            let rendered = target.take_color_texture();
+            if let Some(key) = promote_key
+                && let Some(shape_blend) = inline_blend
+            {
+                let (tex, view, bind_group) = crate::filters::BlendLayerCache::allocate_texture(
+                    self.descriptors,
+                    (width, height),
+                );
+                self.draw_encoder.copy_texture_to_texture(
+                    rendered.texture().as_image_copy(),
+                    tex.as_image_copy(),
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                if let Some(cache) = self.blend_cache.as_deref_mut() {
+                    cache.insert(
+                        key,
+                        tex.clone(),
+                        view.clone(),
+                        bind_group.clone(),
+                        (width, height),
+                    );
+                    crate::perf_counters::count_named("blend-lru/promote");
+                }
+                emit_inline_texture(
+                    self,
+                    PoolOrArcTexture::Manual((tex, view)),
+                    bind_group,
+                    shape_blend,
+                );
+                return;
+            }
+            rendered
         };
 
         match inline_blend {
@@ -1919,6 +2133,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             LayerRef::None,
             self.texture_pool,
             self.filter_atlas,
+            None,
         );
         maskee.ensure_cleared(self.draw_encoder);
         let matrix = Matrix::translate(
@@ -1938,6 +2153,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             LayerRef::None,
             self.texture_pool,
             self.filter_atlas,
+            None,
         );
         mask.ensure_cleared(self.draw_encoder);
         let mask = mask.take_color_texture();

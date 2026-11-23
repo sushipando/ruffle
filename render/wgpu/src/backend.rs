@@ -105,6 +105,8 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     filter_atlas_tick: u32,
     /// Content-addressed LRU cache for looping pure-vector filtered CABs.
     cab_cache: crate::filters::FilteredCabCache,
+    /// Content-addressed LRU cache for pure-vector offscreen blend layers.
+    blend_cache: crate::filters::BlendLayerCache,
     /// When true, `submit_frame` leaves `active_frame.command_encoder` open so the desktop
     /// shell can append its `egui_render` pass onto the same Metal command buffer before
     /// submitting + presenting in one job.
@@ -320,6 +322,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             filter_atlas: crate::filters::FilterAtlasResult::default(),
             filter_atlas_tick: 0,
             cab_cache: crate::filters::FilteredCabCache::new(),
+            blend_cache: crate::filters::BlendLayerCache::new(),
             defer_submit: false,
             deferred_frame_pending: false,
             direct_output_acquirer: None,
@@ -509,6 +512,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
         self.cab_cache.clear();
+        self.blend_cache.clear();
         self.filter_atlas.clear();
         // Avoid panics from creating 0-sized framebuffers.
         // TODO: find a way to bubble an error when the size is too large
@@ -610,6 +614,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     fn set_quality(&mut self, quality: StageQuality) {
         if quality != self.surface.quality() {
             self.cab_cache.clear();
+            self.blend_cache.clear();
             self.filter_atlas.clear();
         }
         self.surface = Surface::new(
@@ -749,6 +754,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 && ruffle_render::filters::rendering_for_display();
 
         self.cab_cache.begin_frame();
+        self.blend_cache.begin_frame();
         let cur_tick = ruffle_render::filters::render_tick();
         if cur_tick == 0 || cur_tick != self.filter_atlas_tick {
             self.filter_atlas.clear();
@@ -1161,6 +1167,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             LayerRef::None,
                             &mut self.offscreen_texture_pool,
                             filter_atlas_ref,
+                            None,
                         );
                     }
                 } else {
@@ -1188,6 +1195,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             LayerRef::None,
                             &mut self.offscreen_texture_pool,
                             filter_atlas_ref,
+                            None,
                         ))
                     };
                     if crate::perf_counters::enabled() {
@@ -1295,6 +1303,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             LayerRef::None,
                             &mut self.offscreen_texture_pool,
                             filter_atlas_ref,
+                            None,
                         );
                     }
                     filter_texture_in_place(
@@ -1473,6 +1482,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         LayerRef::None,
                         &mut self.texture_pool,
                         filter_atlas_ref,
+                        Some(&mut self.blend_cache),
                     );
                     target.ensure_cleared(&mut scope);
                 } else {
@@ -1511,6 +1521,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         LayerRef::None,
                         &mut self.texture_pool,
                         filter_atlas_ref,
+                        Some(&mut self.blend_cache),
                     );
                     let swap_view = swap_tex.create_view(&Default::default());
                     crate::utils::run_copy_pipeline_into_region(
@@ -1567,6 +1578,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     LayerRef::None,
                     &mut self.texture_pool,
                     filter_atlas_ref,
+                    Some(&mut self.blend_cache),
                 );
             } else {
                 surface.draw_commands_and_copy_to(
@@ -1587,6 +1599,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         self.visible_region
                     },
                     filter_atlas_ref,
+                    Some(&mut self.blend_cache),
                 );
             }
         }
@@ -1782,6 +1795,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             &mut self.offscreen_texture_pool,
             None,
             filter_atlas_ref,
+            None,
         );
 
         self.active_frame.maybe_flush(&self.descriptors);

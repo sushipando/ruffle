@@ -17,7 +17,7 @@ use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use swf::Color;
+use swf::{Color, Twips};
 
 /// Maximum VRAM retained by the small/medium keyframe tier (<= 384x384 px = <= 576 KB/frame).
 /// Isolated from both large entries and interpolated subframes so giant wings or 6x-volume
@@ -32,16 +32,26 @@ const LARGE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SUBFRAME_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum single CAB pixel area eligible for caching (1024x1024 = 4 MB).
 const MAX_ENTRY_PIXELS: u64 = 1024 * 1024;
+/// Maximum VRAM retained by the small/medium blend-layer tier (<= 512x512 px).
+const BLEND_SMALL_MAX_BYTES: usize = 192 * 1024 * 1024;
+/// Pixel area threshold separating small/medium and large blend layers (512x512).
+const BLEND_SMALL_MAX_PIXELS: u64 = 512 * 512;
+/// Maximum VRAM retained by the large blend-layer tier (512x512 < px <= 2560x1440).
+const BLEND_LARGE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum single blend-layer pixel area eligible for caching (covers up to 2560x1440).
+const BLEND_MAX_ENTRY_PIXELS: u64 = 2560 * 1440;
 /// Maximum single CAB pixel area eligible for promoting interpolated subframes (384x384,
 /// matching the dedicated subframe tier).
 pub const SUBFRAME_PROMOTE_MAX_PIXELS: u64 = SMALL_MAX_PIXELS;
 /// Maximum command count per CAB eligible for canonical key serialization.
 const MAX_COMMANDS: usize = 256;
-/// Evict cached textures unused for this many submitted frames (~12-25 s).
-const MAX_IDLE_FRAMES: u64 = 1800;
-/// Refuse to evict a cached entry used within this many frames (~3-5 s) so active loops
-/// stay pinned at 100% hit rate instead of thrashing when a room exceeds the tier budget.
-const HOT_WINDOW_FRAMES: u64 = 360;
+/// Evict cached textures unused for this many submitted frames (~62 s at 144 fps, ~125 s at
+/// 72 fps) so player attack/skill animations on 15-45 s cooldowns stay warm in-room while
+/// rooms left behind still free VRAM smoothly.
+const MAX_IDLE_FRAMES: u64 = 9000;
+/// Refuse to evict a cached entry used within this many frames (~5 s at 144 fps) so active
+/// loops stay pinned at 100% hit rate instead of thrashing when a room exceeds the tier budget.
+const HOT_WINDOW_FRAMES: u64 = 720;
 /// Size of the 2-hit admission filter (only promote keys seen at least twice).
 const SEEN_CAPACITY: usize = 16384;
 
@@ -85,6 +95,41 @@ impl CabContentKey {
         Self::try_from_entry_inner(used_size, clear, quality, filters, commands)
     }
 
+    /// Serializes a pure-vector offscreen blend layer's exact rendering inputs into a
+    /// canonical key, normalized to layer-local `(0, 0)` coordinates by subtracting `origin`.
+    pub fn try_from_blend_layer(
+        used_size: (u32, u32),
+        origin: (i32, i32),
+        clear: Color,
+        quality: StageQuality,
+        is_layer: bool,
+        commands: &CommandList,
+    ) -> Option<Self> {
+        let pixels = u64::from(used_size.0) * u64::from(used_size.1);
+        if pixels == 0 || pixels > BLEND_MAX_ENTRY_PIXELS {
+            return None;
+        }
+        if commands.commands.is_empty() || commands.commands.len() > MAX_COMMANDS {
+            return None;
+        }
+        let mut payload = Vec::with_capacity(64 + commands.commands.len() * 48);
+        payload.push(if is_layer { 0xB1 } else { 0xB0 });
+        let offset = (
+            Twips::from_pixels_i32(origin.0),
+            Twips::from_pixels_i32(origin.1),
+        );
+        let mut total_cmds = 0usize;
+        if !encode_commands(commands, &mut payload, 0, &mut total_cmds, offset) {
+            return None;
+        }
+        Some(Self {
+            used_size,
+            quality: quality_to_byte(quality),
+            clear: [clear.r, clear.g, clear.b, clear.a],
+            payload,
+        })
+    }
+
     fn try_from_entry_inner(
         used_size: (u32, u32),
         clear: Color,
@@ -107,22 +152,18 @@ impl CabContentKey {
             }
         }
         let mut total_cmds = 0usize;
-        if !encode_commands(commands, &mut payload, 0, &mut total_cmds) {
+        if !encode_commands(
+            commands,
+            &mut payload,
+            0,
+            &mut total_cmds,
+            (Twips::ZERO, Twips::ZERO),
+        ) {
             return None;
         }
-        let quality_byte = match quality {
-            StageQuality::Low => 0,
-            StageQuality::Medium => 1,
-            StageQuality::High => 2,
-            StageQuality::Best => 3,
-            StageQuality::High8x8 => 4,
-            StageQuality::High8x8Linear => 5,
-            StageQuality::High16x16 => 6,
-            StageQuality::High16x16Linear => 7,
-        };
         Some(Self {
             used_size,
-            quality: quality_byte,
+            quality: quality_to_byte(quality),
             clear: [clear.r, clear.g, clear.b, clear.a],
             payload,
         })
@@ -195,17 +236,35 @@ fn encode_filter(filter: &Filter, out: &mut Vec<u8>) -> bool {
     }
 }
 
-fn encode_matrix(m: &Matrix, out: &mut Vec<u8>) {
+fn quality_to_byte(quality: StageQuality) -> u8 {
+    match quality {
+        StageQuality::Low => 0,
+        StageQuality::Medium => 1,
+        StageQuality::High => 2,
+        StageQuality::Best => 3,
+        StageQuality::High8x8 => 4,
+        StageQuality::High8x8Linear => 5,
+        StageQuality::High16x16 => 6,
+        StageQuality::High16x16Linear => 7,
+    }
+}
+
+fn encode_matrix(m: &Matrix, offset: (Twips, Twips), out: &mut Vec<u8>) {
     out.extend_from_slice(&m.a.to_bits().to_le_bytes());
     out.extend_from_slice(&m.b.to_bits().to_le_bytes());
     out.extend_from_slice(&m.c.to_bits().to_le_bytes());
     out.extend_from_slice(&m.d.to_bits().to_le_bytes());
-    out.extend_from_slice(&m.tx.get().to_le_bytes());
-    out.extend_from_slice(&m.ty.get().to_le_bytes());
+    out.extend_from_slice(&(m.tx - offset.0).get().to_le_bytes());
+    out.extend_from_slice(&(m.ty - offset.1).get().to_le_bytes());
 }
 
-fn encode_transform(t: &Transform, out: &mut Vec<u8>) {
-    encode_matrix(&t.matrix, out);
+fn encode_transform(t: &Transform, offset: (Twips, Twips), out: &mut Vec<u8>) -> bool {
+    if (offset.0 != Twips::ZERO || offset.1 != Twips::ZERO)
+        && (t.perspective_projection.is_some() || t.tz != 0.0)
+    {
+        return false;
+    }
+    encode_matrix(&t.matrix, offset, out);
     for v in t.color_transform.mult_rgba_normalized() {
         out.extend_from_slice(&v.to_bits().to_le_bytes());
     }
@@ -222,6 +281,7 @@ fn encode_transform(t: &Transform, out: &mut Vec<u8>) {
         }
         None => out.push(0),
     }
+    true
 }
 
 fn encode_commands(
@@ -229,6 +289,7 @@ fn encode_commands(
     out: &mut Vec<u8>,
     depth: u8,
     total_cmds: &mut usize,
+    offset: (Twips, Twips),
 ) -> bool {
     if depth > 4 {
         return false;
@@ -243,22 +304,24 @@ fn encode_commands(
             Command::RenderShape { shape, transform } => {
                 out.push(1);
                 out.extend_from_slice(&mesh_id(shape).to_le_bytes());
-                encode_transform(transform, out);
+                if !encode_transform(transform, offset, out) {
+                    return false;
+                }
             }
             Command::DrawRect { color, matrix } => {
                 out.push(2);
                 out.extend_from_slice(&[color.r, color.g, color.b, color.a]);
-                encode_matrix(matrix, out);
+                encode_matrix(matrix, offset, out);
             }
             Command::DrawLine { color, matrix } => {
                 out.push(3);
                 out.extend_from_slice(&[color.r, color.g, color.b, color.a]);
-                encode_matrix(matrix, out);
+                encode_matrix(matrix, offset, out);
             }
             Command::DrawLineRect { color, matrix } => {
                 out.push(4);
                 out.extend_from_slice(&[color.r, color.g, color.b, color.a]);
-                encode_matrix(matrix, out);
+                encode_matrix(matrix, offset, out);
             }
             Command::PushMask => out.push(5),
             Command::ActivateMask => out.push(6),
@@ -267,18 +330,18 @@ fn encode_commands(
             Command::Blend(inner, RenderBlendMode::Builtin(mode)) => {
                 out.push(9);
                 out.push(*mode as u8);
-                if !encode_commands(inner, out, depth + 1, total_cmds) {
+                if !encode_commands(inner, out, depth + 1, total_cmds, offset) {
                     return false;
                 }
             }
             Command::BlendBounded(inner, RenderBlendMode::Builtin(mode), bounds) => {
                 out.push(10);
                 out.push(*mode as u8);
-                out.extend_from_slice(&bounds.x_min.get().to_le_bytes());
-                out.extend_from_slice(&bounds.x_max.get().to_le_bytes());
-                out.extend_from_slice(&bounds.y_min.get().to_le_bytes());
-                out.extend_from_slice(&bounds.y_max.get().to_le_bytes());
-                if !encode_commands(inner, out, depth + 1, total_cmds) {
+                out.extend_from_slice(&(bounds.x_min - offset.0).get().to_le_bytes());
+                out.extend_from_slice(&(bounds.x_max - offset.0).get().to_le_bytes());
+                out.extend_from_slice(&(bounds.y_min - offset.1).get().to_le_bytes());
+                out.extend_from_slice(&(bounds.y_max - offset.1).get().to_le_bytes());
+                if !encode_commands(inner, out, depth + 1, total_cmds, offset) {
                     return false;
                 }
             }
@@ -296,6 +359,7 @@ fn encode_commands(
 
 pub struct CachedCabTexture {
     pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
     pub bind_group: wgpu::BindGroup,
     pub used_size: (u32, u32),
     bytes: usize,
@@ -360,6 +424,7 @@ impl CabTier {
         &mut self,
         key: CabContentKey,
         texture: wgpu::Texture,
+        view: wgpu::TextureView,
         bind_group: wgpu::BindGroup,
         used_size: (u32, u32),
         frame: u64,
@@ -386,6 +451,7 @@ impl CabTier {
             key,
             CachedCabTexture {
                 texture,
+                view,
                 bind_group,
                 used_size,
                 bytes,
@@ -545,11 +611,13 @@ impl FilteredCabCache {
         used_size: (u32, u32),
         is_subframe: bool,
     ) {
+        let view = texture.create_view(&Default::default());
         if is_subframe {
             if Self::is_small(used_size) {
                 self.subframe.insert(
                     key,
                     texture,
+                    view,
                     bind_group,
                     used_size,
                     self.frame,
@@ -557,11 +625,179 @@ impl FilteredCabCache {
                 );
             }
         } else if Self::is_small(used_size) {
-            self.small
-                .insert(key, texture, bind_group, used_size, self.frame, &mut self.seen);
+            self.small.insert(
+                key,
+                texture,
+                view,
+                bind_group,
+                used_size,
+                self.frame,
+                &mut self.seen,
+            );
         } else {
-            self.large
-                .insert(key, texture, bind_group, used_size, self.frame, &mut self.seen);
+            self.large.insert(
+                key,
+                texture,
+                view,
+                bind_group,
+                used_size,
+                self.frame,
+                &mut self.seen,
+            );
+        }
+    }
+}
+
+/// Content-addressed LRU cache for pure-vector offscreen blend layers (`Multiply`,
+/// `Overlay`, `HardLight`, `Add`, `Screen`, etc.).
+///
+/// With 6× frame interpolation, 24 fps animated blend layers emit identical commands on
+/// all 6 subframes (and repeat every 1–2 s loop). Caching their resolved 4× MSAA offscreen
+/// texture by exact canonical inputs (normalized to layer-local `(0, 0)`) eliminates
+/// offscreen rasterization and atlas/target passes completely on hits, while strictly
+/// preserving bit-exact output.
+pub struct BlendLayerCache {
+    seen: LruCache<u64, ()>,
+    small: CabTier,
+    large: CabTier,
+    frame: u64,
+}
+
+impl Default for BlendLayerCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlendLayerCache {
+    pub fn new() -> Self {
+        Self {
+            seen: LruCache::new(NonZeroUsize::new(SEEN_CAPACITY).unwrap()),
+            small: CabTier::new(BLEND_SMALL_MAX_BYTES),
+            large: CabTier::new(BLEND_LARGE_MAX_BYTES),
+            frame: 0,
+        }
+    }
+
+    #[inline]
+    fn is_small(used_size: (u32, u32)) -> bool {
+        u64::from(used_size.0) * u64::from(used_size.1) <= BLEND_SMALL_MAX_PIXELS
+    }
+
+    pub fn clear(&mut self) {
+        self.seen.clear();
+        self.small.clear();
+        self.large.clear();
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        self.small.expire_stale(self.frame, &mut self.seen);
+        self.large.expire_stale(self.frame, &mut self.seen);
+    }
+
+    pub fn get(&mut self, key: &CabContentKey) -> Option<&CachedCabTexture> {
+        let frame = self.frame;
+        if Self::is_small(key.used_size) {
+            self.small.get(key, frame)
+        } else {
+            self.large.get(key, frame)
+        }
+    }
+
+    pub fn should_promote(&mut self, key: &CabContentKey, used_size: (u32, u32)) -> bool {
+        let h = key.fast_hash();
+        if self.seen.get(&h).is_some() {
+            let bytes = used_size.0 as usize * used_size.1 as usize * 4;
+            let ok = if Self::is_small(used_size) {
+                self.small.can_promote(bytes, self.frame)
+            } else {
+                self.large.can_promote(bytes, self.frame)
+            };
+            if !ok {
+                crate::perf_counters::count_named(if Self::is_small(used_size) {
+                    "blend-lru/small-full"
+                } else {
+                    "blend-lru/large-full"
+                });
+            }
+            ok
+        } else {
+            self.seen.put(h, ());
+            false
+        }
+    }
+
+    pub fn allocate_texture(
+        descriptors: &Descriptors,
+        used_size: (u32, u32),
+    ) -> (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup) {
+        let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
+            label: create_debug_label!("Cached blend layer").as_deref(),
+            size: wgpu::Extent3d {
+                width: used_size.0,
+                height: used_size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        // Matches `WgpuCommandHandler::texture_bind_group` (exact pixel-aligned nearest sampling).
+        let nearest = descriptors.bitmap_samplers.get_sampler(false, false);
+        let bind_group = descriptors
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &descriptors.bind_layouts.bitmap,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(nearest),
+                    },
+                ],
+                label: create_debug_label!("Cached blend layer bind group").as_deref(),
+            });
+        (texture, view, bind_group)
+    }
+
+    pub fn insert(
+        &mut self,
+        key: CabContentKey,
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        bind_group: wgpu::BindGroup,
+        used_size: (u32, u32),
+    ) {
+        if Self::is_small(used_size) {
+            self.small.insert(
+                key,
+                texture,
+                view,
+                bind_group,
+                used_size,
+                self.frame,
+                &mut self.seen,
+            );
+        } else {
+            self.large.insert(
+                key,
+                texture,
+                view,
+                bind_group,
+                used_size,
+                self.frame,
+                &mut self.seen,
+            );
         }
     }
 }
