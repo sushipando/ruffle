@@ -56,11 +56,13 @@ struct MainWindow {
     next_tick_time: Option<Instant>,
     /// How many frames are drawn per movie frame (see `--interpolate`), at most.
     max_interpolate: u32,
-    /// How often frames are drawn between movie frames: one every this many display
-    /// refreshes (or, when the display's refresh interval isn't known, this many times
-    /// `frame_duration / max_interpolate`). Raised while frames can't be drawn in time,
-    /// and lowered again later (see `adapt_interpolation`); 0 draws none.
-    every: u32,
+    /// How many steps below the top interpolation rate we currently are (0 = fastest).
+    /// When the display's max refresh rate is a whole multiple of the movie's frame rate
+    /// (e.g. 144 Hz for 24 fps), steps through every integer frames-per-movie-frame
+    /// (`6 -> 5 -> 4 -> 3 -> 2 -> 1`, i.e. 144 -> 120 -> 96 -> 72 -> 48 -> 24 fps).
+    /// Otherwise steps by whole display refreshes (`every`). Raised while frames can't
+    /// be drawn in time, and lowered again later (see `adapt_interpolation`).
+    rate_step: u32,
     adaptation: InterpolationAdaptation,
     /// The ideal time of the last movie frame, from which frames drawn between movie
     /// frames are timed.
@@ -641,46 +643,26 @@ impl MainWindow {
         }
     }
 
-    /// The time between frames drawn between movie frames when `every` is 1: the
-    /// display's refresh interval, so that each is shown for `every` refreshes, or, when
-    /// that isn't known, the movie frame's duration over `max_interpolate`.
-    fn base_step(&self, frame_duration: f64) -> f64 {
-        self.refresh_interval
-            .unwrap_or(frame_duration / self.max_interpolate.max(1) as f64)
+    /// The highest `rate_step` (slowest interpolation rate) for the current movie and
+    /// display. `0` is the fastest rate.
+    fn max_rate_step(&self, frame_duration: f64) -> u32 {
+        max_rate_step_for(self.max_interpolate, frame_duration, self.refresh_interval)
     }
 
-    /// The values of `every` that draw at most `max_interpolate` frames per movie frame,
-    /// and at least about one (the most refreshes that don't go past a movie frame, or
-    /// just do: the last resort when a frame per movie frame doesn't fit a whole number
-    /// of refreshes).
-    fn every_range(&self, frame_duration: f64) -> RangeInclusive<u32> {
-        let base = self.base_step(frame_duration);
-        let min = (frame_duration / (self.max_interpolate.max(1) as f64 * base) - 1e-6)
-            .ceil()
-            .max(1.0) as u32;
-        let max = ((frame_duration / base - 1e-6).ceil().max(1.0) as u32).max(min);
-        min..=max
-    }
-
-    /// How the frames between movie frames are timed, if any are drawn (with
-    /// `--interpolate`; see `Subframes`). The caller checks that the movie plays.
-    fn subframes(&self, frame_duration: f64) -> Option<Subframes> {
-        if self.max_interpolate <= 1 || self.every == 0 || frame_duration <= 0.0 {
-            return None;
-        }
-        let step = self.base_step(frame_duration) * self.every as f64;
-        let per_frame = frame_duration / step;
-        let aligned = (per_frame - per_frame.round()).abs() < 0.01;
-        Some(Subframes {
-            step: if aligned {
-                frame_duration / per_frame.round()
-            } else {
-                step
-            },
+    /// How the frames between movie frames are timed at a given `rate_step` (see
+    /// `--interpolate` and `Subframes`). The caller checks that the movie plays.
+    fn subframes_for(&self, rate_step: u32, frame_duration: f64) -> Option<Subframes> {
+        subframes_for_params(
+            self.max_interpolate,
+            rate_step,
             frame_duration,
-            aligned,
-            single: aligned && per_frame.round() <= 1.0,
-        })
+            self.refresh_interval,
+        )
+    }
+
+    /// How the frames between movie frames are timed right now.
+    fn subframes(&self, frame_duration: f64) -> Option<Subframes> {
+        self.subframes_for(self.rate_step, frame_duration)
     }
 
     /// Requests drawing frames between movie frames when they're due, and makes the event
@@ -697,10 +679,10 @@ impl MainWindow {
         else {
             return;
         };
-        let range = self.every_range(subframes.frame_duration);
-        if !range.contains(&self.every) {
+        let max_step = self.max_rate_step(subframes.frame_duration);
+        if self.rate_step > max_step {
             // The display (or its refresh rate) changed.
-            self.every = self.every.clamp(*range.start(), *range.end());
+            self.rate_step = max_step;
             return;
         }
         let now = Instant::now();
@@ -767,28 +749,42 @@ impl MainWindow {
     }
 
     /// Describes how often frames are drawn between movie frames, for the log.
-    fn describe_every(&self, every: u32, frame_duration: f64) -> String {
-        let per_frame = frame_duration / (self.base_step(frame_duration) * every as f64);
-        let refreshes = match (self.refresh_interval, every) {
-            (None, _) => String::new(),
-            (Some(_), 1) => ", one per refresh".to_string(),
-            (Some(_), every) => format!(", one every {every} refreshes"),
+    fn describe_rate(&self, rate_step: u32, frame_duration: f64) -> String {
+        let Some(subframes) = self.subframes_for(rate_step, frame_duration) else {
+            return "off".to_string();
         };
-        format!("{per_frame:.2} frames per movie frame{refreshes}")
+        let per_frame = frame_duration / subframes.step;
+        let fps = (1.0 / subframes.step).round() as u32;
+        let refreshes = self
+            .refresh_interval
+            .filter(|&r| r > 0.0)
+            .and_then(|r| {
+                let every = subframes.step / r;
+                let rounded = every.round();
+                (rounded >= 1.0 && (every - rounded).abs() < 0.05).then_some(rounded as u32)
+            })
+            .map(|every| {
+                if every == 1 {
+                    ", one per refresh".to_string()
+                } else {
+                    format!(", one every {every} refreshes")
+                }
+            })
+            .unwrap_or_default();
+        format!("{per_frame:.2} frames per movie frame ({fps} fps{refreshes})")
     }
 
-    /// Draws frames between movie frames less often while more than a tenth of them are
-    /// skipped (they couldn't be drawn in time): one every one more refresh, so that
-    /// frames stay evenly spaced (which looks smoother than more frames at uneven times),
-    /// down to about one per movie frame (see `every_range`). Tries drawing them more
-    /// often again after a few seconds without skipped frames. How busy the GPU is doesn't
-    /// tell whether that will fit: GPUs whose clock follows their load (such as Apple's)
-    /// look about as busy with less work. So when frames are skipped soon after the
-    /// change, it goes back and waits twice as long before trying again, unless the load
-    /// gets clearly lower than it was before that try, or a stall (such as loading new
-    /// content) suggests that what's shown changed.
+    /// Draws frames between movie frames less often while too many of them are skipped
+    /// (they couldn't be drawn in time), stepping down smoothly through each intermediate
+    /// rate (e.g. 6 -> 5 -> 4 -> 3 -> 2 -> 1 frames per movie frame, or 144 -> 120 -> 96
+    /// -> 72 -> 48 -> 24 fps on a 144 Hz display), and tries raising the rate again after
+    /// clean seconds. How busy the GPU is doesn't tell whether that will fit: GPUs whose
+    /// clock follows their load (such as Apple's) look about as busy with less work. So
+    /// when frames are skipped soon after a raise, it goes back and waits twice as long
+    /// before trying again, unless the load gets clearly lower than it was before that
+    /// try, or a stall (such as loading new content) suggests that what's shown changed.
     fn adapt_interpolation(&mut self, now: Instant, frame_duration: f64) {
-        let range = self.every_range(frame_duration);
+        let max_step = self.max_rate_step(frame_duration);
         let adaptation = &mut self.adaptation;
         let window = now.duration_since(adaptation.window_start);
         if window < Duration::from_secs(1) || adaptation.fixed {
@@ -812,29 +808,27 @@ impl MainWindow {
             return;
         }
         let total = drawn + skipped;
-        // At 1-frame-per-refresh (e.g. 144 Hz, 6.9 ms/frame), dropping a level halves the
-        // frame rate (144 -> 72). When both GPU and CPU have clear headroom (<80% load),
-        // occasional single-subframe skips right behind heavy 24 fps game ticks still look
-        // much smoother at ~120-144 fps than halving to 72 fps; only treat >16.7% skipped
-        // as behind in that case (keeping the strict 10% threshold whenever load >= 80%).
+        // At the top rate (e.g. 144 fps, 6.9 ms/frame), when both GPU and CPU have clear
+        // headroom (<80% load), tolerate up to 12.5% transient skips (~126+ fps) before
+        // stepping down to 5x (120 fps); keep the strict 10% threshold otherwise.
         let behind = if total == 0 {
             false
-        } else if self.every == *range.start() && load < 0.80 {
-            skipped * 6 > total
+        } else if self.rate_step == 0 && load < 0.80 {
+            skipped * 8 > total
         } else {
             skipped * 10 > total
         };
         let severely_behind = total > 0 && skipped * 4 > total;
         let was_behind = std::mem::replace(&mut adaptation.behind, behind);
         let on_trial = adaptation.since_raise.is_some();
-        let warming_top_rate = self.every == *range.start() && load < 0.92;
+        let warming_raise = load < 0.92;
         let swamped = total > 0 && skipped * 2 > total;
         let abort_trial = match adaptation.since_raise {
-            // Raising to 1-frame-per-refresh introduces new interpolated subframe phases
-            // (e.g. 1/6, 3/6, 5/6 at 144 Hz) that need up to 6 seconds in crowded rooms to
-            // warm up FilteredCabCache and BlendLayerCache. Don't abort during warmup
-            // unless truly swamped (>50% skipped or >=94% load).
-            Some(0..=5) if warming_top_rate => swamped || load >= 0.94,
+            // Raising to a new rate introduces new interpolated subframe phases (e.g.
+            // 1/5..4/5 or 1/6..5/6) that need up to 6 seconds in crowded rooms to warm
+            // up FilteredCabCache and BlendLayerCache. Don't abort during warmup unless
+            // truly swamped (>50% skipped or >=94% load).
+            Some(0..=5) if warming_raise => swamped || load >= 0.94,
             // The first second after raising often spans the rate transition; only abort
             // immediately if severely behind (>25% skipped).
             Some(0) => severely_behind,
@@ -844,10 +838,10 @@ impl MainWindow {
             Some(_) => behind && (was_behind || severely_behind || load >= 0.85),
             None => false,
         };
-        let in_warmup = matches!(adaptation.since_raise, Some(0..=5)) && warming_top_rate;
+        let in_warmup = matches!(adaptation.since_raise, Some(0..=5)) && warming_raise;
         if (!in_warmup && behind && was_behind) || abort_trial {
-            // Less often: every one more refresh.
-            let fewer = (self.every < *range.end()).then(|| self.every + 1);
+            // One step slower (e.g. 6x -> 5x -> 4x -> 3x -> 2x -> 1x).
+            let fewer = (self.rate_step < max_step).then(|| self.rate_step + 1);
             if let Some(fewer) = fewer {
                 if on_trial {
                     adaptation.retry_after =
@@ -857,10 +851,10 @@ impl MainWindow {
                 adaptation.since_raise = None;
                 adaptation.clean_windows = 0;
                 adaptation.behind = false;
-                self.every = fewer;
+                self.rate_step = fewer;
                 tracing::info!(
                     "[interpolate] {} (couldn't keep up)",
-                    self.describe_every(fewer, frame_duration)
+                    self.describe_rate(fewer, frame_duration)
                 );
             }
             return;
@@ -882,8 +876,8 @@ impl MainWindow {
             let lighter = adaptation
                 .failed_load
                 .is_some_and(|failed| load <= failed * 0.85);
-            // More often: every one refresh fewer.
-            let more = (self.every > *range.start()).then(|| self.every - 1);
+            // One step faster (e.g. 3x -> 4x -> 5x -> 6x).
+            let more = (self.rate_step > 0).then(|| self.rate_step - 1);
             if (adaptation.clean_windows >= adaptation.retry_after
                 || (adaptation.clean_windows >= InterpolationAdaptation::MIN_WAIT && lighter))
                 && let Some(more) = more
@@ -892,11 +886,11 @@ impl MainWindow {
                 adaptation.load_before_raise = load;
                 adaptation.clean_windows = 0;
                 adaptation.behind = false;
-                let before = self.describe_every(self.every, frame_duration);
-                self.every = more;
+                let before = self.describe_rate(self.rate_step, frame_duration);
+                self.rate_step = more;
                 tracing::info!(
                     "[interpolate] {} (load {:.0}% at {before})",
-                    self.describe_every(more, frame_duration),
+                    self.describe_rate(more, frame_duration),
                     load * 100.0,
                 );
             }
@@ -1187,7 +1181,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 next_frame_time: None,
                 next_tick_time: None,
                 max_interpolate: self.preferences.cli.interpolate.max(1),
-                every: 1,
+                rate_step: 0,
                 adaptation: InterpolationAdaptation::new(),
                 frame_start: None,
                 next_due: None,
@@ -1364,4 +1358,132 @@ enum LoadingState {
 /// Whether two key events are for the same key (as the player matches presses and releases).
 fn same_key(a: &KeyDescriptor, b: &KeyDescriptor) -> bool {
     a.physical_key == b.physical_key && a.key_location == b.key_location
+}
+
+/// When the display's max refresh rate is (approximately) a whole multiple of the movie's
+/// frame rate (or unknown), returns the highest integer frames-per-movie-frame we can draw.
+fn aligned_max_per_frame(
+    max_interpolate: u32,
+    frame_duration: f64,
+    refresh_interval: Option<f64>,
+) -> Option<u32> {
+    let max_interp = max_interpolate.max(1);
+    match refresh_interval {
+        None => Some(max_interp),
+        Some(refresh) if refresh > 0.0 => {
+            let ratio = frame_duration / refresh;
+            let rounded = ratio.round();
+            if rounded >= 1.0 && (ratio - rounded).abs() < 0.05 {
+                Some((rounded as u32).min(max_interp).max(1))
+            } else {
+                None
+            }
+        }
+        Some(_) => Some(max_interp),
+    }
+}
+
+/// Fallback refresh-divisor range for displays whose refresh rate is not a whole multiple
+/// of the movie's frame rate (e.g. 24 fps on a 60 Hz screen).
+fn every_range_for(
+    max_interpolate: u32,
+    frame_duration: f64,
+    refresh_interval: Option<f64>,
+) -> RangeInclusive<u32> {
+    let base = refresh_interval.unwrap_or(frame_duration / max_interpolate.max(1) as f64);
+    let min = (frame_duration / (max_interpolate.max(1) as f64 * base) - 1e-6)
+        .ceil()
+        .max(1.0) as u32;
+    let max = ((frame_duration / base - 1e-6).ceil().max(1.0) as u32).max(min);
+    min..=max
+}
+
+fn max_rate_step_for(
+    max_interpolate: u32,
+    frame_duration: f64,
+    refresh_interval: Option<f64>,
+) -> u32 {
+    if let Some(max_pf) = aligned_max_per_frame(max_interpolate, frame_duration, refresh_interval) {
+        max_pf.saturating_sub(1)
+    } else {
+        let range = every_range_for(max_interpolate, frame_duration, refresh_interval);
+        range.end().saturating_sub(*range.start())
+    }
+}
+
+fn subframes_for_params(
+    max_interpolate: u32,
+    rate_step: u32,
+    frame_duration: f64,
+    refresh_interval: Option<f64>,
+) -> Option<Subframes> {
+    if max_interpolate <= 1 || frame_duration <= 0.0 {
+        return None;
+    }
+    if let Some(max_pf) = aligned_max_per_frame(max_interpolate, frame_duration, refresh_interval) {
+        let per_frame = max_pf.saturating_sub(rate_step).max(1);
+        return Some(Subframes {
+            step: frame_duration / per_frame as f64,
+            frame_duration,
+            aligned: true,
+            single: per_frame <= 1,
+        });
+    }
+    let range = every_range_for(max_interpolate, frame_duration, refresh_interval);
+    let every = (*range.start() + rate_step).min(*range.end());
+    let base = refresh_interval.unwrap_or(frame_duration / max_interpolate.max(1) as f64);
+    let step = base * every as f64;
+    let per_frame = frame_duration / step;
+    let aligned = (per_frame - per_frame.round()).abs() < 0.01;
+    Some(Subframes {
+        step: if aligned {
+            frame_duration / per_frame.round()
+        } else {
+            step
+        },
+        frame_duration,
+        aligned,
+        single: aligned && per_frame.round() <= 1.0,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_ladder_144hz_24fps() {
+        let frame_duration = 1.0 / 24.0;
+        let refresh = Some(1.0 / 144.0);
+        assert_eq!(max_rate_step_for(6, frame_duration, refresh), 5);
+        let fps: Vec<u32> = (0..=5)
+            .map(|step| {
+                let sf = subframes_for_params(6, step, frame_duration, refresh).unwrap();
+                assert!(sf.aligned);
+                assert_eq!(sf.single, step == 5);
+                (1.0 / sf.step).round() as u32
+            })
+            .collect();
+        assert_eq!(fps, vec![144, 120, 96, 72, 48, 24]);
+
+        // Explicit --interpolate 5 starts at 120 fps, --interpolate 4 starts at 96 fps.
+        let sf5 = subframes_for_params(5, 0, frame_duration, refresh).unwrap();
+        assert_eq!((1.0 / sf5.step).round() as u32, 120);
+        let sf4 = subframes_for_params(4, 0, frame_duration, refresh).unwrap();
+        assert_eq!((1.0 / sf4.step).round() as u32, 96);
+    }
+
+    #[test]
+    fn interpolation_ladder_60hz_24fps_fallback() {
+        let frame_duration = 1.0 / 24.0;
+        let refresh = Some(1.0 / 60.0);
+        assert_eq!(max_rate_step_for(6, frame_duration, refresh), 2);
+        let fps: Vec<u32> = (0..=2)
+            .map(|step| {
+                let sf = subframes_for_params(6, step, frame_duration, refresh).unwrap();
+                (1.0 / sf.step).round() as u32
+            })
+            .collect();
+        assert_eq!(fps, vec![60, 30, 20]);
+    }
 }
