@@ -54,9 +54,9 @@ pub struct FilterTogetherEntry {
     pub handle_ptr: usize,
     /// Persistence policy for this filtered entry.
     pub volatility: CacheVolatility,
-    /// Optional dedicated LRU-cache texture to copy the finished filtered result into
-    /// (for 2-hit promotion into `FilteredCabCache`).
-    pub promote_copy: Option<wgpu::Texture>,
+    /// Optional dedicated LRU-cache destination `(texture, dst_x, dst_y)` to copy the
+    /// finished filtered result into (for promotion into `FilteredCabCache`).
+    pub promote_copy: Option<(wgpu::Texture, u32, u32)>,
 }
 
 /// Filtered CAB atlases kept alive for direct sampling during the current frame (and, for
@@ -68,6 +68,9 @@ pub struct FilterAtlasResult {
     pub bind_groups: Vec<wgpu::BindGroup>,
     /// Maps `BitmapHandle` pointer -> `(atlas_bind_group_index, slot_x, slot_y, atlas_w, atlas_h)`.
     pub slots: fnv::FnvHashMap<usize, (usize, u32, u32, u32, u32)>,
+    /// Optional canonical content key for each slot in `slots`, allowing downstream CABs and
+    /// blend layers that sample an upstream `filter_atlas` CAB to remain 100% cacheable.
+    pub slot_keys: fnv::FnvHashMap<usize, std::sync::Arc<crate::filters::CabContentKey>>,
     handles: fnv::FnvHashMap<usize, BitmapHandle>,
     subframe_keys: Vec<usize>,
 }
@@ -75,6 +78,7 @@ pub struct FilterAtlasResult {
 impl FilterAtlasResult {
     pub fn clear(&mut self) {
         self.slots.clear();
+        self.slot_keys.clear();
         self.handles.clear();
         self.subframe_keys.clear();
         self.bind_groups.clear();
@@ -83,27 +87,65 @@ impl FilterAtlasResult {
 
     pub fn remove_slot(&mut self, handle_ptr: usize) {
         self.slots.remove(&handle_ptr);
+        self.slot_keys.remove(&handle_ptr);
         self.handles.remove(&handle_ptr);
     }
 
-    /// Exposes an externally owned cached texture (e.g. from `FilteredCabCache`) for
-    /// zero-copy direct sampling in the main pass.
+    /// Exposes an externally owned cached texture (or sub-rect inside a persistent cache
+    /// atlas page) for zero-copy direct sampling in the main pass, deduplicating shared
+    /// atlas page bind groups.
+    #[expect(clippy::too_many_arguments)]
     pub fn insert_external_slot(
         &mut self,
         handle: BitmapHandle,
         handle_ptr: usize,
         bind_group: wgpu::BindGroup,
-        used_size: (u32, u32),
+        slot_origin: (u32, u32),
+        atlas_size: (u32, u32),
         volatility: CacheVolatility,
+        content_key: Option<std::sync::Arc<crate::filters::CabContentKey>>,
     ) {
-        let atlas_idx = self.bind_groups.len();
-        self.textures.push(None);
-        self.bind_groups.push(bind_group);
-        self.slots
-            .insert(handle_ptr, (atlas_idx, 0, 0, used_size.0, used_size.1));
+        let atlas_idx = self
+            .bind_groups
+            .iter()
+            .enumerate()
+            .find_map(|(i, bg)| (self.textures[i].is_none() && bg == &bind_group).then_some(i))
+            .unwrap_or_else(|| {
+                let idx = self.bind_groups.len();
+                self.textures.push(None);
+                self.bind_groups.push(bind_group);
+                idx
+            });
+        self.slots.insert(
+            handle_ptr,
+            (
+                atlas_idx,
+                slot_origin.0,
+                slot_origin.1,
+                atlas_size.0,
+                atlas_size.1,
+            ),
+        );
+        if let Some(key) = content_key {
+            self.slot_keys.insert(handle_ptr, key);
+        } else {
+            self.slot_keys.remove(&handle_ptr);
+        }
         self.handles.insert(handle_ptr, handle);
         if matches!(volatility, CacheVolatility::Subframe) {
             self.subframe_keys.push(handle_ptr);
+        }
+    }
+
+    /// Associates a canonical content key with an already-inserted slot (e.g. after
+    /// `apply_together` finishes rendering it into the filter atlas).
+    pub fn set_slot_key(
+        &mut self,
+        handle_ptr: usize,
+        key: std::sync::Arc<crate::filters::CabContentKey>,
+    ) {
+        if self.slots.contains_key(&handle_ptr) {
+            self.slot_keys.insert(handle_ptr, key);
         }
     }
 
@@ -120,6 +162,11 @@ impl FilterAtlasResult {
             return false;
         };
         self.slots.insert(to_ptr, slot);
+        if let Some(key) = self.slot_keys.get(&from_ptr).cloned() {
+            self.slot_keys.insert(to_ptr, key);
+        } else {
+            self.slot_keys.remove(&to_ptr);
+        }
         self.handles.insert(to_ptr, handle);
         if matches!(volatility, CacheVolatility::Subframe) {
             self.subframe_keys.push(to_ptr);
@@ -168,6 +215,7 @@ impl FilterAtlasResult {
     pub fn end_frame(&mut self) {
         for key in self.subframe_keys.drain(..) {
             self.slots.remove(&key);
+            self.slot_keys.remove(&key);
             self.handles.remove(&key);
         }
         if self.slots.is_empty() {
@@ -1679,7 +1727,7 @@ pub fn apply_together(
                 let next_filter_idx = filter_idx + if fused_cm_at[batch_index] { 2 } else { 1 };
                 if next_filter_idx >= entries[index].filters.len() {
                     let (uw, uh) = used_extent(&entries[index]);
-                    if let Some(ref promote_tex) = entries[index].promote_copy {
+                    if let Some((ref promote_tex, dst_x, dst_y)) = entries[index].promote_copy {
                         encoder.copy_texture_to_texture(
                             wgpu::TexelCopyTextureInfo {
                                 texture: &target.texture.0,
@@ -1691,7 +1739,16 @@ pub fn apply_together(
                                 },
                                 aspect: Default::default(),
                             },
-                            promote_tex.as_image_copy(),
+                            wgpu::TexelCopyTextureInfo {
+                                texture: promote_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d {
+                                    x: dst_x,
+                                    y: dst_y,
+                                    z: 0,
+                                },
+                                aspect: Default::default(),
+                            },
                             wgpu::Extent3d {
                                 width: uw,
                                 height: uh,

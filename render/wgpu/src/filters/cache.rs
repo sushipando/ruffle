@@ -26,18 +26,19 @@ use swf::{Color, Twips};
 /// Maximum VRAM retained by the small/medium keyframe tier (<= 384x384 px = <= 576 KB/frame).
 /// Isolated from both large entries and interpolated subframes so giant wings or 6x-volume
 /// subframe animations can never starve dozens of smaller glowing weapons, flames, and runes.
-const SMALL_MAX_BYTES: usize = 256 * 1024 * 1024;
+const SMALL_MAX_BYTES: usize = 384 * 1024 * 1024;
 /// Pixel area threshold separating the small/medium tier from the large tier (384x384).
 const SMALL_MAX_PIXELS: u64 = 384 * 384;
 /// Maximum VRAM retained by the large keyframe tier (384x384 < pixels <= 1024x1024).
 const LARGE_MAX_BYTES: usize = 256 * 1024 * 1024;
-/// Dedicated VRAM tier for interpolated subframe CABs (<= 384x384 px), isolated from the
-/// keyframe tiers so 5x-per-tick subframe volume never evicts or blocks keyframe promotions.
-const SUBFRAME_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Dedicated VRAM tier for interpolated subframe CABs (<= 384x384 px), sized so heavy
+/// 19-20 player rooms with 75+ glowing CABs can keep all 5 interpolated subframe phases
+/// warm at 144 fps without overflowing.
+const SUBFRAME_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum single CAB pixel area eligible for caching (1024x1024 = 4 MB).
 const MAX_ENTRY_PIXELS: u64 = 1024 * 1024;
 /// Maximum VRAM retained by the small/medium blend-layer tier (<= 512x512 px).
-const BLEND_SMALL_MAX_BYTES: usize = 192 * 1024 * 1024;
+const BLEND_SMALL_MAX_BYTES: usize = 320 * 1024 * 1024;
 /// Pixel area threshold separating small/medium and large blend layers (512x512).
 const BLEND_SMALL_MAX_PIXELS: u64 = 512 * 512;
 /// Maximum VRAM retained by the large blend-layer tier (512x512 < px <= 2560x1440).
@@ -48,7 +49,7 @@ const BLEND_MAX_ENTRY_PIXELS: u64 = 2560 * 1440;
 /// matching the dedicated subframe tier).
 pub const SUBFRAME_PROMOTE_MAX_PIXELS: u64 = SMALL_MAX_PIXELS;
 /// Maximum command count per CAB eligible for canonical key serialization.
-const MAX_COMMANDS: usize = 256;
+const MAX_COMMANDS: usize = 512;
 /// Evict cached textures unused for this many submitted frames (~62 s at 144 fps, ~125 s at
 /// 72 fps) so player attack/skill animations on 15-45 s cooldowns stay warm in-room while
 /// rooms left behind still free VRAM smoothly.
@@ -56,8 +57,9 @@ const MAX_IDLE_FRAMES: u64 = 9000;
 /// Refuse to evict a cached entry used within this many frames (~5 s at 144 fps) so active
 /// loops stay pinned at 100% hit rate instead of thrashing when a room exceeds the tier budget.
 const HOT_WINDOW_FRAMES: u64 = 720;
-/// Size of the 2-hit admission filter (only promote keys seen at least twice).
-const SEEN_CAPACITY: usize = 16384;
+/// Size of the 2-hit admission filter (only promote keys seen at least twice once a tier is
+/// >50% full).
+const SEEN_CAPACITY: usize = 32768;
 
 /// Exact canonical content key for a pure-vector filtered CAB.
 /// Comparing `payload` byte-for-byte eliminates hash-collision bugs completely.
@@ -154,15 +156,22 @@ impl CabContentKey {
     ) -> Option<Self> {
         let pixels = u64::from(used_size.0) * u64::from(used_size.1);
         if pixels == 0 || pixels > MAX_ENTRY_PIXELS {
+            if pixels > MAX_ENTRY_PIXELS {
+                crate::perf_counters::count_named("cab-nokey/size");
+            }
             return None;
         }
         if commands.commands.is_empty() || commands.commands.len() > MAX_COMMANDS {
+            if commands.commands.len() > MAX_COMMANDS {
+                crate::perf_counters::count_named("cab-nokey/cmds");
+            }
             return None;
         }
         let mut payload = Vec::with_capacity(64 + commands.commands.len() * 48);
         payload.extend_from_slice(&(filters.len() as u32).to_le_bytes());
         for filter in filters {
             if !encode_filter(filter, &mut payload) {
+                crate::perf_counters::count_named("cab-nokey/filter");
                 return None;
             }
         }
@@ -309,12 +318,14 @@ fn encode_commands(
     filter_atlas: Option<&FilterAtlasResult>,
 ) -> bool {
     if depth > 4 {
+        crate::perf_counters::count_named("cab-nokey/depth");
         return false;
     }
     out.extend_from_slice(&(commands.commands.len() as u32).to_le_bytes());
     for cmd in &commands.commands {
         *total_cmds += 1;
         if *total_cmds > MAX_COMMANDS {
+            crate::perf_counters::count_named("cab-nokey/cmds");
             return false;
         }
         match cmd {
@@ -322,6 +333,7 @@ fn encode_commands(
                 out.push(1);
                 out.extend_from_slice(&mesh_id(shape).to_le_bytes());
                 if !encode_transform(transform, offset, out) {
+                    crate::perf_counters::count_named("cab-nokey/3d");
                     return false;
                 }
             }
@@ -369,16 +381,30 @@ fn encode_commands(
                 pixel_snapping,
                 region,
             } => {
-                // Skip bitmaps aliased into the transient per-frame filter atlas (their
-                // pixels live in the atlas, not in `texture.texture`).
                 let ptr = Arc::as_ptr(&bitmap.0) as *const () as usize;
-                if filter_atlas.is_some_and(|fa| fa.slots.contains_key(&ptr)) {
-                    return false;
+                if let Some(fa) = filter_atlas
+                    && fa.slots.contains_key(&ptr)
+                {
+                    // Upstream CAB lives in the transient per-frame filter atlas: if it has
+                    // a canonical content key, inline-encode its exact key so nested filtered
+                    // CABs and blend layers remain 100% cacheable.
+                    let Some(child_key) = fa.slot_keys.get(&ptr) else {
+                        crate::perf_counters::count_named("cab-nokey/atlas-bmp");
+                        return false;
+                    };
+                    out.push(12);
+                    out.extend_from_slice(&child_key.used_size.0.to_le_bytes());
+                    out.extend_from_slice(&child_key.used_size.1.to_le_bytes());
+                    out.push(child_key.quality);
+                    out.extend_from_slice(&child_key.clear);
+                    out.extend_from_slice(&(child_key.payload.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&child_key.payload);
+                } else {
+                    let tex = as_texture(bitmap);
+                    out.push(11);
+                    out.extend_from_slice(&tex.id.to_le_bytes());
+                    out.extend_from_slice(&tex.generation.get().to_le_bytes());
                 }
-                let tex = as_texture(bitmap);
-                out.push(11);
-                out.extend_from_slice(&tex.id.to_le_bytes());
-                out.extend_from_slice(&tex.generation.get().to_le_bytes());
                 out.push(u8::from(*smoothing));
                 out.push(match pixel_snapping {
                     PixelSnapping::Never => 0,
@@ -390,6 +416,7 @@ fn encode_commands(
                 out.extend_from_slice(&region.x_max.to_le_bytes());
                 out.extend_from_slice(&region.y_max.to_le_bytes());
                 if !encode_transform(transform, offset, out) {
+                    crate::perf_counters::count_named("cab-nokey/3d");
                     return false;
                 }
             }
@@ -397,7 +424,10 @@ fn encode_commands(
             Command::RenderStage3D { .. }
             | Command::RenderAlphaMask { .. }
             | Command::Blend(_, RenderBlendMode::Shader(_))
-            | Command::BlendBounded(_, RenderBlendMode::Shader(_), _) => return false,
+            | Command::BlendBounded(_, RenderBlendMode::Shader(_), _) => {
+                crate::perf_counters::count_named("cab-nokey/other");
+                return false;
+            }
         }
     }
     true
@@ -405,10 +435,16 @@ fn encode_commands(
 
 /// Page dimension (width and height) for persistent small-texture atlas pages (16 MB/page).
 const ATLAS_PAGE_SIZE: u32 = 2048;
-/// Maximum persistent atlas pages for small cached blend layers (10 × 16 MB = 160 MB).
-const ATLAS_MAX_PAGES: usize = 10;
-/// Maximum width or height (in pixels) eligible for persistent atlas packing (+1 px gutter <= 256).
-const ATLAS_MAX_ENTRY_DIM: u32 = 255;
+/// Maximum persistent atlas pages for small cached blend layers (16 × 16 MB = 256 MB).
+const BLEND_ATLAS_MAX_PAGES: usize = 16;
+/// Maximum persistent atlas pages for small cached filtered CABs (24 × 16 MB = 384 MB).
+const CAB_ATLAS_MAX_PAGES: usize = 24;
+/// Maximum width or height (in pixels) for nearest-sampled atlas packing (+1 px gutter <= 256).
+const ATLAS_MAX_NEAREST_DIM: u32 = 255;
+/// Maximum width or height (in pixels) for linear-sampled atlas packing (+2 px 1-on-each-side border <= 256).
+const ATLAS_MAX_LINEAR_DIM: u32 = 254;
+/// Size of the lazy zero-initialized texture used to clear reused linear atlas slots.
+const ATLAS_ZERO_TEX_SIZE: u32 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AtlasSlot {
@@ -424,6 +460,9 @@ struct AtlasShelf {
     height: u32,
     /// Sorted, non-overlapping `(x, width)` free horizontal spans inside this shelf.
     free_spans: Vec<(u32, u32)>,
+    /// True once any slot in this shelf has been freed (so linear-filtered allocations must
+    /// zero the 1 px border before writing new pixels).
+    reused: bool,
 }
 
 impl AtlasShelf {
@@ -432,6 +471,7 @@ impl AtlasShelf {
             y,
             height,
             free_spans: vec![(0, page_width)],
+            reused: false,
         }
     }
 
@@ -451,6 +491,7 @@ impl AtlasShelf {
     }
 
     fn free(&mut self, x: u32, width: u32) {
+        self.reused = true;
         let pos = self
             .free_spans
             .binary_search_by_key(&x, |&(sx, _)| sx)
@@ -498,12 +539,14 @@ struct PersistentAtlasPage {
     shelves: Vec<AtlasShelf>,
     next_y: u32,
     live_slots: usize,
+    /// True once this page has been reset after emptying, meaning prior texels may be non-zero.
+    reused: bool,
 }
 
 impl PersistentAtlasPage {
-    fn new(descriptors: &Descriptors) -> Self {
+    fn new(descriptors: &Descriptors, linear: bool) -> Self {
         let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
-            label: create_debug_label!("Persistent blend cache atlas").as_deref(),
+            label: create_debug_label!("Persistent cache atlas (linear: {})", linear).as_deref(),
             size: wgpu::Extent3d {
                 width: ATLAS_PAGE_SIZE,
                 height: ATLAS_PAGE_SIZE,
@@ -519,7 +562,7 @@ impl PersistentAtlasPage {
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
-        let nearest = descriptors.bitmap_samplers.get_sampler(false, false);
+        let sampler = descriptors.bitmap_samplers.get_sampler(false, linear);
         let bind_group = descriptors
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -531,10 +574,11 @@ impl PersistentAtlasPage {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(nearest),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
-                label: create_debug_label!("Persistent blend cache atlas bind group").as_deref(),
+                label: create_debug_label!("Persistent cache atlas bind group (linear: {})", linear)
+                    .as_deref(),
             });
         Self {
             texture,
@@ -543,22 +587,32 @@ impl PersistentAtlasPage {
             shelves: Vec::new(),
             next_y: 0,
             live_slots: 0,
+            reused: false,
         }
     }
 }
 
-/// Persistent multi-page shelf atlas packing small (`<= 255×255`) cached blend layers onto
-/// shared `2048×2048` textures so dozens of cached layers draw with a single `wgpu::BindGroup`.
+/// Persistent multi-page shelf atlas packing small cached blend layers (nearest) or filtered
+/// CABs (linear, with a 1 px transparent border on all 4 sides) onto shared `2048×2048`
+/// textures so dozens of cached textures draw with a single `wgpu::BindGroup`.
 struct PersistentCacheAtlas {
     pages: Vec<PersistentAtlasPage>,
     deferred_frees: Vec<AtlasSlot>,
+    linear: bool,
+    max_pages: usize,
+    /// Lazily created `256×256` zero-initialized texture used to clear reused linear slots
+    /// inside the command encoder so linear sampling can never bleed stale neighbor pixels.
+    zero_texture: Option<wgpu::Texture>,
 }
 
 impl PersistentCacheAtlas {
-    fn new() -> Self {
+    fn new(linear: bool, max_pages: usize) -> Self {
         Self {
             pages: Vec::new(),
             deferred_frees: Vec::new(),
+            linear,
+            max_pages,
+            zero_texture: None,
         }
     }
 
@@ -577,22 +631,76 @@ impl PersistentCacheAtlas {
                 if page.live_slots == 0 {
                     page.shelves.clear();
                     page.next_y = 0;
+                    page.reused = true;
                 }
             }
         }
     }
 
+    fn clear_reused_slot(
+        zero_texture: &mut Option<wgpu::Texture>,
+        descriptors: &Descriptors,
+        encoder: &mut wgpu::CommandEncoder,
+        dst_tex: &wgpu::Texture,
+        clear_origin: (u32, u32),
+        clear_size: (u32, u32),
+    ) {
+        let zero = zero_texture.get_or_insert_with(|| {
+            descriptors.device.create_texture(&wgpu::TextureDescriptor {
+                label: create_debug_label!("Persistent cache atlas zero clear source").as_deref(),
+                size: wgpu::Extent3d {
+                    width: ATLAS_ZERO_TEX_SIZE,
+                    height: ATLAS_ZERO_TEX_SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        });
+        encoder.copy_texture_to_texture(
+            zero.as_image_copy(),
+            wgpu::TexelCopyTextureInfo {
+                texture: dst_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: clear_origin.0,
+                    y: clear_origin.1,
+                    z: 0,
+                },
+                aspect: Default::default(),
+            },
+            wgpu::Extent3d {
+                width: clear_size.0,
+                height: clear_size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     fn allocate(
         &mut self,
         descriptors: &Descriptors,
+        mut clear_encoder: Option<&mut wgpu::CommandEncoder>,
         used_size: (u32, u32),
-    ) -> Option<BlendCacheAllocation> {
+    ) -> Option<CacheAllocation> {
         let (w, h) = used_size;
-        if w == 0 || h == 0 || w > ATLAS_MAX_ENTRY_DIM || h > ATLAS_MAX_ENTRY_DIM {
+        let max_dim = if self.linear {
+            ATLAS_MAX_LINEAR_DIM
+        } else {
+            ATLAS_MAX_NEAREST_DIM
+        };
+        if w == 0 || h == 0 || w > max_dim || h > max_dim {
             return None;
         }
-        let alloc_w = w + 1;
-        let bucket_h = atlas_bucket_height(h + 1);
+        let border = u32::from(self.linear);
+        let pad = if self.linear { 2 } else { 1 };
+        let alloc_w = w + pad;
+        let alloc_h = h + pad;
+        let bucket_h = atlas_bucket_height(alloc_h);
 
         // 1. Try existing shelves with matching bucket height.
         for (page_idx, page) in self.pages.iter_mut().enumerate() {
@@ -601,7 +709,18 @@ impl PersistentCacheAtlas {
                     && let Some(x) = shelf.alloc(alloc_w)
                 {
                     let y = shelf.y;
+                    let needs_clear = self.linear && (page.reused || shelf.reused);
                     page.live_slots += 1;
+                    if needs_clear && let Some(enc) = clear_encoder.as_deref_mut() {
+                        Self::clear_reused_slot(
+                            &mut self.zero_texture,
+                            descriptors,
+                            enc,
+                            &page.texture,
+                            (x, y),
+                            (alloc_w, alloc_h),
+                        );
+                    }
                     return Some(Self::build_alloc(
                         page,
                         AtlasSlot {
@@ -610,7 +729,7 @@ impl PersistentCacheAtlas {
                             x,
                             alloc_w,
                         },
-                        (x, y),
+                        (x + border, y + border),
                         used_size,
                     ));
                 }
@@ -626,7 +745,18 @@ impl PersistentCacheAtlas {
                 let x = shelf.alloc(alloc_w).expect("fresh shelf fits <= 256 px");
                 let shelf_idx = page.shelves.len();
                 page.shelves.push(shelf);
+                let needs_clear = self.linear && page.reused;
                 page.live_slots += 1;
+                if needs_clear && let Some(enc) = clear_encoder.as_deref_mut() {
+                    Self::clear_reused_slot(
+                        &mut self.zero_texture,
+                        descriptors,
+                        enc,
+                        &page.texture,
+                        (x, y),
+                        (alloc_w, alloc_h),
+                    );
+                }
                 return Some(Self::build_alloc(
                     page,
                     AtlasSlot {
@@ -635,18 +765,19 @@ impl PersistentCacheAtlas {
                         x,
                         alloc_w,
                     },
-                    (x, y),
+                    (x + border, y + border),
                     used_size,
                 ));
             }
         }
 
         // 3. Allocate a new 2048×2048 atlas page if under page cap.
-        if self.pages.len() >= ATLAS_MAX_PAGES {
+        if self.pages.len() >= self.max_pages {
             return None;
         }
         let page_idx = self.pages.len();
-        self.pages.push(PersistentAtlasPage::new(descriptors));
+        self.pages
+            .push(PersistentAtlasPage::new(descriptors, self.linear));
         let page = &mut self.pages[page_idx];
         let y = 0;
         page.next_y = bucket_h;
@@ -662,7 +793,7 @@ impl PersistentCacheAtlas {
                 x,
                 alloc_w,
             },
-            (x, y),
+            (x + border, y + border),
             used_size,
         ))
     }
@@ -672,17 +803,18 @@ impl PersistentCacheAtlas {
         slot: AtlasSlot,
         dst_origin: (u32, u32),
         used_size: (u32, u32),
-    ) -> BlendCacheAllocation {
+    ) -> CacheAllocation {
         let inv = 1.0 / ATLAS_PAGE_SIZE as f32;
         let u0 = dst_origin.0 as f32 * inv;
         let v0 = dst_origin.1 as f32 * inv;
         let u1 = (dst_origin.0 + used_size.0) as f32 * inv;
         let v1 = (dst_origin.1 + used_size.1) as f32 * inv;
-        BlendCacheAllocation {
+        CacheAllocation {
             texture: page.texture.clone(),
             view: page.view.clone(),
             bind_group: page.bind_group.clone(),
             dst_origin,
+            atlas_size: (ATLAS_PAGE_SIZE, ATLAS_PAGE_SIZE),
             used_size,
             uv_rect: Some([u0, v0, u1, v1]),
             atlas_slot: Some(slot),
@@ -691,22 +823,26 @@ impl PersistentCacheAtlas {
 }
 
 /// A newly allocated storage target (either a sub-rect inside a persistent atlas page or a
-/// standalone texture) waiting to be filled and inserted into `BlendLayerCache`.
-pub struct BlendCacheAllocation {
+/// standalone texture) waiting to be filled and inserted into a cache.
+pub struct CacheAllocation {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub bind_group: wgpu::BindGroup,
     pub dst_origin: (u32, u32),
+    pub atlas_size: (u32, u32),
     pub used_size: (u32, u32),
     pub uv_rect: Option<[f32; 4]>,
     atlas_slot: Option<AtlasSlot>,
 }
 
+pub type BlendCacheAllocation = CacheAllocation;
+
 pub struct CachedCabTexture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub bind_group: wgpu::BindGroup,
-    pub used_size: (u32, u32),
+    pub src_origin: (u32, u32),
+    pub atlas_size: (u32, u32),
     pub uv_rect: Option<[f32; 4]>,
     atlas_slot: Option<AtlasSlot>,
     bytes: usize,
@@ -765,6 +901,11 @@ impl CabTier {
         Some(entry)
     }
 
+    #[inline]
+    fn is_under_half(&self) -> bool {
+        self.total_bytes * 2 < self.max_bytes
+    }
+
     fn can_promote(&self, bytes: usize, frame: u64) -> bool {
         if bytes > self.max_bytes {
             return false;
@@ -777,23 +918,17 @@ impl CabTier {
         })
     }
 
-    #[expect(clippy::too_many_arguments)]
-    fn insert(
+    fn insert_alloc(
         &mut self,
         key: CabContentKey,
-        texture: wgpu::Texture,
-        view: wgpu::TextureView,
-        bind_group: wgpu::BindGroup,
-        used_size: (u32, u32),
-        uv_rect: Option<[f32; 4]>,
-        atlas_slot: Option<AtlasSlot>,
+        alloc: CacheAllocation,
         frame: u64,
         seen: &mut LruCache<u64, ()>,
         mut deferred_frees: Option<&mut Vec<AtlasSlot>>,
     ) {
-        let bytes = used_size.0 as usize * used_size.1 as usize * 4;
+        let bytes = alloc.used_size.0 as usize * alloc.used_size.1 as usize * 4;
         if bytes > self.max_bytes {
-            if let (Some(slot), Some(frees)) = (atlas_slot, deferred_frees) {
+            if let (Some(slot), Some(frees)) = (alloc.atlas_slot, deferred_frees) {
                 frees.push(slot);
             }
             return;
@@ -803,7 +938,7 @@ impl CabTier {
                 frame.saturating_sub(oldest.last_used_frame) > HOT_WINDOW_FRAMES
             });
             if !can_evict {
-                if let (Some(slot), Some(frees)) = (atlas_slot, deferred_frees) {
+                if let (Some(slot), Some(frees)) = (alloc.atlas_slot, deferred_frees) {
                     frees.push(slot);
                 }
                 return;
@@ -820,12 +955,13 @@ impl CabTier {
         if let Some(old) = self.entries.put(
             key,
             CachedCabTexture {
-                texture,
-                view,
-                bind_group,
-                used_size,
-                uv_rect,
-                atlas_slot,
+                texture: alloc.texture,
+                view: alloc.view,
+                bind_group: alloc.bind_group,
+                src_origin: alloc.dst_origin,
+                atlas_size: alloc.atlas_size,
+                uv_rect: alloc.uv_rect,
+                atlas_slot: alloc.atlas_slot,
                 bytes,
                 last_used_frame: frame,
             },
@@ -844,6 +980,7 @@ pub struct FilteredCabCache {
     small: CabTier,
     large: CabTier,
     subframe: CabTier,
+    atlas: PersistentCacheAtlas,
     frame: u64,
 }
 
@@ -860,6 +997,7 @@ impl FilteredCabCache {
             small: CabTier::new(SMALL_MAX_BYTES),
             large: CabTier::new(LARGE_MAX_BYTES),
             subframe: CabTier::new(SUBFRAME_MAX_BYTES),
+            atlas: PersistentCacheAtlas::new(true, CAB_ATLAS_MAX_PAGES),
             frame: 0,
         }
     }
@@ -874,14 +1012,24 @@ impl FilteredCabCache {
         self.small.clear();
         self.large.clear();
         self.subframe.clear();
+        self.atlas.clear();
     }
 
     pub fn begin_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        self.atlas.flush_deferred_frees();
         // Evict up to 8 stale entries per tier per frame so room-hopping frees VRAM smoothly.
-        self.small.expire_stale(self.frame, &mut self.seen, None);
+        self.small.expire_stale(
+            self.frame,
+            &mut self.seen,
+            Some(&mut self.atlas.deferred_frees),
+        );
         self.large.expire_stale(self.frame, &mut self.seen, None);
-        self.subframe.expire_stale(self.frame, &mut self.seen, None);
+        self.subframe.expire_stale(
+            self.frame,
+            &mut self.seen,
+            Some(&mut self.atlas.deferred_frees),
+        );
     }
 
     pub fn get(&mut self, key: &CabContentKey) -> Option<&CachedCabTexture> {
@@ -909,8 +1057,19 @@ impl FilteredCabCache {
         }
     }
 
-    /// 2-hit admission filter: returns `true` if this key's hash was already seen before
-    /// AND the entry's tier has cold space to promote it without thrashing hot entries.
+    fn tier_under_half(&self, used_size: (u32, u32), is_subframe: bool) -> bool {
+        if is_subframe {
+            Self::is_small(used_size) && self.subframe.is_under_half()
+        } else if Self::is_small(used_size) {
+            self.small.is_under_half()
+        } else {
+            self.large.is_under_half()
+        }
+    }
+
+    /// Adaptive admission filter: promotes on first sight while the target tier is <50% full
+    /// (cutting 144 fps warmup time in half), and tightens to 2-hit admission once busy so
+    /// one-off particles never displace looping animations.
     pub fn should_promote(
         &mut self,
         key: &CabContentKey,
@@ -918,7 +1077,11 @@ impl FilteredCabCache {
         is_subframe: bool,
     ) -> bool {
         let h = key.fast_hash();
-        if self.seen.get(&h).is_some() {
+        let already_seen = self.seen.get(&h).is_some();
+        if !already_seen {
+            self.seen.put(h, ());
+        }
+        if already_seen || self.tier_under_half(used_size, is_subframe) {
             let ok = self.can_promote(used_size, is_subframe);
             if !ok {
                 let counter = if is_subframe {
@@ -932,15 +1095,23 @@ impl FilteredCabCache {
             }
             ok
         } else {
-            self.seen.put(h, ());
+            crate::perf_counters::count_named("cab-miss/1st-seen");
             false
         }
     }
 
-    pub fn allocate_texture(
+    /// Allocates storage for a promoted filtered CAB: small (`<= 254×254`) entries pack into
+    /// shared `2048×2048` linear-sampled atlas pages with a 1 px transparent border on all 4
+    /// sides; larger entries (or overflow) allocate standalone textures.
+    pub fn allocate_entry(
+        &mut self,
         descriptors: &Descriptors,
+        encoder: &mut wgpu::CommandEncoder,
         used_size: (u32, u32),
-    ) -> (wgpu::Texture, wgpu::BindGroup) {
+    ) -> CacheAllocation {
+        if let Some(alloc) = self.atlas.allocate(descriptors, Some(encoder), used_size) {
+            return alloc;
+        }
         let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
             label: create_debug_label!("Cached filtered CAB").as_deref(),
             size: wgpu::Extent3d {
@@ -975,59 +1146,53 @@ impl FilteredCabCache {
                 ],
                 label: create_debug_label!("Cached filtered CAB bind group").as_deref(),
             });
-        (texture, bind_group)
+        CacheAllocation {
+            texture,
+            view,
+            bind_group,
+            dst_origin: (0, 0),
+            atlas_size: used_size,
+            used_size,
+            uv_rect: None,
+            atlas_slot: None,
+        }
     }
 
-    pub fn insert(
+    pub fn cancel_allocation(&mut self, alloc: CacheAllocation) {
+        if let Some(slot) = alloc.atlas_slot {
+            self.atlas.deferred_frees.push(slot);
+        }
+    }
+
+    pub fn insert_entry(
         &mut self,
         key: CabContentKey,
-        texture: wgpu::Texture,
-        bind_group: wgpu::BindGroup,
-        used_size: (u32, u32),
+        alloc: CacheAllocation,
         is_subframe: bool,
     ) {
-        let view = texture.create_view(&Default::default());
         if is_subframe {
-            if Self::is_small(used_size) {
-                self.subframe.insert(
+            if Self::is_small(alloc.used_size) {
+                self.subframe.insert_alloc(
                     key,
-                    texture,
-                    view,
-                    bind_group,
-                    used_size,
-                    None,
-                    None,
+                    alloc,
                     self.frame,
                     &mut self.seen,
-                    None,
+                    Some(&mut self.atlas.deferred_frees),
                 );
+            } else {
+                self.cancel_allocation(alloc);
             }
-        } else if Self::is_small(used_size) {
-            self.small.insert(
+        } else if Self::is_small(alloc.used_size) {
+            self.small.insert_alloc(
                 key,
-                texture,
-                view,
-                bind_group,
-                used_size,
-                None,
-                None,
+                alloc,
                 self.frame,
                 &mut self.seen,
-                None,
+                Some(&mut self.atlas.deferred_frees),
             );
         } else {
-            self.large.insert(
-                key,
-                texture,
-                view,
-                bind_group,
-                used_size,
-                None,
-                None,
-                self.frame,
-                &mut self.seen,
-                None,
-            );
+            self.large
+                .insert_alloc(key, alloc, self.frame, &mut self.seen, None);
         }
     }
 }
@@ -1061,7 +1226,7 @@ impl BlendLayerCache {
             seen: LruCache::new(NonZeroUsize::new(SEEN_CAPACITY).unwrap()),
             small: CabTier::new(BLEND_SMALL_MAX_BYTES),
             large: CabTier::new(BLEND_LARGE_MAX_BYTES),
-            atlas: PersistentCacheAtlas::new(),
+            atlas: PersistentCacheAtlas::new(false, BLEND_ATLAS_MAX_PAGES),
             frame: 0,
         }
     }
@@ -1101,7 +1266,16 @@ impl BlendLayerCache {
 
     pub fn should_promote(&mut self, key: &CabContentKey, used_size: (u32, u32)) -> bool {
         let h = key.fast_hash();
-        if self.seen.get(&h).is_some() {
+        let already_seen = self.seen.get(&h).is_some();
+        if !already_seen {
+            self.seen.put(h, ());
+        }
+        let under_half = if Self::is_small(used_size) {
+            self.small.is_under_half()
+        } else {
+            self.large.is_under_half()
+        };
+        if already_seen || under_half {
             let bytes = used_size.0 as usize * used_size.1 as usize * 4;
             let ok = if Self::is_small(used_size) {
                 self.small.can_promote(bytes, self.frame)
@@ -1117,7 +1291,6 @@ impl BlendLayerCache {
             }
             ok
         } else {
-            self.seen.put(h, ());
             false
         }
     }
@@ -1130,7 +1303,7 @@ impl BlendLayerCache {
         descriptors: &Descriptors,
         used_size: (u32, u32),
     ) -> BlendCacheAllocation {
-        if let Some(alloc) = self.atlas.allocate(descriptors, used_size) {
+        if let Some(alloc) = self.atlas.allocate(descriptors, None, used_size) {
             return alloc;
         }
         let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
@@ -1173,6 +1346,7 @@ impl BlendLayerCache {
             view,
             bind_group,
             dst_origin: (0, 0),
+            atlas_size: used_size,
             used_size,
             uv_rect: None,
             atlas_slot: None,
@@ -1181,31 +1355,16 @@ impl BlendLayerCache {
 
     pub fn insert_entry(&mut self, key: CabContentKey, alloc: BlendCacheAllocation) {
         if Self::is_small(alloc.used_size) {
-            self.small.insert(
+            self.small.insert_alloc(
                 key,
-                alloc.texture,
-                alloc.view,
-                alloc.bind_group,
-                alloc.used_size,
-                alloc.uv_rect,
-                alloc.atlas_slot,
+                alloc,
                 self.frame,
                 &mut self.seen,
                 Some(&mut self.atlas.deferred_frees),
             );
         } else {
-            self.large.insert(
-                key,
-                alloc.texture,
-                alloc.view,
-                alloc.bind_group,
-                alloc.used_size,
-                alloc.uv_rect,
-                alloc.atlas_slot,
-                self.frame,
-                &mut self.seen,
-                None,
-            );
+            self.large
+                .insert_alloc(key, alloc, self.frame, &mut self.seen, None);
         }
     }
 }

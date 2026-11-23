@@ -813,13 +813,13 @@ impl MainWindow {
         }
         let total = drawn + skipped;
         // At 1-frame-per-refresh (e.g. 144 Hz, 6.9 ms/frame), dropping a level halves the
-        // frame rate (144 -> 72). When both GPU and CPU have clear headroom (<70% load),
+        // frame rate (144 -> 72). When both GPU and CPU have clear headroom (<80% load),
         // occasional single-subframe skips right behind heavy 24 fps game ticks still look
-        // much smoother at ~125-144 fps than halving to 72 fps; only treat >16.7% skipped
-        // as behind in that case (keeping the strict 10% threshold whenever load >= 70%).
+        // much smoother at ~120-144 fps than halving to 72 fps; only treat >16.7% skipped
+        // as behind in that case (keeping the strict 10% threshold whenever load >= 80%).
         let behind = if total == 0 {
             false
-        } else if self.every == *range.start() && load < 0.70 {
+        } else if self.every == *range.start() && load < 0.80 {
             skipped * 6 > total
         } else {
             skipped * 10 > total
@@ -827,24 +827,24 @@ impl MainWindow {
         let severely_behind = total > 0 && skipped * 4 > total;
         let was_behind = std::mem::replace(&mut adaptation.behind, behind);
         let on_trial = adaptation.since_raise.is_some();
-        let warming_top_rate = self.every == *range.start() && load < 0.85;
+        let warming_top_rate = self.every == *range.start() && load < 0.92;
         let swamped = total > 0 && skipped * 2 > total;
         let abort_trial = match adaptation.since_raise {
             // Raising to 1-frame-per-refresh introduces new interpolated subframe phases
-            // (e.g. 1/6, 3/6, 5/6 at 144 Hz) that need 2-3 seconds to warm up
-            // FilteredCabCache. Don't abort during the 3s warmup unless truly swamped
-            // (>50% skipped or >=90% load).
-            Some(0..=2) if warming_top_rate => swamped || load >= 0.90,
+            // (e.g. 1/6, 3/6, 5/6 at 144 Hz) that need up to 6 seconds in crowded rooms to
+            // warm up FilteredCabCache and BlendLayerCache. Don't abort during warmup
+            // unless truly swamped (>50% skipped or >=94% load).
+            Some(0..=5) if warming_top_rate => swamped || load >= 0.94,
             // The first second after raising often spans the rate transition; only abort
             // immediately if severely behind (>25% skipped).
             Some(0) => severely_behind,
-            // During the rest of the trial, abort immediately if load is high (>=75%) or
+            // During the rest of the trial, abort immediately if load is high (>=85%) or
             // severely behind; otherwise tolerate a single 1s transient blip (e.g. a combat
             // tick or spell load) and require 2 consecutive behind seconds like steady-state.
-            Some(_) => behind && (was_behind || severely_behind || load >= 0.75),
+            Some(_) => behind && (was_behind || severely_behind || load >= 0.85),
             None => false,
         };
-        let in_warmup = matches!(adaptation.since_raise, Some(0..=2)) && warming_top_rate;
+        let in_warmup = matches!(adaptation.since_raise, Some(0..=5)) && warming_top_rate;
         if (!in_warmup && behind && was_behind) || abort_trial {
             // Less often: every one more refresh.
             let fewer = (self.every < *range.end()).then(|| self.every + 1);

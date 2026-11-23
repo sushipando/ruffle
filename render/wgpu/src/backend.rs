@@ -984,12 +984,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             let mut pending_promotions: Vec<(
                 usize,
                 crate::filters::CabContentKey,
-                wgpu::Texture,
-                wgpu::BindGroup,
-                (u32, u32),
+                crate::filters::CacheAllocation,
                 bool,
             )> = Vec::new();
             let mut pending_persistent_keys: Vec<(usize, crate::filters::CabContentKey)> =
+                Vec::new();
+            let mut pending_slot_keys: Vec<(usize, Arc<crate::filters::CabContentKey>)> =
                 Vec::new();
             let mut dedup_leaders: std::collections::HashMap<
                 crate::filters::CabContentKey,
@@ -1044,12 +1044,23 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             entry.handle.clone(),
                             handle_ptr,
                             cached.bind_group.clone(),
-                            cached.used_size,
+                            cached.src_origin,
+                            cached.atlas_size,
                             entry.volatility,
+                            Some(Arc::new(key.clone())),
                         );
                     } else {
                         self.active_frame.command_encoder.copy_texture_to_texture(
-                            cached.texture.as_image_copy(),
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &cached.texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d {
+                                    x: cached.src_origin.0,
+                                    y: cached.src_origin.1,
+                                    z: 0,
+                                },
+                                aspect: Default::default(),
+                            },
                             cache_textures[index].as_image_copy(),
                             wgpu::Extent3d {
                                 width: used_size.0,
@@ -1096,22 +1107,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     if promote_eligible
                         && self.cab_cache.should_promote(&key, used_size, is_subframe)
                     {
-                        let (tex, bg) = crate::filters::FilteredCabCache::allocate_texture(
+                        let alloc = self.cab_cache.allocate_entry(
                             &self.descriptors,
+                            &mut self.active_frame.command_encoder,
                             used_size,
                         );
-                        promote_copy = Some(tex.clone());
-                        pending_promotions.push((
-                            ft_idx,
-                            key.clone(),
-                            tex,
-                            bg,
-                            used_size,
-                            is_subframe,
+                        promote_copy = Some((
+                            alloc.texture.clone(),
+                            alloc.dst_origin.0,
+                            alloc.dst_origin.1,
                         ));
+                        pending_promotions.push((ft_idx, key.clone(), alloc, is_subframe));
                     }
                     if is_persistent {
                         pending_persistent_keys.push((ft_idx, key.clone()));
+                    } else {
+                        pending_slot_keys.push((ft_idx, Arc::new(key.clone())));
                     }
                     dedup_leaders.insert(key, ft_idx);
                 } else if is_persistent {
@@ -1337,10 +1348,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             .borrow_mut() = Some(key);
                     }
                 }
-                for (ft_idx, key, tex, bg, used_size, is_subframe) in pending_promotions {
+                for (ft_idx, key) in pending_slot_keys {
                     if !skipped.contains(&ft_idx) {
-                        self.cab_cache.insert(key, tex, bg, used_size, is_subframe);
+                        self.filter_atlas
+                            .set_slot_key(filtered_together[ft_idx].handle_ptr, key);
+                    }
+                }
+                for (ft_idx, key, alloc, is_subframe) in pending_promotions {
+                    if !skipped.contains(&ft_idx) {
+                        self.cab_cache.insert_entry(key, alloc, is_subframe);
                         crate::perf_counters::count_named("cab-lru/promote");
+                    } else {
+                        self.cab_cache.cancel_allocation(alloc);
                     }
                 }
                 for (leader_ft_idx, handle, handle_ptr, tex, used_size, volatility, key) in
