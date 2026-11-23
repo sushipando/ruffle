@@ -32,7 +32,6 @@ use ruffle_render::shape_utils::DistilledShape;
 use ruffle_render::tessellator::ShapeTessellator;
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use swf::Color;
@@ -853,6 +852,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 .collect();
             let quality = self.surface.quality();
             let mut preserved_unfiltered_key = vec![false; levels.len()];
+            let filter_atlas_key_ref =
+                (!self.filter_atlas.slots.is_empty()).then_some(&self.filter_atlas);
             let atlased: Vec<_> = members
                 .iter()
                 .copied()
@@ -875,6 +876,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             quality,
                             &entry.filters,
                             &entry.commands,
+                            filter_atlas_key_ref,
                         )
                     {
                         if texture.last_cab_key.borrow().as_ref() == Some(&key) {
@@ -886,12 +888,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         *texture.last_cab_key.borrow_mut() = Some(key);
                         preserved_unfiltered_key[index] = true;
                     }
+                    texture.bump_generation_keeping_key();
                     Some(crate::surface::layer_atlas::LeafLayer {
                         commands: std::mem::take(&mut entry.commands),
                         origin: (0, 0),
                         width: w,
                         height: h,
-                        destination: Some(texture.texture.clone()),
+                        destination: Some((texture.texture.clone(), 0, 0)),
                         is_layer: false,
                     })
                 })
@@ -1009,12 +1012,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 let used_size = used_sizes[index];
                 let is_persistent = entry.volatility == CacheVolatility::Persistent;
                 let content_key = if direct_to_filter_atlas[index] && entry.clear.a == 0 {
+                    let filter_atlas_ref =
+                        (!self.filter_atlas.slots.is_empty()).then_some(&self.filter_atlas);
                     crate::filters::CabContentKey::try_from_entry(
                         used_size,
                         entry.clear,
                         quality,
                         &entry.filters,
                         &entry.commands,
+                        filter_atlas_ref,
                     )
                 } else {
                     None
@@ -1051,7 +1057,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                                 depth_or_array_layers: 1,
                             },
                         );
-                        *as_texture(&entry.handle).last_cab_key.borrow_mut() = Some(key.clone());
+                        let tex = as_texture(&entry.handle);
+                        tex.bump_generation_keeping_key();
+                        *tex.last_cab_key.borrow_mut() = Some(key.clone());
                     }
                     crate::perf_counters::count_named("cab-lru/hit");
                     continue;
@@ -1135,7 +1143,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 }
                 let texture = as_texture(&entry.handle);
                 if !in_filtered_together[index] && !preserved_unfiltered_key[index] {
-                    *texture.last_cab_key.borrow_mut() = None;
+                    texture.bump_generation();
+                } else if !atlased || !filter_batched[index] {
+                    texture.bump_generation_keeping_key();
                 }
                 let surface = Surface::new(
                     &self.descriptors,
@@ -1315,6 +1325,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         &entry.filters,
                     );
                 }
+                for entry in &filtered_together {
+                    if entry.volatility == CacheVolatility::Persistent {
+                        as_texture(&entry.handle).bump_generation_keeping_key();
+                    }
+                }
                 for (ft_idx, key) in pending_persistent_keys {
                     if !skipped.contains(&ft_idx) {
                         *as_texture(&filtered_together[ft_idx].handle)
@@ -1362,8 +1377,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             );
                         }
                         if volatility == CacheVolatility::Persistent {
-                            *as_texture(&handle).last_cab_key.borrow_mut() =
-                                (!leader_skipped).then_some(key);
+                            let tex_obj = as_texture(&handle);
+                            tex_obj.bump_generation_keeping_key();
+                            *tex_obj.last_cab_key.borrow_mut() = (!leader_skipped).then_some(key);
                         }
                     }
                 }
@@ -1675,15 +1691,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
-        let handle = BitmapHandle(Arc::new(Texture {
-            texture,
-            repeating_linear: Default::default(),
-            repeating_nearest: Default::default(),
-            clamped_linear: Default::default(),
-            clamped_nearest: Default::default(),
-            copy_count: Cell::new(0),
-            last_cab_key: Default::default(),
-        }));
+        let handle = BitmapHandle(Arc::new(Texture::new(texture)));
 
         Ok(handle)
     }
@@ -1702,7 +1710,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
 
         let texture = as_texture(handle);
-        *texture.last_cab_key.borrow_mut() = None;
+        texture.bump_generation();
 
         let mut bitmap = bitmap.to_rgba();
         if self.clamp_bitmap(&mut bitmap) {
@@ -1752,7 +1760,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) -> Option<Box<dyn SyncHandle>> {
         self.finish_pending_shapes();
         let texture = as_texture(&handle);
-        *texture.last_cab_key.borrow_mut() = None;
+        texture.bump_generation();
 
         let extent = wgpu::Extent3d {
             width: texture.texture.width(),
@@ -1830,6 +1838,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) -> Option<Box<dyn SyncHandle>> {
         let source_texture = as_texture(&source);
         let dest_texture = as_texture(&destination);
+        dest_texture.bump_generation();
 
         let copy_area = PixelRegion::for_whole_size(
             dest_texture.texture.width(),
@@ -1962,20 +1971,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
                     });
-                BitmapHandle(Arc::new(Texture {
-                    texture,
-                    repeating_linear: Default::default(),
-                    repeating_nearest: Default::default(),
-                    clamped_linear: Default::default(),
-                    clamped_nearest: Default::default(),
-                    copy_count: Cell::new(0),
-                    last_cab_key: Default::default(),
-                }))
+                BitmapHandle(Arc::new(Texture::new(texture)))
             }
         };
 
         let target_texture = as_texture(&target_handle);
-        *target_texture.last_cab_key.borrow_mut() = None;
+        target_texture.bump_generation();
 
         let extent = wgpu::Extent3d {
             width: target_texture.texture.width(),
@@ -2124,15 +2125,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
-        Ok(BitmapHandle(Arc::new(Texture {
-            texture,
-            repeating_linear: Default::default(),
-            repeating_nearest: Default::default(),
-            clamped_linear: Default::default(),
-            clamped_nearest: Default::default(),
-            copy_count: Cell::new(0),
-            last_cab_key: Default::default(),
-        })))
+        Ok(BitmapHandle(Arc::new(Texture::new(texture))))
     }
 
     fn resolve_sync_handle(

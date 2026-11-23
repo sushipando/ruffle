@@ -35,7 +35,7 @@ pub struct CommandRenderer<'encoder> {
     atlas_bind_groups: &'encoder [wgpu::BindGroup],
     filter_atlas_bind_groups: &'encoder [wgpu::BindGroup],
     last_pipeline: Option<*const wgpu::RenderPipeline>,
-    last_bind_group_2: Option<*const wgpu::BindGroup>,
+    last_bind_group_2: Option<&'encoder wgpu::BindGroup>,
     last_stencil_ref: Option<u32>,
     last_vertex_buffer: Option<(*const wgpu::Buffer, u64, u64)>,
     last_index_buffer: Option<(*const wgpu::Buffer, u64, u64)>,
@@ -92,9 +92,8 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut wgpu::RenderPass<'encoder>,
         bind_group: &'encoder wgpu::BindGroup,
     ) {
-        let ptr = bind_group as *const wgpu::BindGroup;
-        if self.last_bind_group_2 != Some(ptr) {
-            self.last_bind_group_2 = Some(ptr);
+        if self.last_bind_group_2 != Some(bind_group) {
+            self.last_bind_group_2 = Some(bind_group);
             render_pass.set_bind_group(2, bind_group, &[]);
         }
     }
@@ -148,14 +147,28 @@ impl<'encoder> CommandRenderer<'encoder> {
                 _texture,
                 binds,
                 instance_index,
+                vertex_offset,
                 blend_mode,
-            } => self.render_texture(render_pass, *instance_index, binds, *blend_mode),
+            } => self.render_texture(
+                render_pass,
+                *instance_index,
+                binds,
+                *vertex_offset,
+                *blend_mode,
+            ),
             DrawCommand::FetchBlend {
                 _texture,
                 binds,
                 instance_index,
+                vertex_offset,
                 blend_mode,
-            } => self.render_fetch_blend(render_pass, *instance_index, binds, *blend_mode),
+            } => self.render_fetch_blend(
+                render_pass,
+                *instance_index,
+                binds,
+                *vertex_offset,
+                *blend_mode,
+            ),
             DrawCommand::RenderAtlasLayer {
                 atlas_index,
                 instance_index,
@@ -282,6 +295,18 @@ impl<'encoder> CommandRenderer<'encoder> {
         num_indices: u32,
         instance_index: u32,
     ) {
+        self.draw_with_base_vertex(render_pass, vertices, indices, num_indices, 0, instance_index);
+    }
+
+    pub fn draw_with_base_vertex(
+        &mut self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        vertices: wgpu::BufferSlice<'encoder>,
+        indices: wgpu::BufferSlice<'encoder>,
+        num_indices: u32,
+        base_vertex: i32,
+        instance_index: u32,
+    ) {
         let vb_key = (
             vertices.buffer() as *const wgpu::Buffer,
             vertices.offset(),
@@ -301,7 +326,41 @@ impl<'encoder> CommandRenderer<'encoder> {
             render_pass.set_index_buffer(indices, wgpu::IndexFormat::Uint32);
         }
 
-        render_pass.draw_indexed(0..num_indices, 0, instance_index..(instance_index + 1));
+        render_pass.draw_indexed(
+            0..num_indices,
+            base_vertex,
+            instance_index..(instance_index + 1),
+        );
+    }
+
+    #[inline]
+    fn draw_quad_with_vertex_offset(
+        &mut self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        vertex_offset: Option<wgpu::BufferAddress>,
+        instance_index: u32,
+    ) {
+        if let Some(vertex_offset) = vertex_offset {
+            let stride = size_of::<PosUvVertex>() as u64;
+            debug_assert_eq!(vertex_offset % stride, 0);
+            let base_vertex = (vertex_offset / stride) as i32;
+            self.draw_with_base_vertex(
+                render_pass,
+                self.dynamic_vertex_buffer.slice(self.dynamic_vertex_base..),
+                self.descriptors.quad.indices.slice(..),
+                6,
+                base_vertex,
+                instance_index,
+            );
+        } else {
+            self.draw(
+                render_pass,
+                self.descriptors.quad.vertices_pos_uv.slice(..),
+                self.descriptors.quad.indices.slice(..),
+                6,
+                instance_index,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -347,20 +406,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             }
         }
 
-        let vertex_slice = if let Some(vertex_offset) = vertex_offset {
-            self.dynamic_vertex_buffer
-                .slice(self.dynamic_vertex_base + vertex_offset..)
-        } else {
-            self.descriptors.quad.vertices_pos_uv.slice(..)
-        };
-
-        self.draw(
-            render_pass,
-            vertex_slice,
-            self.descriptors.quad.indices.slice(..),
-            6,
-            instance_index,
-        );
+        self.draw_quad_with_vertex_offset(render_pass, vertex_offset, instance_index);
     }
 
     pub fn render_texture(
@@ -368,17 +414,12 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut wgpu::RenderPass<'encoder>,
         instance_index: u32,
         bind_group: &'encoder wgpu::BindGroup,
+        vertex_offset: Option<wgpu::BufferAddress>,
         blend_mode: TrivialBlend,
     ) {
         self.prep_bitmap(render_pass, bind_group, blend_mode, false);
 
-        self.draw(
-            render_pass,
-            self.descriptors.quad.vertices_pos_uv.slice(..),
-            self.descriptors.quad.indices.slice(..),
-            6,
-            instance_index,
-        );
+        self.draw_quad_with_vertex_offset(render_pass, vertex_offset, instance_index);
     }
 
     pub fn render_fetch_blend(
@@ -386,6 +427,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut wgpu::RenderPass<'encoder>,
         instance_index: u32,
         bind_group: &'encoder wgpu::BindGroup,
+        vertex_offset: Option<wgpu::BufferAddress>,
         blend_mode: ComplexBlend,
     ) {
         let pipelines = &self
@@ -400,13 +442,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         };
         self.set_pipeline(render_pass, pipeline);
         self.set_bind_group_2(render_pass, bind_group);
-        self.draw(
-            render_pass,
-            self.descriptors.quad.vertices_pos_uv.slice(..),
-            self.descriptors.quad.indices.slice(..),
-            6,
-            instance_index,
-        );
+        self.draw_quad_with_vertex_offset(render_pass, vertex_offset, instance_index);
     }
 
     pub fn render_atlas_layer(
@@ -437,14 +473,7 @@ impl<'encoder> CommandRenderer<'encoder> {
                 self.set_bind_group_2(render_pass, bind_group);
             }
         }
-        self.draw(
-            render_pass,
-            self.dynamic_vertex_buffer
-                .slice(self.dynamic_vertex_base + vertex_offset..),
-            self.descriptors.quad.indices.slice(..),
-            6,
-            instance_index,
-        );
+        self.draw_quad_with_vertex_offset(render_pass, Some(vertex_offset), instance_index);
     }
 
     pub fn render_filter_atlas(
@@ -476,14 +505,7 @@ impl<'encoder> CommandRenderer<'encoder> {
                 self.set_bind_group_2(render_pass, bind_group);
             }
         }
-        self.draw(
-            render_pass,
-            self.dynamic_vertex_buffer
-                .slice(self.dynamic_vertex_base + vertex_offset..),
-            self.descriptors.quad.indices.slice(..),
-            6,
-            instance_index,
-        );
+        self.draw_quad_with_vertex_offset(render_pass, Some(vertex_offset), instance_index);
     }
 
     pub fn render_shape(
@@ -738,6 +760,7 @@ pub enum DrawCommand {
         _texture: PoolOrArcTexture,
         binds: wgpu::BindGroup,
         instance_index: u32,
+        vertex_offset: Option<wgpu::BufferAddress>,
         blend_mode: TrivialBlend,
     },
     /// A complex blend that reads the backdrop from the color attachment.
@@ -745,6 +768,7 @@ pub enum DrawCommand {
         _texture: PoolOrArcTexture,
         binds: wgpu::BindGroup,
         instance_index: u32,
+        vertex_offset: Option<wgpu::BufferAddress>,
         blend_mode: ComplexBlend,
     },
     /// A leaf blend layer sampled directly from its slot in a shared layer atlas.
@@ -824,10 +848,7 @@ pub enum LayerRef<'a> {
 /// Every complex blend will be its own item, but every other draw will be chunked together
 pub type PendingBlendPromotion = (
     crate::filters::CabContentKey,
-    wgpu::Texture,
-    wgpu::TextureView,
-    wgpu::BindGroup,
-    (u32, u32),
+    crate::filters::BlendCacheAllocation,
 );
 
 #[expect(clippy::too_many_arguments)]
@@ -1591,39 +1612,59 @@ impl WgpuCommandHandler<'_, '_> {
         let emit_inline_texture = |this: &mut Self,
                                    texture: PoolOrArcTexture,
                                    bind_group: wgpu::BindGroup,
+                                   uv_rect: Option<[f32; 4]>,
                                    shape_blend: ShapeBlend| {
             let matrix = Matrix::translate(
                 Twips::from_pixels_i32(origin.0),
                 Twips::from_pixels_i32(origin.1),
             ) * Matrix::scale(width as f32, height as f32);
+            let quad = uv_rect.map(|[u0, v0, u1, v1]| {
+                [
+                    PosUvVertex::new(0.0, 0.0, u0, v0, 1.0),
+                    PosUvVertex::new(1.0, 0.0, u1, v0, 1.0),
+                    PosUvVertex::new(1.0, 1.0, u1, v1, 1.0),
+                    PosUvVertex::new(0.0, 1.0, u0, v1, 1.0),
+                ]
+            });
+            let vertices_slice = quad.as_ref().map(|q| &q[..]);
             match shape_blend {
                 ShapeBlend::Fetch(blend_mode) => {
                     crate::perf_counters::count_named("fetch-blend");
-                    this.add_to_current(matrix, 0.0, Default::default(), |instance_index| {
-                        DrawCommand::FetchBlend {
+                    this.add_to_current_with_vertices(
+                        matrix,
+                        0.0,
+                        Default::default(),
+                        vertices_slice,
+                        |instance_index, vertex_offset| DrawCommand::FetchBlend {
                             _texture: texture,
                             binds: bind_group,
                             instance_index,
+                            vertex_offset,
                             blend_mode,
-                        }
-                    });
+                        },
+                    );
                 }
                 ShapeBlend::Trivial(blend_mode) => {
                     crate::perf_counters::count(crate::perf_counters::Counter::BlendTrivial);
-                    this.add_to_current(matrix, 0.0, Default::default(), |instance_index| {
-                        DrawCommand::RenderTexture {
+                    this.add_to_current_with_vertices(
+                        matrix,
+                        0.0,
+                        Default::default(),
+                        vertices_slice,
+                        |instance_index, vertex_offset| DrawCommand::RenderTexture {
                             _texture: texture,
                             binds: bind_group,
                             instance_index,
+                            vertex_offset,
                             blend_mode,
-                        }
-                    });
+                        },
+                    );
                 }
             }
         };
 
         // Content-addressed blend-layer LRU cache: skip 4× MSAA offscreen rasterization
-        // completely for static/24fps-animated/looping pure-vector blend layers.
+        // completely for static/24fps-animated/looping blend layers.
         let blend_key = if let Some(shape_blend) = inline_blend
             && matches!(self.nearest_layer, LayerRef::None)
             && self.blend_cache.is_some()
@@ -1641,14 +1682,16 @@ impl WgpuCommandHandler<'_, '_> {
                 self.quality,
                 is_layer,
                 &commands,
+                self.filter_atlas,
             );
             if let Some(ref k) = key
                 && let Some(cached) = self.blend_cache.as_deref_mut().and_then(|c| c.get(k))
             {
                 let tex = PoolOrArcTexture::Manual((cached.texture.clone(), cached.view.clone()));
                 let bg = cached.bind_group.clone();
+                let uv_rect = cached.uv_rect;
                 crate::perf_counters::count_named("blend-lru/hit");
-                emit_inline_texture(self, tex, bg, shape_blend);
+                emit_inline_texture(self, tex, bg, uv_rect, shape_blend);
                 return;
             }
             key
@@ -1657,6 +1700,10 @@ impl WgpuCommandHandler<'_, '_> {
         };
 
         let promote_key = if let Some(key) = blend_key
+            && !self
+                .pending_blend_promotions
+                .iter()
+                .any(|(pending_key, _)| *pending_key == key)
             && self
                 .blend_cache
                 .as_deref_mut()
@@ -1672,31 +1719,30 @@ impl WgpuCommandHandler<'_, '_> {
             && layer_atlas::is_leaf(self.descriptors, &commands, width, height, is_layer);
 
         if use_leaf_atlas && let Some(shape_blend) = inline_blend {
-            if let Some(key) = promote_key {
-                let (tex, view, bind_group) = crate::filters::BlendLayerCache::allocate_texture(
-                    self.descriptors,
-                    (width, height),
-                );
+            if let Some(key) = promote_key
+                && let Some(cache) = self.blend_cache.as_deref_mut()
+            {
+                let alloc = cache.allocate_entry(self.descriptors, (width, height));
+                let tex = alloc.texture.clone();
+                let view = alloc.view.clone();
+                let bind_group = alloc.bind_group.clone();
+                let uv_rect = alloc.uv_rect;
+                let (dst_x, dst_y) = alloc.dst_origin;
                 self.leaf_layers.push(layer_atlas::LeafLayer {
                     commands,
                     origin,
                     width,
                     height,
-                    destination: Some(tex.clone()),
+                    destination: Some((tex.clone(), dst_x, dst_y)),
                     is_layer,
                 });
-                self.pending_blend_promotions.push((
-                    key,
-                    tex.clone(),
-                    view.clone(),
-                    bind_group.clone(),
-                    (width, height),
-                ));
+                self.pending_blend_promotions.push((key, alloc));
                 crate::perf_counters::count_named("blend-lru/promote");
                 emit_inline_texture(
                     self,
                     PoolOrArcTexture::Manual((tex, view)),
                     bind_group,
+                    uv_rect,
                     shape_blend,
                 );
                 return;
@@ -1756,7 +1802,7 @@ impl WgpuCommandHandler<'_, '_> {
                 origin,
                 width,
                 height,
-                destination: Some(texture.0.clone()),
+                destination: Some((texture.0.clone(), 0, 0)),
                 is_layer,
             });
             PoolOrArcTexture::Pool(texture)
@@ -1786,34 +1832,39 @@ impl WgpuCommandHandler<'_, '_> {
             let rendered = target.take_color_texture();
             if let Some(key) = promote_key
                 && let Some(shape_blend) = inline_blend
+                && let Some(cache) = self.blend_cache.as_deref_mut()
             {
-                let (tex, view, bind_group) = crate::filters::BlendLayerCache::allocate_texture(
-                    self.descriptors,
-                    (width, height),
-                );
+                let alloc = cache.allocate_entry(self.descriptors, (width, height));
+                let tex = alloc.texture.clone();
+                let view = alloc.view.clone();
+                let bind_group = alloc.bind_group.clone();
+                let uv_rect = alloc.uv_rect;
+                let (dst_x, dst_y) = alloc.dst_origin;
                 self.draw_encoder.copy_texture_to_texture(
                     rendered.texture().as_image_copy(),
-                    tex.as_image_copy(),
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: dst_x,
+                            y: dst_y,
+                            z: 0,
+                        },
+                        aspect: Default::default(),
+                    },
                     wgpu::Extent3d {
                         width,
                         height,
                         depth_or_array_layers: 1,
                     },
                 );
-                if let Some(cache) = self.blend_cache.as_deref_mut() {
-                    cache.insert(
-                        key,
-                        tex.clone(),
-                        view.clone(),
-                        bind_group.clone(),
-                        (width, height),
-                    );
-                    crate::perf_counters::count_named("blend-lru/promote");
-                }
+                cache.insert_entry(key, alloc);
+                crate::perf_counters::count_named("blend-lru/promote");
                 emit_inline_texture(
                     self,
                     PoolOrArcTexture::Manual((tex, view)),
                     bind_group,
+                    uv_rect,
                     shape_blend,
                 );
                 return;
@@ -1840,6 +1891,7 @@ impl WgpuCommandHandler<'_, '_> {
                         _texture: texture,
                         binds: bind_group,
                         instance_index,
+                        vertex_offset: None,
                         blend_mode,
                     },
                 );
@@ -1864,6 +1916,7 @@ impl WgpuCommandHandler<'_, '_> {
                         _texture: texture,
                         binds: bind_group,
                         instance_index,
+                        vertex_offset: None,
                         blend_mode,
                     },
                 );

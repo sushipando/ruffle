@@ -227,8 +227,8 @@ impl Surface {
             None
         };
         if let Some(cache) = blend_cache {
-            for (key, tex, view, bind_group, used_size) in pending_blend_promotions {
-                cache.insert(key, tex, view, bind_group, used_size);
+            for (key, alloc) in pending_blend_promotions {
+                cache.insert_entry(key, alloc);
             }
         }
         let atlas_bind_groups = atlas_layers

@@ -16,13 +16,24 @@ pub struct TransformStack(Vec<Transform>);
 
 impl TransformStack {
     pub fn new() -> Self {
-        Self(vec![Transform::default()])
+        let mut stack = Vec::with_capacity(16);
+        stack.push(Transform::default());
+        Self(stack)
     }
 
+    #[inline]
     pub fn push(&mut self, transform: &Transform) {
-        let cur_transform = self.transform();
-        let matrix = cur_transform.matrix * transform.matrix;
-        let color_transform = cur_transform.color_transform * transform.color_transform;
+        let cur_transform = self.0.last().expect("Transform stack underflow");
+        let matrix = if transform.matrix == Matrix::IDENTITY {
+            cur_transform.matrix
+        } else {
+            cur_transform.matrix * transform.matrix
+        };
+        let color_transform = if transform.color_transform == ColorTransform::IDENTITY {
+            cur_transform.color_transform
+        } else {
+            cur_transform.color_transform * transform.color_transform
+        };
         let tz = cur_transform.tz + transform.tz;
         self.0.push(Transform {
             matrix,
@@ -33,13 +44,20 @@ impl TransformStack {
         });
     }
 
+    #[inline]
     pub fn pop(&mut self) {
         assert!(self.0.len() > 1, "Transform stack underflow");
         self.0.pop();
     }
 
+    #[inline]
     pub fn transform(&self) -> Transform {
         self.0[self.0.len() - 1].clone()
+    }
+
+    #[inline]
+    pub fn transform_ref(&self) -> &Transform {
+        &self.0[self.0.len() - 1]
     }
 }
 

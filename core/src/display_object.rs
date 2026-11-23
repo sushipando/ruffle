@@ -552,6 +552,7 @@ struct ChildRuns {
     runs: Vec<CachedChildRun>,
     last_scan_tick: u32,
     evictions: u8,
+    empty_scans: u8,
 }
 
 pub(crate) struct ActiveChildRun {
@@ -682,14 +683,22 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.place_frame.set(frame);
     }
 
+    #[inline]
     fn transform(&self, apply_matrix: bool) -> Transform {
+        let raw_matrix = self.matrix.get();
+        let raw_ct = self.color_transform.get();
+        let (matrix, color_transform) = if apply_matrix {
+            self.interpolation
+                .matrix_and_color_transform(raw_matrix, raw_ct)
+        } else {
+            (
+                Matrix::IDENTITY,
+                self.interpolation.color_transform(raw_matrix, raw_ct),
+            )
+        };
         Transform {
-            matrix: if apply_matrix {
-                self.matrix()
-            } else {
-                Matrix::IDENTITY
-            },
-            color_transform: self.color_transform(),
+            matrix,
+            color_transform,
             perspective_projection: self.perspective_projection.get(),
             tz: self.tz.get(),
         }
@@ -1889,6 +1898,7 @@ pub(crate) fn prepare_child_runs<'gc>(
             runs: Vec::new(),
             last_scan_tick: tick,
             evictions: 0,
+            empty_scans: 0,
         });
         let parent_linear_same = cr.parent_matrix.a == parent_tx.matrix.a
             && cr.parent_matrix.b == parent_tx.matrix.b
@@ -1907,6 +1917,7 @@ pub(crate) fn prepare_child_runs<'gc>(
             cr.viewport_bounds = viewport_bounds;
             cr.num_children = num_children;
             cr.last_scan_tick = tick;
+            cr.empty_scans = 0;
         } else if !cr.runs.is_empty() {
             let raw = container.raw_container();
             let mut any_evicted = false;
@@ -1928,6 +1939,7 @@ pub(crate) fn prepare_child_runs<'gc>(
             if any_evicted {
                 cr.evictions = cr.evictions.saturating_add(1);
                 cr.last_scan_tick = tick;
+                cr.empty_scans = 0;
             }
             for run in &cr.runs {
                 let dx = parent_tx.matrix.tx - run.parent_tx.x;
@@ -1947,7 +1959,7 @@ pub(crate) fn prepare_child_runs<'gc>(
         if !interpolation::is_inter_frame()
             && AUTO_CACHE_BYTES.load(Ordering::Relaxed) < MAX_AUTO_CACHE_BYTES
         {
-            let required_ticks = AUTO_CACHE_STABLE_TICKS << cr.evictions.min(3);
+            let required_ticks = AUTO_CACHE_STABLE_TICKS << cr.evictions.max(cr.empty_scans).min(3);
             if tick.wrapping_sub(cr.last_scan_tick) >= required_ticks
                 && tick.wrapping_sub(base.last_linear_transform_tick.get()) >= required_ticks
                 && ancestors_linear_transform_stable(container_obj, tick, required_ticks)
@@ -2249,6 +2261,7 @@ pub(crate) fn prepare_child_runs<'gc>(
         let base = container_obj.base();
         let mut cell = base.cell.borrow_mut();
         if let Some(cr) = &mut cell.child_runs {
+            cr.empty_scans = 0;
             for run in new_runs {
                 active.push(ActiveChildRun {
                     start_idx: run.start_idx,
@@ -2264,6 +2277,12 @@ pub(crate) fn prepare_child_runs<'gc>(
             }
             cr.runs.sort_by_key(|r| r.start_idx);
             active.sort_by_key(|r| r.start_idx);
+        }
+    } else {
+        let base = container_obj.base();
+        let mut cell = base.cell.borrow_mut();
+        if let Some(cr) = &mut cell.child_runs {
+            cr.empty_scans = cr.empty_scans.saturating_add(1).min(3);
         }
     }
 
@@ -2290,6 +2309,7 @@ pub(crate) struct BackdropCache {
     pub(crate) nodes: Vec<BackdropNodeKey>,
     pub(crate) built_tick: u32,
     pub(crate) checked_tick: u32,
+    pub(crate) last_full_scan_tick: u32,
     pub(crate) bytes: usize,
 }
 
@@ -2304,6 +2324,7 @@ impl Clone for BackdropCache {
             nodes: self.nodes.clone(),
             built_tick: self.built_tick,
             checked_tick: self.checked_tick,
+            last_full_scan_tick: self.last_full_scan_tick,
             bytes: self.bytes,
         }
     }
@@ -2493,6 +2514,92 @@ fn collect_backdrop_prefix<'gc>(
     true
 }
 
+/// Fast O(cached_nodes.len()) validation of an existing `BackdropCache`'s leading prefix
+/// without descending into any cached node's subtree with `check_auto_cache_node`.
+/// Returns `Ok(true)` if all `cached_nodes` were matched in exact painter's order,
+/// `Ok(false)` if still matching (caller continues to next sibling), or `Err(())` on mismatch.
+pub(crate) fn verify_backdrop_prefix<'gc>(
+    container: DisplayObject<'gc>,
+    parent_matrix: Matrix,
+    parent_ct: ColorTransform,
+    cached_nodes: &[BackdropNodeKey],
+    cursor: &mut usize,
+) -> Result<bool, ()> {
+    let Some(c) = container.as_container() else {
+        return Err(());
+    };
+    for child in c.iter_render_list() {
+        if *cursor == cached_nodes.len() {
+            return Ok(true);
+        }
+        if child.clip_depth() > 0 {
+            return Err(());
+        }
+        if !child.visible() || child.maskee().is_some() {
+            continue;
+        }
+        let base = child.base();
+        if base.z() != 0.0 {
+            return Err(());
+        }
+        let child_tx = base.transform(true);
+        let child_matrix = parent_matrix * child_tx.matrix;
+        let child_ct = parent_ct * child_tx.color_transform;
+        let blend_mode = child.blend_mode();
+        if matches!(
+            blend_mode,
+            ExtendedBlendMode::Alpha | ExtendedBlendMode::Erase | ExtendedBlendMode::Shader
+        ) {
+            return Err(());
+        }
+        let expected = &cached_nodes[*cursor];
+        let ptr = Gc::as_ptr(base) as usize;
+        if ptr == expected.ptr {
+            let mask_ok = match child.masker() {
+                None => true,
+                Some(mask) => {
+                    is_descendant_of(mask, child)
+                        && !mask.base().contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+                }
+            };
+            if !base.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED)
+                && mask_ok
+                && base.last_invalidated_tick.get() == expected.last_inv_tick
+                && child_matrix == expected.matrix
+                && child_ct == expected.color_transform
+            {
+                *cursor += 1;
+                if *cursor == cached_nodes.len() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            return Err(());
+        }
+
+        // Not the expected cached node itself: descend into transparent pass-through
+        // containers (same rule as `collect_backdrop_prefix`).
+        let can_descend = blend_mode == ExtendedBlendMode::Normal
+            && child.masker().is_none()
+            && child.scroll_rect().is_none()
+            && child.opaque_background().is_none()
+            && !child.is_bitmap_cached()
+            && match child {
+                DisplayObject::MovieClip(mc) => mc.drawing().is_none(),
+                DisplayObject::LoaderDisplay(_) => true,
+                _ => false,
+            };
+        if can_descend {
+            if verify_backdrop_prefix(child, child_matrix, child_ct, cached_nodes, cursor)? {
+                return Ok(true);
+            }
+        } else {
+            return Err(());
+        }
+    }
+    Ok(*cursor == cached_nodes.len())
+}
+
 /// Attempts to satisfy the stage's leading static layers from `Stage::backdrop_cache`.
 /// When active, emits a single bitmap draw for the cached backdrop and populates
 /// `stage`'s skip list so `render_children` skips those prefix nodes in O(1).
@@ -2545,6 +2652,32 @@ pub(crate) fn render_stage_backdrop<'gc>(
             );
             stage.set_backdrop_skip(ptrs);
         }
+        return;
+    }
+
+    // Fast movie-tick hit: validate only the already-cached prefix nodes in O(prefix.len())
+    // without re-walking their subtrees via `check_auto_cache_node` (re-scan for a larger
+    // prefix at most once every 48 ticks).
+    if let Some((bitmap, origin, ptrs)) =
+        stage.try_fast_backdrop_tick_hit(bg, viewport_bounds, viewport_matrix, tick)
+    {
+        let region = bitmap.full_region();
+        context.commands.render_bitmap(
+            bitmap.handle,
+            Transform {
+                matrix: Matrix::translate(
+                    Twips::from_pixels_i32(origin.x),
+                    Twips::from_pixels_i32(origin.y),
+                ),
+                color_transform: Default::default(),
+                perspective_projection: None,
+                tz: 0.0,
+            },
+            false,
+            PixelSnapping::Always,
+            region,
+        );
+        stage.set_backdrop_skip(ptrs);
         return;
     }
 
@@ -2692,6 +2825,7 @@ pub(crate) fn render_stage_backdrop<'gc>(
         nodes: keys,
         built_tick: tick,
         checked_tick: tick,
+        last_full_scan_tick: tick,
         bytes,
     });
     stage.set_backdrop_skip(skip_ptrs);
@@ -3234,6 +3368,9 @@ fn blend_layer_bounds_impl<'gc>(
 
     if let Some(ctr) = this.as_container() {
         for child in ctr.iter_render_list() {
+            if !child.visible() || child.maskee().is_some() {
+                continue;
+            }
             let matrix = *matrix * child.base().matrix();
             bounds = bounds.union(&blend_layer_bounds_impl(
                 child,

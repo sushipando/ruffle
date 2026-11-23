@@ -6,7 +6,7 @@ use ruffle_render::backend::{
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::error::Error;
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use swf::{Rectangle, Twips};
 
 use wgpu::util::StagingBelt;
@@ -110,15 +110,7 @@ impl WgpuContext3D {
                 usage: wgpu::TextureUsages::COPY_SRC,
             });
 
-            BitmapHandle(Arc::new(Texture {
-                repeating_linear: Default::default(),
-                repeating_nearest: Default::default(),
-                clamped_linear: Default::default(),
-                clamped_nearest: Default::default(),
-                texture: dummy_texture,
-                copy_count: Cell::new(0),
-                last_cab_key: Default::default(),
-            }))
+            BitmapHandle(Arc::new(Texture::new(dummy_texture)))
         };
 
         let back_buffer_raw_texture_handle = make_dummy_handle();
@@ -647,46 +639,19 @@ impl Context3D for WgpuContext3D {
                     // We always use a non-multisampled texture as our raw texture handle,
                     // which is what the Stage rendering code expects. In multisample mode,
                     // this is our resolve texture.
-                    self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        texture: back_buffer_resolve_texture.unwrap(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
-                        last_cab_key: Default::default(),
-                    }));
-                    self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        texture: front_buffer_resolve_texture.unwrap(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
-                        last_cab_key: Default::default(),
-                    }));
+                    self.back_buffer_raw_texture_handle =
+                        BitmapHandle(Arc::new(Texture::new(back_buffer_resolve_texture.unwrap())));
+                    self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture::new(
+                        front_buffer_resolve_texture.unwrap(),
+                    )));
                 } else {
                     // In non-multisample mode, we don't have a separate resolve buffer,
                     // so our main texture gets used as the raw texture handle.
 
-                    self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        texture: back_buffer_texture,
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
-                        last_cab_key: Default::default(),
-                    }));
-                    self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        texture: front_buffer_texture,
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
-                        last_cab_key: Default::default(),
-                    }));
+                    self.back_buffer_raw_texture_handle =
+                        BitmapHandle(Arc::new(Texture::new(back_buffer_texture)));
+                    self.front_buffer_raw_texture_handle =
+                        BitmapHandle(Arc::new(Texture::new(front_buffer_texture)));
                     self.current_texture_resolve_view = None;
                 }
 

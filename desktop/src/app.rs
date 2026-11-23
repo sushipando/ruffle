@@ -225,8 +225,8 @@ impl MainWindow {
                     if slack >= Duration::from_micros(2200) {
                         let budget = slack
                             .saturating_sub(Duration::from_micros(1500))
-                            .min(Duration::from_micros(1000));
-                        player.collect_gc_slice(budget);
+                            .min(Duration::from_micros(2500));
+                        player.collect_gc_slice_strict(budget);
                     }
                 }
             }

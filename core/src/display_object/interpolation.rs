@@ -130,10 +130,9 @@ pub fn track_blended<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (result, inner)
 }
 
-/// A display object's transform from before the movie frame `tick` first changed it.
+/// A display object's transform from before the movie frame `previous_tick` first changed it.
 #[derive(Clone, Copy)]
 struct PreviousTransform {
-    tick: u32,
     matrix: Matrix,
     color_transform: ColorTransform,
 }
@@ -153,6 +152,9 @@ struct Blended {
 pub struct InterpolationData {
     /// The movie frame in which the object was created or placed: it isn't blended then.
     born: Cell<u32>,
+    /// Fast 4-byte tag mirroring `previous.map(|p| p.tick).unwrap_or(0)` so static objects
+    /// skip copying the 56-byte `Option<PreviousTransform>` and TLS lookups on every render.
+    previous_tick: Cell<u32>,
     previous: Cell<Option<PreviousTransform>>,
     blended: Cell<Option<Blended>>,
 }
@@ -161,6 +163,7 @@ impl Default for InterpolationData {
     fn default() -> Self {
         Self {
             born: Cell::new(tick()),
+            previous_tick: Cell::new(0),
             previous: Cell::new(None),
             blended: Cell::new(None),
         }
@@ -178,6 +181,7 @@ impl InterpolationData {
     /// The object was placed (again) in the current movie frame, so it isn't blended.
     pub fn reset(&self) {
         self.born.set(tick());
+        self.previous_tick.set(0);
         self.previous.set(None);
     }
 
@@ -187,15 +191,12 @@ impl InterpolationData {
         if !state.enabled
             || state.render_fraction.is_some()
             || self.born.get() == state.tick
-            || self
-                .previous
-                .get()
-                .is_some_and(|previous| previous.tick == state.tick)
+            || self.previous_tick.get() == state.tick
         {
             return;
         }
+        self.previous_tick.set(state.tick);
         self.previous.set(Some(PreviousTransform {
-            tick: state.tick,
             matrix,
             color_transform,
         }));
@@ -203,16 +204,23 @@ impl InterpolationData {
 
     /// The blended transform, if the object changed in the current movie frame and a
     /// frame between movie frames is being drawn.
+    #[inline]
     fn blended(&self, matrix: Matrix, color_transform: ColorTransform) -> Option<Blended> {
-        // Check `previous` before touching thread-local state: most objects didn't move.
-        let previous = self.previous.get()?;
+        // Check the 4-byte `previous_tick` before loading `PreviousTransform` or TLS state:
+        // most objects didn't move in this movie frame.
+        let prev_tick = self.previous_tick.get();
+        if prev_tick == 0 {
+            return None;
+        }
         let state = state();
-        if previous.tick != state.tick {
+        if prev_tick != state.tick {
             // Stale from an earlier movie frame; clear so future reads skip the TLS lookup.
+            self.previous_tick.set(0);
             self.previous.set(None);
             return None;
         }
         let fraction = state.render_fraction?;
+        let previous = self.previous.get()?;
         if previous.matrix == matrix && previous.color_transform == color_transform {
             return None;
         }
@@ -240,15 +248,39 @@ impl InterpolationData {
     }
 
     /// The matrix to draw with: `current`, or blended with the previous one.
+    #[inline]
     pub fn matrix(&self, current: Matrix, color_transform: ColorTransform) -> Matrix {
+        if self.previous_tick.get() == 0 {
+            return current;
+        }
         self.blended(current, color_transform)
             .map_or(current, |blended| blended.matrix)
     }
 
     /// The color transform to draw with: `current`, or blended with the previous one.
+    #[inline]
     pub fn color_transform(&self, matrix: Matrix, current: ColorTransform) -> ColorTransform {
+        if self.previous_tick.get() == 0 {
+            return current;
+        }
         self.blended(matrix, current)
             .map_or(current, |blended| blended.color_transform)
+    }
+
+    /// Both matrix and color transform in a single interpolation lookup.
+    #[inline]
+    pub fn matrix_and_color_transform(
+        &self,
+        matrix: Matrix,
+        color_transform: ColorTransform,
+    ) -> (Matrix, ColorTransform) {
+        if self.previous_tick.get() == 0 {
+            return (matrix, color_transform);
+        }
+        self.blended(matrix, color_transform)
+            .map_or((matrix, color_transform), |blended| {
+                (blended.matrix, blended.color_transform)
+            })
     }
 }
 

@@ -46,7 +46,7 @@ pub(super) const KERNEL_UNIFORM_SIZE: u64 = 16 + 16 * (MAX_KERNEL_TAPS as u64 / 
 
 /// Builds the raw 1D convolved kernel of `passes` box blurs of `strength`.
 /// Always has odd length `2 * R + 1` centered at `kernel.len() / 2`.
-fn raw_kernel(strength: f32, passes: u8) -> Vec<f64> {
+fn compute_raw_kernel(strength: f32, passes: u8) -> Vec<f64> {
     // See `apply_full` for what these mean.
     let full_size = strength.min(255.0);
     let radius = (full_size - 1.0) / 2.0;
@@ -70,31 +70,52 @@ fn raw_kernel(strength: f32, passes: u8) -> Vec<f64> {
     kernel
 }
 
+/// Runs `f` with a memoized raw 1D convolved kernel for `(strength, passes)`.
+fn with_raw_kernel<R>(strength: f32, passes: u8, f: impl FnOnce(&[f64]) -> R) -> R {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<fnv::FnvHashMap<(u32, u8), Vec<f64>>> =
+            RefCell::new(fnv::FnvHashMap::default());
+    }
+    let key = (strength.min(255.0).to_bits(), passes);
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            if cache.len() >= 512 {
+                cache.clear();
+            }
+            cache.insert(key, compute_raw_kernel(strength, passes));
+        }
+        f(&cache[&key])
+    })
+}
+
 /// Combines `passes` box blurs of `strength` (as `BlurFilter::apply_full` does them, one
 /// after the other) into one kernel. Returns its taps as `(offset, weight)`, each sampling
 /// between two neighboring texels with bilinear filtering, or `None` if there are too many.
 pub(super) fn merged_kernel(strength: f32, passes: u8) -> Option<Vec<[f32; 2]>> {
-    let kernel = raw_kernel(strength, passes);
-    if kernel.len().div_ceil(2) > MAX_KERNEL_TAPS {
-        return None;
-    }
-    let center = (kernel.len() / 2) as f64;
-    Some(
-        kernel
-            .chunks(2)
-            .enumerate()
-            .filter_map(|(index, pair)| {
-                let (w0, w1) = (pair[0], pair.get(1).copied().unwrap_or(0.0));
-                let weight = w0 + w1;
-                (weight > 0.0).then(|| {
-                    [
-                        ((2 * index) as f64 - center + w1 / weight) as f32,
-                        weight as f32,
-                    ]
+    with_raw_kernel(strength, passes, |kernel| {
+        if kernel.len().div_ceil(2) > MAX_KERNEL_TAPS {
+            return None;
+        }
+        let center = (kernel.len() / 2) as f64;
+        Some(
+            kernel
+                .chunks(2)
+                .enumerate()
+                .filter_map(|(index, pair)| {
+                    let (w0, w1) = (pair[0], pair.get(1).copied().unwrap_or(0.0));
+                    let weight = w0 + w1;
+                    (weight > 0.0).then(|| {
+                        [
+                            ((2 * index) as f64 - center + w1 / weight) as f32,
+                            weight as f32,
+                        ]
+                    })
                 })
-            })
-            .collect(),
-    )
+                .collect(),
+        )
+    })
 }
 
 /// Like `merged_kernel`, but keeps every tap at an exact integer offset (unpaired) so that
@@ -105,20 +126,21 @@ pub(super) fn unpaired_kernel(
     passes: u8,
     max_taps: usize,
 ) -> Option<Vec<[f32; 2]>> {
-    let kernel = raw_kernel(strength, passes);
-    if kernel.len() > max_taps.min(MAX_KERNEL_TAPS) {
-        return None;
-    }
-    let center = (kernel.len() / 2) as f64;
-    Some(
-        kernel
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, weight)| {
-                (weight > 0.0).then(|| [(index as f64 - center) as f32, weight as f32])
-            })
-            .collect(),
-    )
+    with_raw_kernel(strength, passes, |kernel| {
+        if kernel.len() > max_taps.min(MAX_KERNEL_TAPS) {
+            return None;
+        }
+        let center = (kernel.len() / 2) as f64;
+        Some(
+            kernel
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &weight)| {
+                    (weight > 0.0).then(|| [(index as f64 - center) as f32, weight as f32])
+                })
+                .collect(),
+        )
+    })
 }
 
 /// How many times lower the resolution of a blur may be in each direction (see

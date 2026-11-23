@@ -413,9 +413,9 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
         if !context.is_offscreen {
-            let transform = context.transform_stack.transform();
+            let matrix = &context.transform_stack.transform_ref().matrix;
             if !self
-                .bounds_with_transform(&transform.matrix, BoundsMode::Engine)
+                .bounds_with_transform(matrix, BoundsMode::Engine)
                 .intersects(&context.stage.viewport_view_bounds())
             {
                 // Off-screen; culled

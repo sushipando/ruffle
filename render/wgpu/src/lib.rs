@@ -269,8 +269,12 @@ impl QueueSyncHandle {
     }
 }
 
+static NEXT_TEXTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Debug)]
 pub struct Texture {
+    pub(crate) id: u64,
+    pub(crate) generation: Cell<u64>,
     pub(crate) texture: wgpu::Texture,
     repeating_linear: OnceCell<BitmapBinds>,
     repeating_nearest: OnceCell<BitmapBinds>,
@@ -283,6 +287,34 @@ pub struct Texture {
 }
 
 impl Texture {
+    pub(crate) fn new(texture: wgpu::Texture) -> Self {
+        Self {
+            id: NEXT_TEXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            generation: Cell::new(1),
+            texture,
+            repeating_linear: Default::default(),
+            repeating_nearest: Default::default(),
+            clamped_linear: Default::default(),
+            clamped_nearest: Default::default(),
+            copy_count: Cell::new(0),
+            last_cab_key: Default::default(),
+        }
+    }
+
+    /// Marks this texture's pixels as modified and invalidates any cached CAB key.
+    #[inline]
+    pub(crate) fn bump_generation(&self) {
+        self.bump_generation_keeping_key();
+        *self.last_cab_key.borrow_mut() = None;
+    }
+
+    /// Marks this texture's pixels as modified while letting the caller update `last_cab_key`.
+    #[inline]
+    pub(crate) fn bump_generation_keeping_key(&self) {
+        self.generation
+            .set(self.generation.get().wrapping_add(1).max(1));
+    }
+
     pub fn bind_group(
         &self,
         repeating: bool,

@@ -368,6 +368,42 @@ impl<'gc> Stage<'gc> {
         }
     }
 
+    pub(crate) fn try_fast_backdrop_tick_hit(
+        self,
+        clear_color: Color,
+        viewport_bounds: Rectangle<Twips>,
+        viewport_matrix: Matrix,
+        tick: u32,
+    ) -> Option<(ruffle_render::bitmap::BitmapInfo, Point<i32>, Vec<usize>)> {
+        let mut cache_ref = self.0.backdrop_cache.borrow_mut();
+        let cache = cache_ref.as_mut()?;
+        if cache.clear_color != clear_color
+            || cache.viewport_bounds != viewport_bounds
+            || cache.nodes.is_empty()
+            || tick.wrapping_sub(cache.last_full_scan_tick) >= 48
+        {
+            return None;
+        }
+        let mut cursor = 0usize;
+        if crate::display_object::verify_backdrop_prefix(
+            self.into(),
+            viewport_matrix,
+            swf::ColorTransform::IDENTITY,
+            &cache.nodes,
+            &mut cursor,
+        ) == Ok(true)
+        {
+            cache.checked_tick = tick;
+            Some((
+                cache.bitmap.clone(),
+                cache.origin,
+                cache.nodes.iter().map(|n| n.ptr).collect(),
+            ))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn check_backdrop_cache_hit(
         self,
         clear_color: Color,
@@ -398,6 +434,7 @@ impl<'gc> Stage<'gc> {
                 }
             }
             cache.checked_tick = tick;
+            cache.last_full_scan_tick = tick;
             return BackdropCacheLookup::Hit {
                 bitmap: cache.bitmap.clone(),
                 origin: cache.origin,

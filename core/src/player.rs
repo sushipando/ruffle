@@ -619,16 +619,23 @@ impl Player {
         did_work |= self.update_sockets_inner();
         did_work |= self.update_net_connections_inner();
         did_work |= self.update_timers_inner(dt);
+        // If `run_frame()` already ran on this tick while frame interpolation is active,
+        // it already ran mouse hover picking and a GC slice; avoid repeating both on the
+        // same tick when network packets or timers also fire.
+        let skip_post_work = frame > 0 && crate::display_object::interpolation::is_enabled();
         if did_work {
-            self.update(|context| {
-                StreamManager::tick(context, dt);
-            });
+            self.update_inner(
+                |context| {
+                    StreamManager::tick(context, dt);
+                },
+                !skip_post_work,
+            );
         } else {
             let streams_ran = self.mutate_with_update_context(|context| {
                 StreamManager::tick(context, dt)
             });
             if streams_ran {
-                self.update(|_| {});
+                self.update_inner(|_| {}, !skip_post_work);
             }
         }
         self.audio.tick();
@@ -2348,17 +2355,29 @@ impl Player {
     /// heavy allocation bursts can be drained smoothly across idle interpolated sub-frames
     /// instead of stalling a single movie tick for 10-17 ms.
     pub fn collect_gc_slice(&mut self, budget: Duration) {
+        self.collect_gc_slice_inner(budget, Some((600_000.0, Duration::from_micros(900))));
+    }
+
+    /// Like `collect_gc_slice`, but never exceeds `budget` (used during idle interpolated
+    /// subframe slack so GC never overruns the next scheduled subframe deadline).
+    pub fn collect_gc_slice_strict(&mut self, budget: Duration) {
+        self.collect_gc_slice_inner(budget, None);
+    }
+
+    fn collect_gc_slice_inner(
+        &mut self,
+        budget: Duration,
+        emergency_boost: Option<(f64, Duration)>,
+    ) {
         const CHUNK_DEBT: f64 = 4_000.0;
-        const HIGH_DEBT_WATERMARK: f64 = 250_000.0;
         let mut arena = self.gc_arena.borrow_mut();
         let initial_debt = arena.metrics().allocation_debt();
         if initial_debt <= 0.0 {
             return;
         }
-        let budget = if initial_debt > HIGH_DEBT_WATERMARK {
-            budget.max(Duration::from_micros(2500))
-        } else {
-            budget
+        let budget = match emergency_boost {
+            Some((watermark, boost)) if initial_debt > watermark => budget.max(boost),
+            _ => budget,
         };
         let start = Instant::now();
         loop {
@@ -2730,6 +2749,13 @@ impl Player {
     where
         F: for<'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
     {
+        self.update_inner(func, true)
+    }
+
+    fn update_inner<F, R>(&mut self, func: F, run_mouse_and_gc: bool) -> R
+    where
+        F: for<'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
+    {
         let rval = self.mutate_with_update_context(|context| {
             let rval = func(context);
 
@@ -2742,15 +2768,17 @@ impl Player {
         self.mutate_with_update_context(|context| {
             Self::update_drag(context);
         });
-        self.update_mouse_state(EnumSet::empty(), false, &mut false);
+        if run_mouse_and_gc {
+            self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
-        // GC: when frame interpolation is active, cap per-tick GC to a small slice and
-        // drain any remaining debt during the idle interpolated sub-frames (see
-        // `collect_gc_slice`) so combat allocation spikes don't stall movie ticks.
-        if crate::display_object::interpolation::is_enabled() {
-            self.collect_gc_slice(Duration::from_micros(800));
-        } else {
-            self.gc_arena.borrow_mut().collect_debt();
+            // GC: when frame interpolation is active, keep per-tick GC very short and
+            // drain remaining debt during idle interpolated sub-frames (see
+            // `collect_gc_slice_strict`) so combat allocation spikes don't stall movie ticks.
+            if crate::display_object::interpolation::is_enabled() {
+                self.collect_gc_slice(Duration::from_micros(350));
+            } else {
+                self.gc_arena.borrow_mut().collect_debt();
+            }
         }
 
         rval

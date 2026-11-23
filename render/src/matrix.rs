@@ -231,6 +231,19 @@ impl std::ops::Mul<Rectangle<Twips>> for Matrix {
             return Default::default();
         }
 
+        if self.b == 0.0 && self.c == 0.0 {
+            let x0 = round_to_i32(self.a * rhs.x_min.get() as f32) + self.tx.get();
+            let x1 = round_to_i32(self.a * rhs.x_max.get() as f32) + self.tx.get();
+            let y0 = round_to_i32(self.d * rhs.y_min.get() as f32) + self.ty.get();
+            let y1 = round_to_i32(self.d * rhs.y_max.get() as f32) + self.ty.get();
+            return Rectangle {
+                x_min: Twips::new(x0.min(x1)),
+                x_max: Twips::new(x0.max(x1)),
+                y_min: Twips::new(y0.min(y1)),
+                y_max: Twips::new(y0.max(y1)),
+            };
+        }
+
         let p0 = self * Point::new(rhs.x_min, rhs.y_min);
         let p1 = self * Point::new(rhs.x_min, rhs.y_max);
         let p2 = self * Point::new(rhs.x_max, rhs.y_min);

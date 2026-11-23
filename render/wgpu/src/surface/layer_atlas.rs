@@ -38,9 +38,9 @@ pub struct LeafLayer {
     pub origin: (i32, i32),
     pub width: u32,
     pub height: u32,
-    /// If `Some`, the rendered layer is copied out into this texture; if `None`, the
-    /// caller samples it directly from the atlas via `AtlasLayers`.
-    pub destination: Option<wgpu::Texture>,
+    /// If `Some`, the rendered layer is copied out into `(texture, dst_x, dst_y)`; if `None`,
+    /// the caller samples it directly from the atlas via `AtlasLayers`.
+    pub destination: Option<(wgpu::Texture, u32, u32)>,
     /// Whether this leaf is a `BlendMode::Layer` target (so direct-blended `Alpha`/`Erase`
     /// children inside it blend against the layer's pixels in the atlas).
     pub is_layer: bool,
@@ -404,7 +404,7 @@ pub fn render_leaf_layers(
         let mut needs_direct = false;
         for (index, slot) in &batch {
             let layer = &layers[*index];
-            if let Some(destination) = &layer.destination {
+            if let Some((destination, dst_x, dst_y)) = &layer.destination {
                 draw_encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: target.color_texture(),
@@ -416,7 +416,16 @@ pub fn render_leaf_layers(
                         },
                         aspect: Default::default(),
                     },
-                    destination.as_image_copy(),
+                    wgpu::TexelCopyTextureInfo {
+                        texture: destination,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: *dst_x,
+                            y: *dst_y,
+                            z: 0,
+                        },
+                        aspect: Default::default(),
+                    },
                     wgpu::Extent3d {
                         width: layer.width,
                         height: layer.height,
